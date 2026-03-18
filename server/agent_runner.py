@@ -349,6 +349,11 @@ class AgentRunner:
             return
 
         # ── assistant: complete message (after streaming) ──
+        # The streaming phase (stream_event) already created messages and
+        # broadcast all deltas to the frontend.  The assistant chunk carries
+        # the final, authoritative content – we use it ONLY to fix up the
+        # server-side copies (for persistence accuracy) without broadcasting
+        # anything to the frontend, which already has the correct content.
         if chunk_type == "assistant":
             message_data = chunk.get("message", {})
             content_blocks = message_data.get("content", [])
@@ -361,7 +366,12 @@ class AgentRunner:
                     {"type": "message_done", "task_id": task_id, "message_id": cur.id}
                 )
 
-            # Process each content block in the assistant message
+            # Collect existing messages by type for matching
+            text_msgs = [m for m in task.messages if m.role == "agent" and m.type == "text"]
+            tool_msgs = [m for m in task.messages if m.role == "agent" and m.type == "tool_use"]
+            text_idx = 0
+            tool_idx = 0
+
             for block in content_blocks:
                 btype = block.get("type", "")
 
@@ -369,44 +379,18 @@ class AgentRunner:
                     full_text = block.get("text", "")
                     if not full_text:
                         continue
-                    # Find existing text message to update, or create new one
-                    existing = None
-                    for m in reversed(task.messages):
-                        if m.role == "agent" and m.type == "text":
-                            existing = m
-                            break
-                    if existing:
-                        existing.content = full_text
-                        existing.streaming = False
-                    else:
-                        msg = Message(role="agent", content=full_text, streaming=False)
-                        task.messages.append(msg)
-                        await broadcast(
-                            {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-                        )
+                    if text_idx < len(text_msgs):
+                        text_msgs[text_idx].content = full_text
+                        text_msgs[text_idx].streaming = False
+                    text_idx += 1
 
                 elif btype == "tool_use":
-                    tool_name = block.get("name", "")
                     tool_input = block.get("input", {})
                     content_str = json.dumps(tool_input, ensure_ascii=False)
-                    # Find existing tool_use message to update, or create new one
-                    existing = None
-                    for m in reversed(task.messages):
-                        if m.role == "agent" and m.type == "tool_use" and m.tool_name == tool_name:
-                            existing = m
-                            break
-                    if existing:
-                        existing.content = content_str
-                        existing.streaming = False
-                    else:
-                        msg = Message(
-                            role="agent", type="tool_use", content=content_str,
-                            tool_name=tool_name, streaming=False,
-                        )
-                        task.messages.append(msg)
-                        await broadcast(
-                            {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-                        )
+                    if tool_idx < len(tool_msgs):
+                        tool_msgs[tool_idx].content = content_str
+                        tool_msgs[tool_idx].streaming = False
+                    tool_idx += 1
 
             app_state.save_tasks()
             return
