@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from server.config import agent_defaults
 from server.models import Agent, Task
 
 
@@ -12,9 +13,12 @@ class AppState:
         self._init_default_agents()
 
     def _init_default_agents(self) -> None:
-        defaults = ["Scheduler", "Codegen", "Reviewer"]
-        for name in defaults:
-            agent = Agent(name=name)
+        for cfg in agent_defaults():
+            agent = Agent(
+                name=cfg["name"],
+                command=cfg.get("command", "cco"),
+                cwd=cfg.get("cwd", ""),
+            )
             self.agents[agent.id] = agent
 
     def get_agent(self, agent_id: str) -> Agent | None:

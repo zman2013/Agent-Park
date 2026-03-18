@@ -28,5 +28,11 @@ app.include_router(ws_router)
 
 if __name__ == "__main__":
     import uvicorn
+    from server.config import server_host, server_port
 
-    uvicorn.run("server.main:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run(
+        "server.main:app",
+        host=server_host(),
+        port=server_port(),
+        reload=True,
+    )
