@@ -46,6 +46,7 @@ async def delete_task(task_id: str):
 
 
 class UpdateAgentBody(BaseModel):
+    name: str | None = None
     cwd: str | None = None
 
 
@@ -54,6 +55,8 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
     agent = app_state.get_agent(agent_id)
     if not agent:
         raise HTTPException(404, "agent not found")
+    if body.name is not None:
+        agent.name = body.name
     if body.cwd is not None:
         agent.cwd = body.cwd
     from server.routes_ws import broadcast
