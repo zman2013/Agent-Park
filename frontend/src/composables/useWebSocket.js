@@ -42,7 +42,35 @@ export function useWebSocket() {
     }
   }
 
+  // ── Title-flash fallback for non-secure contexts (HTTP remote IP) ──
+  const originalTitle = document.title
+  let titleFlashTimer = null
+
+  function startTitleFlash(alertText) {
+    stopTitleFlash()
+    let show = true
+    titleFlashTimer = setInterval(() => {
+      document.title = show ? alertText : originalTitle
+      show = !show
+    }, 800)
+    // Stop flashing when user comes back to the tab
+    const onFocus = () => {
+      stopTitleFlash()
+      window.removeEventListener('focus', onFocus)
+    }
+    window.addEventListener('focus', onFocus)
+  }
+
+  function stopTitleFlash() {
+    if (titleFlashTimer) {
+      clearInterval(titleFlashTimer)
+      titleFlashTimer = null
+      document.title = originalTitle
+    }
+  }
+
   function sendBrowserNotify(title, body) {
+    // Native Notification (only works in secure context: HTTPS / localhost)
     if (
       'Notification' in window &&
       Notification.permission === 'granted' &&
@@ -53,6 +81,10 @@ export function useWebSocket() {
         window.focus()
         n.close()
       }
+    }
+    // Title flash fallback (works everywhere, only when tab is hidden)
+    if (document.hidden) {
+      startTitleFlash(`【${title}】${body}`)
     }
   }
 
