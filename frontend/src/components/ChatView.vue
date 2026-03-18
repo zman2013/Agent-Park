@@ -13,7 +13,7 @@
 </template>
 
 <script setup>
-import { ref, watch, nextTick, computed } from 'vue'
+import { ref, watch, nextTick, computed, onMounted } from 'vue'
 import MessageBubble from './MessageBubble.vue'
 
 const props = defineProps({
@@ -34,6 +34,12 @@ watch(
     scrollToBottom()
   }
 )
+
+// Scroll to bottom on initial mount
+onMounted(async () => {
+  await nextTick()
+  scrollToBottom()
+})
 
 // Auto-scroll to bottom on new messages
 watch(

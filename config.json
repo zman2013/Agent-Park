@@ -9,17 +9,17 @@
   "agents": [
     {
       "name": "neo-compiler",
-      "command": "cco",
+      "command": "ccs",
       "cwd": "/data1/neo"
     },
     {
       "name": "agent-park",
-      "command": "cco",
+      "command": "ccs",
       "cwd": "/data1/common/agent-park"
     },
     {
       "name": "Reviewer",
-      "command": "cco",
+      "command": "ccs",
       "cwd": ""
     }
   ]
