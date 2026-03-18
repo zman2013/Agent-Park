@@ -24,14 +24,13 @@
       class="w-full rounded-lg px-4 py-2 text-sm bg-gray-800/60 border border-gray-700/50"
     >
       <div
-        class="flex items-center gap-2 cursor-pointer select-none text-gray-400 hover:text-gray-300"
+        class="flex items-center gap-2 min-w-0 cursor-pointer select-none text-gray-400 hover:text-gray-300"
         @click="expanded = !expanded"
       >
-        <span class="text-xs" :class="expanded ? 'rotate-90' : ''">&#9654;</span>
-        <span class="font-mono text-xs text-blue-400">{{ message.tool_name }}</span>
-        <span class="text-xs text-gray-500">tool call</span>
-        <span v-if="toolDescription" class="text-xs text-gray-400 truncate">{{ toolDescription }}</span>
-        <code v-if="toolCommand" class="text-xs text-yellow-500/80 font-mono truncate">{{ toolCommand }}</code>
+        <span class="text-xs shrink-0" :class="expanded ? 'rotate-90' : ''">&#9654;</span>
+        <span class="font-mono text-xs text-blue-400 shrink-0">{{ message.tool_name }}</span>
+        <span class="text-xs text-gray-500 shrink-0">tool call</span>
+        <span v-if="toolDescription" class="text-xs text-gray-400 min-w-0 truncate">{{ toolDescription }}</span>
       </div>
       <div v-if="expanded" class="mt-2 text-xs">
         <pre class="whitespace-pre-wrap text-gray-400 overflow-x-auto max-h-60 overflow-y-auto">{{ formattedToolInput }}</pre>
