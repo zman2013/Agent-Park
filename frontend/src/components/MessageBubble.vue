@@ -1,8 +1,26 @@
 <template>
   <div class="flex justify-start">
+    <!-- Write tool: show file path + markdown-rendered content -->
+    <div
+      v-if="message.type === 'tool_use' && isWriteTool"
+      class="w-full rounded-lg px-4 py-2 text-sm bg-gray-800/60 border border-gray-700/50"
+    >
+      <div
+        class="flex items-center gap-2 cursor-pointer select-none text-gray-400 hover:text-gray-300"
+        @click="expanded = !expanded"
+      >
+        <span class="text-xs" :class="expanded ? 'rotate-90' : ''">&#9654;</span>
+        <span class="font-mono text-xs text-blue-400">{{ message.tool_name }}</span>
+        <span class="font-mono text-xs text-gray-400 truncate">{{ writeFilePath }}</span>
+      </div>
+      <div v-if="expanded" class="mt-2">
+        <div class="markdown-body text-xs" v-html="writeContentRendered"></div>
+      </div>
+    </div>
+
     <!-- Tool use: show tool name + collapsible params -->
     <div
-      v-if="message.type === 'tool_use'"
+      v-else-if="message.type === 'tool_use'"
       class="w-full rounded-lg px-4 py-2 text-sm bg-gray-800/60 border border-gray-700/50"
     >
       <div
@@ -75,6 +93,26 @@ const props = defineProps({
 })
 
 const expanded = ref(false)
+
+const parsedToolInput = computed(() => {
+  try {
+    return JSON.parse(props.message.content)
+  } catch {
+    return null
+  }
+})
+
+const isWriteTool = computed(() => {
+  const name = (props.message.tool_name || '').toLowerCase()
+  return name === 'write' && parsedToolInput.value?.file_path && parsedToolInput.value?.content
+})
+
+const writeFilePath = computed(() => parsedToolInput.value?.file_path || '')
+
+const writeContentRendered = computed(() => {
+  const content = parsedToolInput.value?.content || ''
+  return md.render(content)
+})
 
 const bubbleClass = computed(() =>
   props.message.role === 'user'
