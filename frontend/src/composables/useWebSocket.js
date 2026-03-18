@@ -17,6 +17,10 @@ export function useWebSocket() {
     ws.onopen = () => {
       connected.value = true
       console.log('[WS] connected')
+      // Request browser notification permission on first connect
+      if ('Notification' in window && Notification.permission === 'default') {
+        Notification.requestPermission()
+      }
     }
 
     ws.onclose = (e) => {
@@ -38,22 +42,41 @@ export function useWebSocket() {
     }
   }
 
+  function sendBrowserNotify(title, body) {
+    if (
+      'Notification' in window &&
+      Notification.permission === 'granted' &&
+      document.hidden
+    ) {
+      const n = new Notification(title, { body })
+      n.onclick = () => {
+        window.focus()
+        n.close()
+      }
+    }
+  }
+
   function handleMessage(data) {
     switch (data.type) {
       case 'state_sync':
         store.syncState(data.data)
         break
 
-      case 'task_status':
+      case 'task_status': {
         store.updateTaskStatus(data.task_id, data.status)
+        const taskName = store.tasks[data.task_id]?.name || data.task_id
         if (data.status === 'success') {
           store.addToast(`Task completed`, 'success')
+          sendBrowserNotify('任务完成', taskName)
         } else if (data.status === 'failed') {
           store.addToast(`Task failed`, 'error')
+          sendBrowserNotify('任务失败', taskName)
         } else if (data.status === 'waiting') {
           store.addToast(`Agent is waiting for your input`, 'warning')
+          sendBrowserNotify('等待输入', taskName)
         }
         break
+      }
 
       case 'message':
         store.addMessage(data.task_id, data.message)
