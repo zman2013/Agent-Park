@@ -355,6 +355,7 @@ class AgentRunner:
         # server-side copies (for persistence accuracy) without broadcasting
         # anything to the frontend, which already has the correct content.
         if chunk_type == "assistant":
+            logger.info("assistant chunk for task %s: %d content blocks", task_id, len(chunk.get("message", {}).get("content", [])))
             message_data = chunk.get("message", {})
             content_blocks = message_data.get("content", [])
 
@@ -426,8 +427,51 @@ class AgentRunner:
 
         # ── result: process finished ──
         if chunk_type == "result":
+            logger.info("result chunk for task %s: %s", task_id, json.dumps(chunk, ensure_ascii=False)[:2000])
             subtype = chunk.get("subtype", "")
             is_error = chunk.get("is_error", False)
+
+            # The result chunk may carry a "result" text field that contains
+            # content not yet streamed (e.g. when AskUserQuestion is denied).
+            # Compare with the last agent text message and send the delta if needed.
+            result_text = chunk.get("result", "")
+            if result_text and isinstance(result_text, str):
+                result_text = result_text.strip()
+                # Find the last agent text message
+                last_text_msg = None
+                for m in reversed(task.messages):
+                    if m.role == "agent" and m.type == "text":
+                        last_text_msg = m
+                        break
+
+                existing_content = (last_text_msg.content if last_text_msg else "").strip()
+
+                if not existing_content or not result_text.startswith(existing_content):
+                    # result text is different from streamed content — send it as a new message
+                    if result_text != existing_content:
+                        msg = Message(role="agent", content=result_text, streaming=False)
+                        task.messages.append(msg)
+                        await broadcast(
+                            {"type": "message", "task_id": task_id, "message": msg.model_dump()}
+                        )
+                elif len(result_text) > len(existing_content):
+                    # result text extends the streamed content — append the delta
+                    delta = result_text[len(existing_content):]
+                    if last_text_msg:
+                        last_text_msg.content = result_text
+                        last_text_msg.streaming = False
+                        await broadcast(
+                            {
+                                "type": "message_chunk",
+                                "task_id": task_id,
+                                "message_id": last_text_msg.id,
+                                "delta": delta,
+                            }
+                        )
+                        await broadcast(
+                            {"type": "message_done", "task_id": task_id, "message_id": last_text_msg.id}
+                        )
+
             if is_error or subtype == "error":
                 await self._finish_task(task_id, TaskStatus.failed)
             return
