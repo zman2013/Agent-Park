@@ -39,11 +39,17 @@ class AppState:
             self.agents[agent.id] = agent
 
     def _load_persisted_data(self) -> None:
-        """Load tasks from disk and reassociate with agents."""
+        """Load agents and tasks from disk."""
         if not TASKS_FILE.exists():
             return
         try:
             raw = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+
+            # Load persisted agents (those not already from config)
+            for aid, adata in raw.get("agents", {}).items():
+                if aid not in self.agents:
+                    self.agents[aid] = Agent(**adata)
+
             for tid, tdata in raw.get("tasks", {}).items():
                 agent_id = tdata.get("agent_id")
                 if agent_id not in self.agents:
@@ -64,10 +70,16 @@ class AppState:
             logger.exception("Failed to load persisted tasks")
 
     def save_tasks(self) -> None:
-        """Persist all tasks to disk (atomic write)."""
+        """Persist non-default agents and all tasks to disk (atomic write)."""
         DATA_DIR.mkdir(exist_ok=True)
+        default_ids = {_stable_agent_id(cfg["name"]) for cfg in agent_defaults()}
         payload = {
-            "tasks": {tid: t.model_dump() for tid, t in self.tasks.items()}
+            "agents": {
+                aid: a.model_dump()
+                for aid, a in self.agents.items()
+                if aid not in default_ids
+            },
+            "tasks": {tid: t.model_dump() for tid, t in self.tasks.items()},
         }
         tmp = TASKS_FILE.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -97,6 +109,7 @@ class AppState:
             raise ValueError(f"Agent with name '{name}' already exists")
         agent = Agent(id=aid, name=name, command=command, cwd=cwd)
         self.agents[aid] = agent
+        self.save_tasks()
         return agent
 
     def delete_task(self, task_id: str) -> bool:
