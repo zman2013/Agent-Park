@@ -41,6 +41,7 @@ class AgentRunner:
         self._current_msg: dict[str, Message] = {}
         self._current_block_type: dict[str, str] = {}  # task_id -> "text"|"tool_use"
         self._session_ids: dict[str, str] = self._load_sessions()
+        self._resuming: set[str] = set()          # task_ids being killed for resume
 
     def _load_sessions(self) -> dict[str, str]:
         """Load session IDs from disk."""
@@ -73,6 +74,13 @@ class AgentRunner:
         task = app_state.get_task(task_id)
         if not task:
             return
+
+        # Ensure running status is set (send_input sets it before killing the old
+        # process, but the old process's _finish_task could race and overwrite it
+        # before this coroutine is scheduled; re-assert here to be safe)
+        if task.status not in (TaskStatus.running,):
+            task.status = TaskStatus.running
+            await self._broadcast_status(task_id, TaskStatus.running)
 
         agent = app_state.get_agent(task.agent_id)
         command = agent.command if agent else "cco"
@@ -506,6 +514,11 @@ class AgentRunner:
     async def _finish_task(self, task_id: str, status: TaskStatus) -> None:
         from server.routes_ws import broadcast
 
+        # If this task is being killed for a resume, don't overwrite the running status
+        if status == TaskStatus.failed and task_id in self._resuming:
+            self._resuming.discard(task_id)
+            return
+
         # Close any still-streaming message before finishing the task
         msg = self._current_msg.pop(task_id, None)
         if msg and msg.streaming:
@@ -536,6 +549,8 @@ class AgentRunner:
         task.status = TaskStatus.running
         await self._broadcast_status(task_id, TaskStatus.running)
 
+        # Mark as resuming so the dying subprocess doesn't overwrite status with failed
+        self._resuming.add(task_id)
         # Kill current process if still running
         await self.kill_task(task_id)
 

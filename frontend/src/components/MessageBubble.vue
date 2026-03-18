@@ -30,6 +30,8 @@
         <span class="text-xs" :class="expanded ? 'rotate-90' : ''">&#9654;</span>
         <span class="font-mono text-xs text-blue-400">{{ message.tool_name }}</span>
         <span class="text-xs text-gray-500">tool call</span>
+        <span v-if="toolDescription" class="text-xs text-gray-400 truncate">{{ toolDescription }}</span>
+        <code v-if="toolCommand" class="text-xs text-yellow-500/80 font-mono truncate">{{ toolCommand }}</code>
       </div>
       <div v-if="expanded" class="mt-2 text-xs">
         <pre class="whitespace-pre-wrap text-gray-400 overflow-x-auto max-h-60 overflow-y-auto">{{ formattedToolInput }}</pre>
@@ -140,4 +142,7 @@ const contentPreview = computed(() => {
   if (firstLine.length > 80) return firstLine.slice(0, 80) + '...'
   return firstLine
 })
+
+const toolDescription = computed(() => parsedToolInput.value?.description || '')
+const toolCommand = computed(() => parsedToolInput.value?.command || '')
 </script>
