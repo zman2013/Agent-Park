@@ -1,0 +1,96 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Streaming cursor blink */
+.streaming-cursor::after {
+  content: '▋';
+  animation: blink 1s step-end infinite;
+  color: #22c55e;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Task status animations */
+.status-running {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.4; }
+  100% { opacity: 1; }
+}
+
+/* Markdown content styling */
+.markdown-body pre {
+  background: #1a1a1a;
+  border-radius: 6px;
+  padding: 12px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.markdown-body code {
+  font-family: 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 0.85em;
+}
+.markdown-body p code {
+  background: #1a1a1a;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+.markdown-body p {
+  margin: 4px 0;
+}
+.markdown-body ul, .markdown-body ol {
+  padding-left: 1.5em;
+  margin: 4px 0;
+}
+.markdown-body li {
+  margin: 2px 0;
+}
+.markdown-body h1, .markdown-body h2, .markdown-body h3 {
+  font-weight: 600;
+  margin: 8px 0 4px;
+}
+.markdown-body blockquote {
+  border-left: 3px solid #444;
+  padding-left: 12px;
+  color: #999;
+  margin: 8px 0;
+}
+
+/* Toast animations */
+.toast-enter {
+  animation: slideIn 0.3s ease-out;
+}
+.toast-exit {
+  animation: slideOut 0.3s ease-in forwards;
+}
+
+@keyframes slideIn {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes slideOut {
+  from { transform: translateX(0); opacity: 1; }
+  to { transform: translateX(100%); opacity: 0; }
+}

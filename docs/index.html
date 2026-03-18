@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Agent UI v2</title>
+
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+<style>
+body { background: #0b0b0b; color: #e5e5e5; }
+.task-running { color: #eab308; animation: pulse 1.5s infinite; }
+.task-success { color: #22c55e; }
+.task-failed { color: #ef4444; }
+
+@keyframes pulse {
+  0% { opacity: 1 }
+  50% { opacity: 0.4 }
+  100% { opacity: 1 }
+}
+</style>
+</head>
+
+<body class="h-screen flex">
+
+<!-- LEFT -->
+<div class="w-72 bg-[#111] p-4 overflow-auto border-r border-gray-800">
+  <div class="text-xs text-gray-400 mb-3">AGENTS</div>
+  <div id="agentList"></div>
+</div>
+
+<!-- RIGHT -->
+<div class="flex-1 flex flex-col">
+
+  <!-- Chat -->
+  <div id="chat" class="flex-1 overflow-auto p-6 space-y-4 text-sm"></div>
+
+  <!-- Input -->
+  <div class="border-t border-gray-800 p-3 flex gap-2">
+    <input id="inputBox"
+      class="flex-1 bg-[#111] p-2 rounded outline-none text-sm"
+      placeholder="Reply to agent..." />
+    <button onclick="sendMessage()"
+      class="bg-green-600 px-4 rounded text-sm">
+      Send
+    </button>
+  </div>
+
+</div>
+
+<script>
+let agents = [
+  { name: "Scheduler", open: true, tasks: [] },
+  { name: "MemoryPlan", open: true, tasks: [] },
+  { name: "Codegen", open: true, tasks: [] }
+]
+
+let currentTask = null
+
+function createTask(agentName) {
+  const agent = agents.find(a => a.name === agentName)
+  const task = {
+    id: Date.now(),
+    name: "Task " + (agent.tasks.length + 1),
+    status: "idle",
+    messages: []
+  }
+  agent.tasks.unshift(task)
+  currentTask = task
+  renderAgents()
+}
+
+function renderAgents() {
+  const root = document.getElementById("agentList")
+  root.innerHTML = ""
+
+  agents.forEach(agent => {
+
+    const header = document.createElement("div")
+    header.className = "text-sm text-gray-300 mt-4 cursor-pointer"
+    header.innerHTML = `${agent.open ? "▼" : "▶"} ${agent.name}`
+
+    header.onclick = () => {
+      agent.open = !agent.open
+      renderAgents()
+    }
+
+    root.appendChild(header)
+
+    if (agent.open) {
+      agent.tasks.forEach(task => {
+        const div = document.createElement("div")
+
+        let icon = "⚪️"
+        let cls = ""
+
+        if (task.status === "running") {
+          icon = "🟡"
+          cls = "task-running"
+        }
+        if (task.status === "success") {
+          icon = "🟢"
+          cls = "task-success"
+        }
+
+        div.className =
+          "ml-4 p-1 text-sm cursor-pointer hover:bg-gray-800 rounded " +
+          cls +
+          (task === currentTask ? " bg-gray-800" : "")
+
+        div.innerHTML = `${icon} ${task.name}`
+
+        div.onclick = () => {
+          currentTask = task
+          renderChat(task)
+          renderAgents()
+        }
+
+        root.appendChild(div)
+      })
+
+      const btn = document.createElement("div")
+      btn.className = "ml-4 text-xs text-gray-500 cursor-pointer mt-1"
+      btn.innerText = "+ new task"
+      btn.onclick = () => createTask(agent.name)
+
+      root.appendChild(btn)
+    }
+
+  })
+}
+
+function renderChat(task) {
+  const chat = document.getElementById("chat")
+  chat.innerHTML = ""
+
+  task.messages.forEach(msg => {
+    const div = document.createElement("div")
+
+    let align = msg.role === "user" ? "text-right" : "text-left"
+    let bg = msg.role === "user" ? "bg-green-700" : "bg-gray-800"
+
+    div.className = align
+
+    div.innerHTML = `
+      <div class="inline-block ${bg} px-3 py-2 rounded max-w-xl">
+        ${marked.parse(msg.content)}
+      </div>
+    `
+
+    chat.appendChild(div)
+  })
+
+  chat.scrollTop = chat.scrollHeight
+}
+
+function sendMessage() {
+  const input = document.getElementById("inputBox")
+  if (!input.value || !currentTask) return
+
+  currentTask.messages.push({
+    role: "user",
+    content: input.value
+  })
+
+  input.value = ""
+  renderChat(currentTask)
+
+  simulateAgent(currentTask)
+}
+
+function simulateAgent(task) {
+  task.status = "running"
+  renderAgents()
+
+  setTimeout(() => {
+    task.messages.push({
+      role: "agent",
+      content: "Processing your input..."
+    })
+    renderChat(task)
+  }, 500)
+
+  setTimeout(() => {
+    task.messages.push({
+      role: "agent",
+      content: "✅ Done"
+    })
+    task.status = "success"
+    renderAgents()
+    renderChat(task)
+  }, 1500)
+}
+
+// init
+renderAgents()
+</script>
+
+</body>
+</html>
