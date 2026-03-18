@@ -86,6 +86,13 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  function updateTaskTurns(taskId, numTurns) {
+    const task = tasks.value[taskId]
+    if (task) {
+      task.num_turns = numTurns
+    }
+  }
+
   function removeTask(taskId) {
     delete tasks.value[taskId]
     // Remove from agent task_ids
@@ -124,5 +131,6 @@ export const useAgentStore = defineStore('agent', () => {
     removeToast,
     removeTask,
     updateAgent,
+    updateTaskTurns,
   }
 })

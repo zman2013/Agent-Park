@@ -1,14 +1,20 @@
 <template>
-  <div ref="chatContainer" class="flex-1 overflow-auto p-6 space-y-3">
-    <div v-if="task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
-      No messages yet. Send a prompt to get started.
+  <div class="flex flex-col flex-1 min-h-0">
+    <!-- Turns indicator -->
+    <div v-if="task.num_turns" class="flex items-center justify-end px-6 py-1 border-b border-gray-800 text-xs text-gray-500 shrink-0">
+      <span>累计 <span class="text-gray-300 font-mono">{{ task.num_turns }}</span> turns</span>
     </div>
-    <MessageBubble
-      v-for="msg in visibleMessages"
-      :key="msg.id"
-      :message="msg"
-    />
-    <div v-if="task.status === 'running'" class="streaming-cursor text-sm px-4"></div>
+    <div ref="chatContainer" class="flex-1 overflow-auto p-6 space-y-3">
+      <div v-if="task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
+        No messages yet. Send a prompt to get started.
+      </div>
+      <MessageBubble
+        v-for="msg in visibleMessages"
+        :key="msg.id"
+        :message="msg"
+      />
+      <div v-if="task.status === 'running'" class="streaming-cursor text-sm px-4"></div>
+    </div>
   </div>
 </template>
 

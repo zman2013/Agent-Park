@@ -1,5 +1,13 @@
 <template>
   <div class="flex justify-start">
+    <!-- System notice -->
+    <div
+      v-if="message.type === 'system'"
+      class="w-full rounded-lg px-4 py-2 text-xs text-yellow-300 bg-yellow-900/30 border border-yellow-700/50"
+    >
+      ⚠ {{ message.content }}
+    </div>
+
     <!-- Write tool: show file path + markdown-rendered content -->
     <div
       v-if="message.type === 'tool_use' && isWriteTool"

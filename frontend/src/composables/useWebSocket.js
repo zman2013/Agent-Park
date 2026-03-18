@@ -122,6 +122,10 @@ export function useWebSocket() {
         store.markMessageDone(data.task_id, data.message_id)
         break
 
+      case 'turns_info':
+        store.updateTaskTurns(data.task_id, data.num_turns)
+        break
+
       case 'agent_updated':
         store.updateAgent(data.agent_id, data.fields)
         break

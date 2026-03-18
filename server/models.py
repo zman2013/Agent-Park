@@ -22,7 +22,7 @@ class TaskStatus(str, Enum):
 class Message(BaseModel):
     id: str = Field(default_factory=_uid)
     role: Literal["agent", "user"] = "agent"
-    type: Literal["text", "tool_use", "tool_result"] = "text"
+    type: Literal["text", "tool_use", "tool_result", "system"] = "text"
     content: str = ""
     tool_name: str = ""
     streaming: bool = False
@@ -35,6 +35,7 @@ class Task(BaseModel):
     prompt: str = ""
     status: TaskStatus = TaskStatus.idle
     messages: list[Message] = Field(default_factory=list)
+    num_turns: int = 0
 
 
 class Agent(BaseModel):

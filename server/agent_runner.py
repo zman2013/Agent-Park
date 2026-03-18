@@ -453,6 +453,13 @@ class AgentRunner:
             logger.info("result chunk for task %s: %s", task_id, json.dumps(chunk, ensure_ascii=False)[:2000])
             subtype = chunk.get("subtype", "")
             is_error = chunk.get("is_error", False)
+            num_turns = chunk.get("num_turns", 0)
+
+            # Update cumulative turn count on the task
+            task.num_turns += num_turns
+            await broadcast(
+                {"type": "turns_info", "task_id": task_id, "num_turns": task.num_turns}
+            )
 
             # The result chunk may carry a "result" text field that contains
             # content not yet streamed (e.g. when AskUserQuestion is denied).
@@ -494,6 +501,30 @@ class AgentRunner:
                         await broadcast(
                             {"type": "message_done", "task_id": task_id, "message_id": last_text_msg.id}
                         )
+
+            # Detect max-turns exit: success but result text is empty and the last
+            # streamed message is truncated (still streaming or very short).
+            if subtype == "success" and not result_text:
+                last_text_msg = None
+                for m in reversed(task.messages):
+                    if m.role == "agent" and m.type == "text":
+                        last_text_msg = m
+                        break
+                if last_text_msg and (last_text_msg.streaming or len(last_text_msg.content) < 200):
+                    # Close the truncated message first
+                    if last_text_msg.streaming:
+                        last_text_msg.streaming = False
+                        await broadcast(
+                            {"type": "message_done", "task_id": task_id, "message_id": last_text_msg.id}
+                        )
+                    notice = Message(
+                        role="agent", type="system", streaming=False,
+                        content=f"已达到单次会话 turns 上限（本轮 {num_turns} turns），输出被截断。发送任意消息可继续。",
+                    )
+                    task.messages.append(notice)
+                    await broadcast(
+                        {"type": "message", "task_id": task_id, "message": notice.model_dump()}
+                    )
 
             if is_error or subtype == "error":
                 await self._finish_task(task_id, TaskStatus.failed)
