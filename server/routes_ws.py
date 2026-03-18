@@ -57,16 +57,11 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
 
     if msg_type == "create_task":
         agent_id = data["agent_id"]
-        prompt = data.get("prompt", "")
+        name = data.get("name", "")
         if agent_id not in app_state.agents:
             return
-        task = app_state.create_task(agent_id, prompt)
+        task = app_state.create_task(agent_id, name)
         await broadcast({"type": "state_sync", "data": app_state.snapshot()})
-
-        # Start running the task
-        from server.agent_runner import runner
-
-        await runner.run_task(task.id, prompt)
 
     elif msg_type == "user_message":
         task_id = data["task_id"]
@@ -79,6 +74,7 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
 
         user_msg = Message(role="user", content=content)
         task.messages.append(user_msg)
+        app_state.save_tasks()
         await broadcast(
             {
                 "type": "message",

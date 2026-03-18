@@ -26,6 +26,15 @@ const visibleMessages = computed(() =>
 
 const chatContainer = ref(null)
 
+// Scroll to bottom when switching tasks (e.g. clicking a historical task)
+watch(
+  () => props.task?.id,
+  async () => {
+    await nextTick()
+    scrollToBottom()
+  }
+)
+
 // Auto-scroll to bottom on new messages
 watch(
   () => props.task.messages.length,

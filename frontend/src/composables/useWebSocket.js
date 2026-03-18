@@ -79,8 +79,8 @@ export function useWebSocket() {
     }
   }
 
-  function createTask(agentId, prompt) {
-    send({ type: 'create_task', agent_id: agentId, prompt })
+  function createTask(agentId, name) {
+    send({ type: 'create_task', agent_id: agentId, name })
   }
 
   function sendUserMessage(taskId, content) {

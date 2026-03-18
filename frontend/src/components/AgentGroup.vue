@@ -119,11 +119,11 @@ async function saveEdit() {
 }
 
 function handleNewTask() {
-  const prompt = window.prompt('Enter task prompt:')
-  if (!prompt) return
+  const name = window.prompt('Enter task name:')
+  if (!name) return
 
   window.dispatchEvent(new CustomEvent('create-task', {
-    detail: { agentId: props.agent.id, prompt }
+    detail: { agentId: props.agent.id, name }
   }))
 }
 </script>

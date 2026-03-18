@@ -62,3 +62,20 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
     from server.routes_ws import broadcast
     await broadcast({"type": "state_sync", "data": app_state.snapshot()})
     return agent.model_dump()
+
+
+class UpdateTaskBody(BaseModel):
+    name: str | None = None
+
+
+@router.patch("/tasks/{task_id}")
+async def update_task(task_id: str, body: UpdateTaskBody):
+    task = app_state.get_task(task_id)
+    if not task:
+        raise HTTPException(404, "task not found")
+    if body.name is not None:
+        task.name = body.name
+    app_state.save_tasks()
+    from server.routes_ws import broadcast
+    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    return task.model_dump()

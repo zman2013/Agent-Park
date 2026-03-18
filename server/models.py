@@ -22,7 +22,9 @@ class TaskStatus(str, Enum):
 class Message(BaseModel):
     id: str = Field(default_factory=_uid)
     role: Literal["agent", "user"] = "agent"
+    type: Literal["text", "tool_use", "tool_result"] = "text"
     content: str = ""
+    tool_name: str = ""
     streaming: bool = False
 
 

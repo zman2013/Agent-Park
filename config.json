@@ -8,14 +8,14 @@
   },
   "agents": [
     {
-      "name": "Scheduler",
+      "name": "neo-compiler",
       "command": "cco",
-      "cwd": ""
+      "cwd": "/data1/neo"
     },
     {
-      "name": "Codegen",
+      "name": "agent-park",
       "command": "cco",
-      "cwd": ""
+      "cwd": "/data1/common/agent-park"
     },
     {
       "name": "Reviewer",

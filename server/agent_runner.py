@@ -6,10 +6,11 @@ to allocate a pseudo-terminal for the child process.
 cco stream-json protocol (with --include-partial-messages):
   {"type":"system","subtype":"init", ...}
   {"type":"stream_event","event":{"type":"message_start", ...}}
-  {"type":"stream_event","event":{"type":"content_block_start", ...}}
-  {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}}
+  {"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text"|"tool_use", ...}}}
+  {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta"|"input_json_delta", ...}}}
   {"type":"stream_event","event":{"type":"content_block_stop", ...}}
-  {"type":"assistant","message":{"content":[{"type":"text","text":"..."}], ...}}
+  {"type":"assistant","message":{"content":[{"type":"text","text":"..."}, {"type":"tool_use","name":"...","input":{...}}], ...}}
+  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"...","content":"..."}]}}
   {"type":"result","subtype":"success"|"error", ...}
 """
 
@@ -21,6 +22,7 @@ import logging
 import os
 import pty
 import signal
+from pathlib import Path
 from typing import Any
 
 from server.models import Message, TaskStatus
@@ -28,13 +30,33 @@ from server.state import app_state
 
 logger = logging.getLogger(__name__)
 
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+SESSIONS_FILE = DATA_DIR / "sessions.json"
+
 
 class AgentRunner:
     def __init__(self) -> None:
         self._pids: dict[str, int] = {}           # task_id -> child pid
         self._master_fds: dict[str, int] = {}     # task_id -> pty master fd
         self._current_msg: dict[str, Message] = {}
-        self._session_ids: dict[str, str] = {}     # task_id -> cco session_id
+        self._current_block_type: dict[str, str] = {}  # task_id -> "text"|"tool_use"
+        self._session_ids: dict[str, str] = self._load_sessions()
+
+    def _load_sessions(self) -> dict[str, str]:
+        """Load session IDs from disk."""
+        if SESSIONS_FILE.exists():
+            try:
+                return json.loads(SESSIONS_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                logger.exception("Failed to load session IDs")
+        return {}
+
+    def _save_sessions(self) -> None:
+        """Persist session IDs to disk (atomic write)."""
+        DATA_DIR.mkdir(exist_ok=True)
+        tmp = SESSIONS_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._session_ids, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.rename(SESSIONS_FILE)
 
     async def run_task(self, task_id: str, prompt: str) -> None:
         """Spawn an agent subprocess and stream output."""
@@ -162,6 +184,7 @@ class AgentRunner:
             self._pids.pop(task_id, None)
             self._master_fds.pop(task_id, None)
             self._current_msg.pop(task_id, None)
+            self._current_block_type.pop(task_id, None)
 
     async def _run_mock(self, task_id: str, prompt: str) -> None:
         """Fallback mock mode when cco is not available."""
@@ -228,6 +251,7 @@ class AgentRunner:
             sid = chunk.get("session_id")
             if sid:
                 self._session_ids[task_id] = sid
+                self._save_sessions()
             return
 
         # ── stream_event: real-time deltas ──
@@ -239,24 +263,78 @@ class AgentRunner:
                 msg = Message(role="agent", content="", streaming=True)
                 task.messages.append(msg)
                 self._current_msg[task_id] = msg
+                self._current_block_type.pop(task_id, None)
                 await broadcast(
                     {"type": "message", "task_id": task_id, "message": msg.model_dump()}
                 )
 
+            elif event_type == "content_block_start":
+                content_block = event.get("content_block", {})
+                block_type = content_block.get("type", "text")
+                self._current_block_type[task_id] = block_type
+
+                if block_type == "tool_use":
+                    # Start a new tool_use message
+                    tool_name = content_block.get("name", "")
+                    # Close the current text message if streaming
+                    cur = self._current_msg.get(task_id)
+                    if cur and cur.streaming and cur.type == "text":
+                        cur.streaming = False
+                        await broadcast(
+                            {"type": "message_done", "task_id": task_id, "message_id": cur.id}
+                        )
+
+                    msg = Message(
+                        role="agent", type="tool_use", content="",
+                        tool_name=tool_name, streaming=True,
+                    )
+                    task.messages.append(msg)
+                    self._current_msg[task_id] = msg
+                    await broadcast(
+                        {"type": "message", "task_id": task_id, "message": msg.model_dump()}
+                    )
+
+                elif block_type == "text":
+                    # If there's no current text message, create one
+                    cur = self._current_msg.get(task_id)
+                    if not cur or cur.type != "text" or not cur.streaming:
+                        msg = Message(role="agent", content="", streaming=True)
+                        task.messages.append(msg)
+                        self._current_msg[task_id] = msg
+                        await broadcast(
+                            {"type": "message", "task_id": task_id, "message": msg.model_dump()}
+                        )
+
             elif event_type == "content_block_delta":
                 delta = event.get("delta", {})
-                text = delta.get("text", "")
+                delta_type = delta.get("type", "")
                 msg = self._current_msg.get(task_id)
-                if msg and text:
-                    msg.content += text
-                    await broadcast(
-                        {
-                            "type": "message_chunk",
-                            "task_id": task_id,
-                            "message_id": msg.id,
-                            "delta": text,
-                        }
-                    )
+
+                if delta_type == "text_delta":
+                    text = delta.get("text", "")
+                    if msg and text:
+                        msg.content += text
+                        await broadcast(
+                            {
+                                "type": "message_chunk",
+                                "task_id": task_id,
+                                "message_id": msg.id,
+                                "delta": text,
+                            }
+                        )
+
+                elif delta_type == "input_json_delta":
+                    partial = delta.get("partial_json", "")
+                    if msg and partial and msg.type == "tool_use":
+                        msg.content += partial
+                        await broadcast(
+                            {
+                                "type": "message_chunk",
+                                "task_id": task_id,
+                                "message_id": msg.id,
+                                "delta": partial,
+                            }
+                        )
 
             elif event_type == "content_block_stop":
                 msg = self._current_msg.get(task_id)
@@ -266,6 +344,7 @@ class AgentRunner:
                         {"type": "message_done", "task_id": task_id, "message_id": msg.id}
                     )
                     self._current_msg.pop(task_id, None)
+                self._current_block_type.pop(task_id, None)
 
             return
 
@@ -273,24 +352,92 @@ class AgentRunner:
         if chunk_type == "assistant":
             message_data = chunk.get("message", {})
             content_blocks = message_data.get("content", [])
-            full_text = ""
-            for block in content_blocks:
-                if block.get("type") == "text":
-                    full_text += block.get("text", "")
 
-            msg = self._current_msg.pop(task_id, None)
-            if msg:
-                msg.content = full_text
-                msg.streaming = False
+            # Close any still-streaming message
+            cur = self._current_msg.pop(task_id, None)
+            if cur and cur.streaming:
+                cur.streaming = False
                 await broadcast(
-                    {"type": "message_done", "task_id": task_id, "message_id": msg.id}
+                    {"type": "message_done", "task_id": task_id, "message_id": cur.id}
                 )
-            elif full_text:
-                msg = Message(role="agent", content=full_text, streaming=False)
-                task.messages.append(msg)
-                await broadcast(
-                    {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-                )
+
+            # Process each content block in the assistant message
+            for block in content_blocks:
+                btype = block.get("type", "")
+
+                if btype == "text":
+                    full_text = block.get("text", "")
+                    if not full_text:
+                        continue
+                    # Find existing text message to update, or create new one
+                    existing = None
+                    for m in reversed(task.messages):
+                        if m.role == "agent" and m.type == "text":
+                            existing = m
+                            break
+                    if existing:
+                        existing.content = full_text
+                        existing.streaming = False
+                    else:
+                        msg = Message(role="agent", content=full_text, streaming=False)
+                        task.messages.append(msg)
+                        await broadcast(
+                            {"type": "message", "task_id": task_id, "message": msg.model_dump()}
+                        )
+
+                elif btype == "tool_use":
+                    tool_name = block.get("name", "")
+                    tool_input = block.get("input", {})
+                    content_str = json.dumps(tool_input, ensure_ascii=False)
+                    # Find existing tool_use message to update, or create new one
+                    existing = None
+                    for m in reversed(task.messages):
+                        if m.role == "agent" and m.type == "tool_use" and m.tool_name == tool_name:
+                            existing = m
+                            break
+                    if existing:
+                        existing.content = content_str
+                        existing.streaming = False
+                    else:
+                        msg = Message(
+                            role="agent", type="tool_use", content=content_str,
+                            tool_name=tool_name, streaming=False,
+                        )
+                        task.messages.append(msg)
+                        await broadcast(
+                            {"type": "message", "task_id": task_id, "message": msg.model_dump()}
+                        )
+
+            app_state.save_tasks()
+            return
+
+        # ── user: tool_result ──
+        if chunk_type == "user":
+            message_data = chunk.get("message", {})
+            content_blocks = message_data.get("content", [])
+            for block in content_blocks:
+                if block.get("type") == "tool_result":
+                    result_content = block.get("content", "")
+                    # Try to get a readable summary from tool_use_result
+                    tool_result_meta = chunk.get("tool_use_result", {})
+                    if isinstance(result_content, list):
+                        # Some tool results are lists of content blocks
+                        parts = []
+                        for part in result_content:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                parts.append(part.get("text", ""))
+                        result_content = "\n".join(parts)
+                    if not isinstance(result_content, str):
+                        result_content = json.dumps(result_content, ensure_ascii=False)
+
+                    msg = Message(
+                        role="agent", type="tool_result",
+                        content=result_content, streaming=False,
+                    )
+                    task.messages.append(msg)
+                    await broadcast(
+                        {"type": "message", "task_id": task_id, "message": msg.model_dump()}
+                    )
             return
 
         # ── result: process finished ──
@@ -343,6 +490,7 @@ class AgentRunner:
         if task and task.status not in (TaskStatus.success, TaskStatus.failed):
             task.status = status
         await self._broadcast_status(task_id, status)
+        app_state.save_tasks()
 
     async def _broadcast_status(self, task_id: str, status: TaskStatus) -> None:
         from server.routes_ws import broadcast

@@ -40,12 +40,12 @@ const store = useAgentStore()
 const { connected: wsConnected, createTask, sendUserMessage } = useWebSocket()
 
 function onCreateTask(e) {
-  const { agentId, prompt } = e.detail
+  const { agentId, name } = e.detail
   if (!wsConnected.value) {
     store.addToast('Cannot create task: WebSocket not connected', 'error')
     return
   }
-  createTask(agentId, prompt)
+  createTask(agentId, name)
 }
 
 function onSendMessage(e) {
