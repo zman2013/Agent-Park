@@ -127,7 +127,16 @@ class AgentRunner:
                     os.close(slave_fd)
                 if agent_cwd:
                     os.chdir(agent_cwd)
-                os.execvp(args[0], args)
+                # Strip virtualenv env vars so they don't leak into the agent process
+                env = os.environ.copy()
+                venv = env.pop("VIRTUAL_ENV", None)
+                env.pop("VIRTUAL_ENV_PROMPT", None)
+                if venv:
+                    venv_bin = os.path.join(venv, "bin")
+                    path_parts = env.get("PATH", "").split(os.pathsep)
+                    path_parts = [p for p in path_parts if p != venv_bin]
+                    env["PATH"] = os.pathsep.join(path_parts)
+                os.execvpe(args[0], args, env)
                 # execvp does not return
             else:
                 # ── Parent process ──
@@ -193,6 +202,12 @@ class AgentRunner:
             self._master_fds.pop(task_id, None)
             self._current_msg.pop(task_id, None)
             self._current_block_type.pop(task_id, None)
+            # Fallback: if the task is still marked running (e.g. asyncio Task was
+            # destroyed before _finish_task could be called), mark it failed so the
+            # UI stops showing a permanent yellow spinner.
+            task = app_state.get_task(task_id)
+            if task and task.status == TaskStatus.running:
+                await self._finish_task(task_id, TaskStatus.failed)
 
     async def _run_mock(self, task_id: str, prompt: str) -> None:
         """Fallback mock mode when cco is not available."""

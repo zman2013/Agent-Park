@@ -11,9 +11,15 @@ BACKEND_PID="$PID_DIR/backend.pid"
 FRONTEND_PID="$PID_DIR/frontend.pid"
 LOG_DIR="$SCRIPT_DIR/logs"
 
+# Python 解释器（优先使用项目 .venv）
+PYTHON="python3"
+if [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
+    PYTHON="$SCRIPT_DIR/.venv/bin/python"
+fi
+
 # 从 config.json 读取端口
 read_config() {
-    python3 -c "
+    "$PYTHON" -c "
 import json, sys
 with open('$CONFIG_FILE') as f:
     c = json.load(f)
@@ -52,17 +58,11 @@ do_start() {
     port=$(echo "$cfg" | sed -n '2p')
     fe_port=$(echo "$cfg" | sed -n '3p')
 
-    # Python 解释器
-    local python="python3"
-    if [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
-        python="$SCRIPT_DIR/.venv/bin/python"
-    fi
-
     # 启动 backend
     if ! is_running "$BACKEND_PID"; then
         echo "正在启动 backend (${host}:${port})..."
         cd "$SCRIPT_DIR"
-        nohup "$python" -m uvicorn server.main:app \
+        nohup "$PYTHON" -m uvicorn server.main:app \
             --host "$host" --port "$port" \
             >> "$LOG_DIR/backend.log" 2>&1 &
         echo $! > "$BACKEND_PID"
