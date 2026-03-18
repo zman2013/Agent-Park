@@ -43,3 +43,19 @@ async def delete_task(task_id: str):
     if not app_state.delete_task(task_id):
         raise HTTPException(404, "task not found")
     return {"ok": True}
+
+
+class UpdateAgentBody(BaseModel):
+    cwd: str | None = None
+
+
+@router.patch("/agents/{agent_id}")
+async def update_agent(agent_id: str, body: UpdateAgentBody):
+    agent = app_state.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    if body.cwd is not None:
+        agent.cwd = body.cwd
+    from server.routes_ws import broadcast
+    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    return agent.model_dump()

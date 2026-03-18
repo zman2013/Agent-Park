@@ -54,6 +54,7 @@ class AgentRunner:
 
         agent = app_state.get_agent(task.agent_id)
         command = agent.command if agent else "cco"
+        agent_cwd = agent.cwd if agent and agent.cwd else ""
 
         # Build command args
         args = [
@@ -94,6 +95,8 @@ class AgentRunner:
                 os.dup2(slave_fd, 2)
                 if slave_fd > 2:
                     os.close(slave_fd)
+                if agent_cwd:
+                    os.chdir(agent_cwd)
                 os.execvp(args[0], args)
                 # execvp does not return
             else:
@@ -279,6 +282,9 @@ class AgentRunner:
             if msg:
                 msg.content = full_text
                 msg.streaming = False
+                await broadcast(
+                    {"type": "message_done", "task_id": task_id, "message_id": msg.id}
+                )
             elif full_text:
                 msg = Message(role="agent", content=full_text, streaming=False)
                 task.messages.append(msg)
@@ -323,6 +329,16 @@ class AgentRunner:
         )
 
     async def _finish_task(self, task_id: str, status: TaskStatus) -> None:
+        from server.routes_ws import broadcast
+
+        # Close any still-streaming message before finishing the task
+        msg = self._current_msg.pop(task_id, None)
+        if msg and msg.streaming:
+            msg.streaming = False
+            await broadcast(
+                {"type": "message_done", "task_id": task_id, "message_id": msg.id}
+            )
+
         task = app_state.get_task(task_id)
         if task and task.status not in (TaskStatus.success, TaskStatus.failed):
             task.status = status

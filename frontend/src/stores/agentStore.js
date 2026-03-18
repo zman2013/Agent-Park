@@ -98,6 +98,13 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  function updateAgent(agentId, fields) {
+    const agent = agents.value.find(a => a.id === agentId)
+    if (agent) {
+      Object.assign(agent, fields)
+    }
+  }
+
   return {
     agents,
     tasks,
@@ -116,5 +123,6 @@ export const useAgentStore = defineStore('agent', () => {
     addToast,
     removeToast,
     removeTask,
+    updateAgent,
   }
 })

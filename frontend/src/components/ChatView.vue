@@ -4,20 +4,25 @@
       No messages yet. Send a prompt to get started.
     </div>
     <MessageBubble
-      v-for="msg in task.messages"
+      v-for="msg in visibleMessages"
       :key="msg.id"
       :message="msg"
     />
+    <div v-if="task.status === 'running'" class="streaming-cursor text-sm px-4"></div>
   </div>
 </template>
 
 <script setup>
-import { ref, watch, nextTick } from 'vue'
+import { ref, watch, nextTick, computed } from 'vue'
 import MessageBubble from './MessageBubble.vue'
 
 const props = defineProps({
   task: { type: Object, required: true },
 })
+
+const visibleMessages = computed(() =>
+  props.task.messages.filter(m => m.content || m.streaming)
+)
 
 const chatContainer = ref(null)
 

@@ -1,13 +1,12 @@
 <template>
-  <div :class="message.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
+  <div class="flex justify-start">
     <div
-      class="max-w-2xl rounded-lg px-4 py-2 text-sm"
+      class="w-full rounded-lg px-4 py-2 text-sm"
       :class="bubbleClass"
     >
       <div
         v-if="message.role === 'agent'"
         class="markdown-body"
-        :class="{ 'streaming-cursor': message.streaming }"
         v-html="renderedContent"
       ></div>
       <div v-else class="whitespace-pre-wrap">{{ message.content }}</div>
