@@ -91,6 +91,14 @@ class AppState:
         self.save_tasks()
         return task
 
+    def create_agent(self, name: str, command: str = "cco", cwd: str = "") -> Agent:
+        aid = _stable_agent_id(name)
+        if aid in self.agents:
+            raise ValueError(f"Agent with name '{name}' already exists")
+        agent = Agent(id=aid, name=name, command=command, cwd=cwd)
+        self.agents[aid] = agent
+        return agent
+
     def delete_task(self, task_id: str) -> bool:
         task = self.tasks.pop(task_id, None)
         if task is None:

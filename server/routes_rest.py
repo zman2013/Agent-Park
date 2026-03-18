@@ -19,6 +19,23 @@ async def list_agents():
     return [a.model_dump() for a in app_state.agents.values()]
 
 
+class CreateAgentBody(BaseModel):
+    name: str
+    command: str = "cco"
+    cwd: str = ""
+
+
+@router.post("/agents")
+async def create_agent(body: CreateAgentBody):
+    try:
+        agent = app_state.create_agent(body.name, body.command, body.cwd)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    from server.routes_ws import broadcast
+    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    return agent.model_dump()
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(task_id: str):
     task = app_state.get_task(task_id)
