@@ -90,11 +90,11 @@ function onOpenMemory(e) {
 }
 
 function handleGlobalKeydown(e) {
-  if ((e.metaKey || e.ctrlKey) && e.key === 'j') {
+  if (e.metaKey && e.key === 'j') {
     e.preventDefault()
     terminalVisible.value = !terminalVisible.value
   }
-  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+  if (e.metaKey && e.key === 'k') {
     e.preventDefault()
     if (store.memoryPanelOpen) {
       store.closeMemoryPanel()
