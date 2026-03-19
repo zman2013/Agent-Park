@@ -94,3 +94,20 @@
   from { transform: translateX(0); opacity: 1; }
   to { transform: translateX(100%); opacity: 0; }
 }
+
+/* Terminal panel slide animation */
+.terminal-slide-enter-active,
+.terminal-slide-leave-active {
+  transition: max-height 0.25s ease, opacity 0.15s ease;
+  overflow: hidden;
+}
+.terminal-slide-enter-from,
+.terminal-slide-leave-to {
+  max-height: 0;
+  opacity: 0;
+}
+.terminal-slide-enter-to,
+.terminal-slide-leave-from {
+  max-height: 50vh;
+  opacity: 1;
+}

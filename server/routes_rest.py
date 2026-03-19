@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
+
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from server.state import app_state
@@ -96,3 +100,36 @@ async def update_task(task_id: str, body: UpdateTaskBody):
     from server.routes_ws import broadcast
     await broadcast({"type": "state_sync", "data": app_state.snapshot()})
     return task.model_dump()
+
+
+class ShellExecBody(BaseModel):
+    cwd: str = ""
+    command: str
+
+
+@router.post("/shell/exec")
+async def shell_exec(body: ShellExecBody):
+    cwd = body.cwd or None
+
+    async def stream_output():
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                body.command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=cwd,
+                env={**os.environ},
+            )
+            async for line in proc.stdout:
+                yield line
+            await proc.wait()
+        except FileNotFoundError as e:
+            yield f"Error: {e}\n".encode()
+        except Exception as e:
+            yield f"Error: {e}\n".encode()
+
+    return StreamingResponse(
+        stream_output(),
+        media_type="text/plain; charset=utf-8",
+        headers={"X-Accel-Buffering": "no"},
+    )
