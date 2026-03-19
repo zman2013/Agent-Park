@@ -6,7 +6,7 @@ import asyncio
 import os
 
 from fastapi import APIRouter, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from server.state import app_state
@@ -85,6 +85,18 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
     return agent.model_dump()
 
 
+class ReorderAgentsBody(BaseModel):
+    order: list[str]
+
+
+@router.post("/agents/reorder")
+async def reorder_agents(body: ReorderAgentsBody):
+    app_state.reorder_agents(body.order)
+    from server.routes_ws import broadcast
+    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    return {"ok": True}
+
+
 class UpdateTaskBody(BaseModel):
     name: str | None = None
 
@@ -105,6 +117,55 @@ async def update_task(task_id: str, body: UpdateTaskBody):
 class ShellExecBody(BaseModel):
     cwd: str = ""
     command: str
+
+
+# ── Memory endpoints ──────────────────────────────────────────────────────────
+
+class MemoryAddBody(BaseModel):
+    content: str
+    type: str = "note"
+
+
+@router.get("/agents/{agent_id}/memory")
+async def get_memory(agent_id: str):
+    if agent_id not in app_state.agents:
+        raise HTTPException(404, "agent not found")
+    from server.memory import list_memory
+    return list_memory(agent_id)
+
+
+@router.post("/agents/{agent_id}/memory")
+async def add_memory(agent_id: str, body: MemoryAddBody):
+    if agent_id not in app_state.agents:
+        raise HTTPException(404, "agent not found")
+    from server.memory import compress_content, append_memory, MAX_CONTENT_LENGTH, _utcnow_iso
+    from server.config import memory_config
+
+    command = memory_config()["command"]
+    compressed = await compress_content(body.content, command)
+
+    if len(compressed) > MAX_CONTENT_LENGTH:
+        return JSONResponse(
+            status_code=422,
+            content={
+                "detail": f"压缩后内容过长（{len(compressed)} 字符），超过限制 {MAX_CONTENT_LENGTH} 字符，请精简输入内容",
+                "compressed": compressed,
+            },
+        )
+
+    entry = {"type": body.type, "timestamp": _utcnow_iso(), "content": compressed}
+    append_memory(agent_id, entry)
+    return entry
+
+
+@router.delete("/agents/{agent_id}/memory/{line_index}")
+async def delete_memory(agent_id: str, line_index: int):
+    if agent_id not in app_state.agents:
+        raise HTTPException(404, "agent not found")
+    from server.memory import delete_memory_line
+    if not delete_memory_line(agent_id, line_index):
+        raise HTTPException(404, "memory entry not found")
+    return {"ok": True}
 
 
 @router.post("/shell/exec")

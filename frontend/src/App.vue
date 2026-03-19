@@ -25,6 +25,12 @@
         :cwd="currentAgentCwd"
         @close="terminalVisible = false"
       />
+      <MemoryPanel
+        :visible="store.memoryPanelOpen"
+        :agent-id="store.memoryAgentId"
+        :agent-name="memoryAgentName"
+        @close="store.closeMemoryPanel()"
+      />
     </div>
 
     <!-- Toasts -->
@@ -41,6 +47,7 @@ import ChatView from './components/ChatView.vue'
 import ChatInput from './components/ChatInput.vue'
 import ToastContainer from './components/ToastContainer.vue'
 import TerminalPanel from './components/TerminalPanel.vue'
+import MemoryPanel from './components/MemoryPanel.vue'
 
 const store = useAgentStore()
 const { connected: wsConnected, createTask, sendUserMessage } = useWebSocket()
@@ -52,6 +59,12 @@ const currentAgentCwd = computed(() => {
   if (!task) return ''
   const agent = store.agents.find(a => a.id === task.agent_id)
   return agent?.cwd || ''
+})
+
+const memoryAgentName = computed(() => {
+  if (!store.memoryAgentId) return ''
+  const agent = store.agents.find(a => a.id === store.memoryAgentId)
+  return agent?.name || ''
 })
 
 function onCreateTask(e) {
@@ -72,22 +85,39 @@ function onSendMessage(e) {
   sendUserMessage(taskId, content)
 }
 
+function onOpenMemory(e) {
+  store.openMemoryPanel(e.detail.agentId)
+}
+
 function handleGlobalKeydown(e) {
   if ((e.metaKey || e.ctrlKey) && e.key === 'j') {
     e.preventDefault()
     terminalVisible.value = !terminalVisible.value
+  }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+    e.preventDefault()
+    if (store.memoryPanelOpen) {
+      store.closeMemoryPanel()
+    } else {
+      // Open for current task's agent, or first agent
+      const task = store.currentTask
+      const agentId = task?.agent_id || store.agents[0]?.id
+      if (agentId) store.openMemoryPanel(agentId)
+    }
   }
 }
 
 onMounted(() => {
   window.addEventListener('create-task', onCreateTask)
   window.addEventListener('send-message', onSendMessage)
+  window.addEventListener('open-memory', onOpenMemory)
   window.addEventListener('keydown', handleGlobalKeydown)
 })
 
 onUnmounted(() => {
   window.removeEventListener('create-task', onCreateTask)
   window.removeEventListener('send-message', onSendMessage)
+  window.removeEventListener('open-memory', onOpenMemory)
   window.removeEventListener('keydown', handleGlobalKeydown)
 })
 </script>

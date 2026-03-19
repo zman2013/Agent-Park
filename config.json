@@ -6,6 +6,10 @@
   "frontend": {
     "port": 3000
   },
+  "memory": {
+    "command": "cc0",
+    "max_lines": 200
+  },
   "agents": [
     {
       "name": "neo-compiler",

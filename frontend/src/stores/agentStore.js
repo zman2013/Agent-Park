@@ -8,6 +8,11 @@ export const useAgentStore = defineStore('agent', () => {
   const collapsed = ref({})
   const toasts = ref([])
 
+  // Memory panel state
+  const memoryPanelOpen = ref(false)
+  const memoryAgentId = ref(null)
+  const agentMemory = ref({})  // { agent_id: [entries...] }
+
   const currentTask = computed(() => {
     if (!currentTaskId.value) return null
     return tasks.value[currentTaskId.value] || null
@@ -27,6 +32,7 @@ export const useAgentStore = defineStore('agent', () => {
     const task = tasks.value[taskId]
     if (task) {
       task.status = status
+      task.updated_at = new Date().toISOString()
     }
   }
 
@@ -112,6 +118,62 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  function moveAgentUp(agentId) {
+    const idx = agents.value.findIndex(a => a.id === agentId)
+    if (idx > 0) {
+      const tmp = agents.value[idx - 1]
+      agents.value[idx - 1] = agents.value[idx]
+      agents.value[idx] = tmp
+      _saveAgentOrder()
+    }
+  }
+
+  function moveAgentDown(agentId) {
+    const idx = agents.value.findIndex(a => a.id === agentId)
+    if (idx !== -1 && idx < agents.value.length - 1) {
+      const tmp = agents.value[idx + 1]
+      agents.value[idx + 1] = agents.value[idx]
+      agents.value[idx] = tmp
+      _saveAgentOrder()
+    }
+  }
+
+  function _saveAgentOrder() {
+    const order = agents.value.map(a => a.id)
+    fetch('/api/agents/reorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ order }),
+    }).catch(() => {})
+  }
+
+  function openMemoryPanel(agentId) {
+    memoryAgentId.value = agentId
+    memoryPanelOpen.value = true
+  }
+
+  function closeMemoryPanel() {
+    memoryPanelOpen.value = false
+  }
+
+  function setAgentMemory(agentId, entries) {
+    agentMemory.value[agentId] = entries
+  }
+
+  function prependMemoryEntry(agentId, entry) {
+    if (!agentMemory.value[agentId]) {
+      agentMemory.value[agentId] = []
+    }
+    agentMemory.value[agentId].unshift(entry)
+  }
+
+  function removeMemoryEntry(agentId, lineIndex) {
+    const entries = agentMemory.value[agentId]
+    if (!entries) return
+    const idx = entries.findIndex(e => e.line_index === lineIndex)
+    if (idx !== -1) entries.splice(idx, 1)
+  }
+
   return {
     agents,
     tasks,
@@ -119,6 +181,9 @@ export const useAgentStore = defineStore('agent', () => {
     currentTask,
     collapsed,
     toasts,
+    memoryPanelOpen,
+    memoryAgentId,
+    agentMemory,
     syncState,
     updateTaskStatus,
     addMessage,
@@ -132,5 +197,12 @@ export const useAgentStore = defineStore('agent', () => {
     removeTask,
     updateAgent,
     updateTaskTurns,
+    moveAgentUp,
+    moveAgentDown,
+    openMemoryPanel,
+    closeMemoryPanel,
+    setAgentMemory,
+    prependMemoryEntry,
+    removeMemoryEntry,
   }
 })

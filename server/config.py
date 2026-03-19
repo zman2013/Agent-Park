@@ -36,3 +36,12 @@ def agent_defaults() -> list[dict]:
         {"name": "Codegen", "command": "cco", "cwd": ""},
         {"name": "Reviewer", "command": "cco", "cwd": ""},
     ])
+
+
+def memory_config() -> dict:
+    """Return the global memory configuration with defaults."""
+    cfg = get_config().get("memory", {})
+    return {
+        "command": cfg.get("command", "cco"),
+        "max_lines": int(cfg.get("max_lines", 200)),
+    }

@@ -25,6 +25,7 @@ class AppState:
     def __init__(self) -> None:
         self.agents: dict[str, Agent] = {}
         self.tasks: dict[str, Task] = {}
+        self._agent_order: list[str] = []  # ordered list of agent ids
         self._init_default_agents()
         self._load_persisted_data()
 
@@ -37,6 +38,7 @@ class AppState:
                 cwd=cfg.get("cwd", ""),
             )
             self.agents[agent.id] = agent
+            self._agent_order.append(agent.id)
 
     def _load_persisted_data(self) -> None:
         """Load agents and tasks from disk."""
@@ -49,6 +51,16 @@ class AppState:
             for aid, adata in raw.get("agents", {}).items():
                 if aid not in self.agents:
                     self.agents[aid] = Agent(**adata)
+                    self._agent_order.append(aid)
+
+            # Restore persisted order (only ids that still exist)
+            saved_order = raw.get("agent_order", [])
+            if saved_order:
+                existing = set(self.agents.keys())
+                restored = [aid for aid in saved_order if aid in existing]
+                # Append any agents not in the saved order (e.g. newly added defaults)
+                restored += [aid for aid in self._agent_order if aid not in restored]
+                self._agent_order = restored
 
             for tid, tdata in raw.get("tasks", {}).items():
                 agent_id = tdata.get("agent_id")
@@ -70,10 +82,11 @@ class AppState:
             logger.exception("Failed to load persisted tasks")
 
     def save_tasks(self) -> None:
-        """Persist non-default agents and all tasks to disk (atomic write)."""
+        """Persist non-default agents, all tasks, and agent order to disk (atomic write)."""
         DATA_DIR.mkdir(exist_ok=True)
         default_ids = {_stable_agent_id(cfg["name"]) for cfg in agent_defaults()}
         payload = {
+            "agent_order": self._agent_order,
             "agents": {
                 aid: a.model_dump()
                 for aid, a in self.agents.items()
@@ -109,6 +122,7 @@ class AppState:
             raise ValueError(f"Agent with name '{name}' already exists")
         agent = Agent(id=aid, name=name, command=command, cwd=cwd)
         self.agents[aid] = agent
+        self._agent_order.append(aid)
         self.save_tasks()
         return agent
 
@@ -122,9 +136,19 @@ class AppState:
         self.save_tasks()
         return True
 
+    def reorder_agents(self, ordered_ids: list[str]) -> None:
+        """Persist a new agent display order."""
+        existing = set(self.agents.keys())
+        valid = [aid for aid in ordered_ids if aid in existing]
+        # Append any missing agents at the end
+        valid += [aid for aid in self._agent_order if aid not in valid]
+        self._agent_order = valid
+        self.save_tasks()
+
     def snapshot(self) -> dict:
+        ordered = [self.agents[aid] for aid in self._agent_order if aid in self.agents]
         return {
-            "agents": [a.model_dump() for a in self.agents.values()],
+            "agents": [a.model_dump() for a in ordered],
             "tasks": {tid: t.model_dump() for tid, t in self.tasks.items()},
         }
 

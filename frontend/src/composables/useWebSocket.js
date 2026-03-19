@@ -90,9 +90,17 @@ export function useWebSocket() {
 
   function handleMessage(data) {
     switch (data.type) {
-      case 'state_sync':
+      case 'state_sync': {
+        // Detect newly added tasks before syncing
+        const prevTaskIds = new Set(Object.keys(store.tasks))
         store.syncState(data.data)
+        // If exactly one new task appeared, auto-select it
+        const newTaskIds = Object.keys(store.tasks).filter(id => !prevTaskIds.has(id))
+        if (newTaskIds.length === 1) {
+          store.selectTask(newTaskIds[0])
+        }
         break
+      }
 
       case 'task_status': {
         store.updateTaskStatus(data.task_id, data.status)

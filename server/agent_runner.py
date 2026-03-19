@@ -173,7 +173,10 @@ class AgentRunner:
                         rc = os.WEXITSTATUS(st) if os.WIFEXITED(st) else -1
                     except ChildProcessError:
                         rc = -1
-                    loop.call_soon_threadsafe(wait_future.set_result, rc)
+                    # Guard against the asyncio Task being destroyed before this
+                    # callback fires (e.g. task was killed for resume).
+                    if not wait_future.done():
+                        loop.call_soon_threadsafe(wait_future.set_result, rc)
 
                 threading.Thread(target=_wait_child, daemon=True).start()
 
@@ -184,13 +187,21 @@ class AgentRunner:
                     lambda: read_protocol, os.fdopen(master_fd, "rb", 0)
                 )
 
-                # When ept exits, close the transport to unblock reader.read().
-                # Must be done after connect_read_pipe so read_transport is available.
-                async def _close_transport_on_exit():
-                    await wait_future
+                # When ept exits: close transport (unblocks reader.read) AND
+                # ensure _finish_task is called even if the asyncio Task is destroyed.
+                def _on_ept_exit(fut: asyncio.Future) -> None:
+                    # Always close transport so read loop unblocks
                     read_transport.close()
+                    # If the coroutine Task was GC'd, finish the agent task here
+                    rc = fut.result() if not fut.cancelled() else -1
+                    status = TaskStatus.success if rc == 0 else TaskStatus.failed
+                    agent_task = app_state.get_task(task_id)
+                    if agent_task and agent_task.status == TaskStatus.running:
+                        asyncio.ensure_future(self._finish_task(task_id, status))
 
-                closer_task = asyncio.create_task(_close_transport_on_exit())
+                wait_future.add_done_callback(_on_ept_exit)
+
+                closer_task = None  # transport is now closed via callback
 
                 buf = b""
                 try:
@@ -218,7 +229,6 @@ class AgentRunner:
                                 pass
                 finally:
                     read_transport.close()
-                    closer_task.cancel()
 
                 returncode = await wait_future
                 logger.info("cco pid=%d exited with code %d", pid, returncode)
@@ -310,8 +320,20 @@ class AgentRunner:
         if chunk_type == "system" and chunk.get("subtype") == "init":
             sid = chunk.get("session_id")
             if sid:
-                self._session_ids[task_id] = sid
-                self._save_sessions()
+                prev_sid = self._session_ids.get(task_id)
+                if prev_sid and sid != prev_sid:
+                    # A new session was opened instead of resuming — the previous
+                    # session likely expired.  Do NOT save the new session ID so
+                    # that the next run will start fresh rather than resuming an
+                    # empty context.  The result chunk will carry is_error=true
+                    # which will mark the task failed.
+                    logger.warning(
+                        "Session changed for task %s: %s -> %s (previous session may have expired)",
+                        task_id, prev_sid, sid,
+                    )
+                else:
+                    self._session_ids[task_id] = sid
+                    self._save_sessions()
             return
 
         # ── stream_event: real-time deltas ──
@@ -563,7 +585,30 @@ class AgentRunner:
                         {"type": "message", "task_id": task_id, "message": notice.model_dump()}
                     )
 
-            if is_error or subtype == "error":
+            if is_error or subtype in ("error", "error_during_execution"):
+                error_msgs = chunk.get("errors", [])
+                if error_msgs:
+                    joined = "；".join(str(e) for e in error_msgs)
+                    # Detect session expiry and clear stale session ID
+                    if "No conversation found" in joined:
+                        old_sid = self._session_ids.pop(task_id, None)
+                        if old_sid:
+                            self._save_sessions()
+                            logger.warning(
+                                "Session expired for task %s (sid=%s), cleared from store",
+                                task_id, old_sid,
+                            )
+                        notice_content = f"会话已失效，下次发送消息将重新开始会话。（原因：{joined}）"
+                    else:
+                        notice_content = f"执行出错：{joined}"
+                    notice = Message(
+                        role="agent", type="system", streaming=False,
+                        content=notice_content,
+                    )
+                    task.messages.append(notice)
+                    await broadcast(
+                        {"type": "message", "task_id": task_id, "message": notice.model_dump()}
+                    )
                 await self._finish_task(task_id, TaskStatus.failed)
             return
 
