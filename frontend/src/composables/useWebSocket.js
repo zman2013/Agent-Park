@@ -1,11 +1,46 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 
+const CHUNK_FLUSH_INTERVAL_MS = 100
+
 export function useWebSocket() {
   const store = useAgentStore()
   const connected = ref(false)
   let ws = null
   let reconnectTimer = null
+  let chunkFlushTimer = null
+  const pendingChunks = new Map()
+
+  function getChunkKey(taskId, messageId) {
+    return `${taskId}:${messageId}`
+  }
+
+  function flushPendingChunks() {
+    if (chunkFlushTimer) {
+      clearTimeout(chunkFlushTimer)
+      chunkFlushTimer = null
+    }
+    if (pendingChunks.size === 0) return
+
+    const chunks = Array.from(pendingChunks.values())
+    pendingChunks.clear()
+    store.appendChunks(chunks)
+  }
+
+  function queueChunk(taskId, messageId, delta) {
+    const key = getChunkKey(taskId, messageId)
+    const existing = pendingChunks.get(key)
+
+    if (existing) {
+      existing.delta += delta
+    } else {
+      pendingChunks.set(key, { taskId, messageId, delta })
+    }
+
+    if (!chunkFlushTimer) {
+      chunkFlushTimer = setTimeout(flushPendingChunks, CHUNK_FLUSH_INTERVAL_MS)
+    }
+  }
 
   function connect() {
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -37,7 +72,6 @@ export function useWebSocket() {
 
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data)
-      console.log('[WS] recv', data.type, data)
       handleMessage(data)
     }
   }
@@ -91,6 +125,7 @@ export function useWebSocket() {
   function handleMessage(data) {
     switch (data.type) {
       case 'state_sync': {
+        flushPendingChunks()
         // Detect newly added tasks before syncing
         const prevTaskIds = new Set(Object.keys(store.tasks))
         store.syncState(data.data)
@@ -123,10 +158,11 @@ export function useWebSocket() {
         break
 
       case 'message_chunk':
-        store.appendChunk(data.task_id, data.message_id, data.delta)
+        queueChunk(data.task_id, data.message_id, data.delta)
         break
 
       case 'message_done':
+        flushPendingChunks()
         store.markMessageDone(data.task_id, data.message_id)
         break
 
@@ -159,6 +195,7 @@ export function useWebSocket() {
   })
 
   onUnmounted(() => {
+    flushPendingChunks()
     clearTimeout(reconnectTimer)
     if (ws) ws.close()
   })

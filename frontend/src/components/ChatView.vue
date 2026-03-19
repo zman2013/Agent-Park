@@ -8,6 +8,9 @@
       <div v-if="task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
         No messages yet. Send a prompt to get started.
       </div>
+      <div v-if="isLiveWindowing" class="text-gray-600 text-xs text-center">
+        Showing the latest {{ renderedMessageCount }} messages during live streaming for performance.
+      </div>
       <MessageBubble
         v-for="msg in visibleMessages"
         :key="msg.id"
@@ -19,26 +22,66 @@
 </template>
 
 <script setup>
-import { ref, watch, nextTick, computed, onMounted } from 'vue'
+import { ref, watch, nextTick, computed, onMounted, onUnmounted } from 'vue'
 import MessageBubble from './MessageBubble.vue'
+
+const AUTO_SCROLL_DELAY_MS = 120
+const MAX_LIVE_MESSAGES = 200
 
 const props = defineProps({
   task: { type: Object, required: true },
 })
 
-const visibleMessages = computed(() =>
-  props.task.messages.filter(m => m.content || m.streaming)
-)
-
 const chatContainer = ref(null)
 // Whether the user has not yet manually scrolled up after opening the window
 const isAtBottom = ref(true)
+let autoScrollTimer = null
+
+const allVisibleMessages = computed(() =>
+  props.task.messages.filter(m => m.content || m.streaming)
+)
+
+const isLiveWindowing = computed(() =>
+  props.task.status === 'running' &&
+  isAtBottom.value &&
+  allVisibleMessages.value.length > MAX_LIVE_MESSAGES
+)
+
+const visibleMessages = computed(() => {
+  if (!isLiveWindowing.value) return allVisibleMessages.value
+  return allVisibleMessages.value.slice(-MAX_LIVE_MESSAGES)
+})
+
+const renderedMessageCount = computed(() => visibleMessages.value.length)
 
 function scrollToBottom() {
   const el = chatContainer.value
   if (el) {
     el.scrollTop = el.scrollHeight
   }
+}
+
+function clearAutoScrollTimer() {
+  if (autoScrollTimer) {
+    clearTimeout(autoScrollTimer)
+    autoScrollTimer = null
+  }
+}
+
+function scheduleAutoScroll(force = false) {
+  clearAutoScrollTimer()
+  autoScrollTimer = setTimeout(async () => {
+    autoScrollTimer = null
+    await nextTick()
+    const el = chatContainer.value
+    if (!el) return
+    if (!force) {
+      const threshold = 150
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+      if (!nearBottom) return
+    }
+    scrollToBottom()
+  }, AUTO_SCROLL_DELAY_MS)
 }
 
 function onScroll() {
@@ -67,10 +110,9 @@ onMounted(async () => {
 // On new messages: only auto-scroll if user is still at the bottom
 watch(
   () => props.task.messages.length,
-  async () => {
+  () => {
     if (!isAtBottom.value) return
-    await nextTick()
-    scrollToBottom()
+    scheduleAutoScroll(true)
   }
 )
 
@@ -82,15 +124,12 @@ watch(
     const last = msgs[msgs.length - 1]
     return last.content?.length || 0
   },
-  async () => {
-    await nextTick()
-    const el = chatContainer.value
-    if (!el) return
-    const threshold = 150
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
-    if (nearBottom) {
-      scrollToBottom()
-    }
+  () => {
+    scheduleAutoScroll()
   }
 )
+
+onUnmounted(() => {
+  clearAutoScrollTimer()
+})
 </script>

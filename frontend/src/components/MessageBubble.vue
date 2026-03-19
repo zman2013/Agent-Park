@@ -70,10 +70,14 @@
       :class="bubbleClass"
     >
       <div
-        v-if="message.role === 'agent'"
+        v-if="message.role === 'agent' && !message.streaming"
         class="markdown-body"
         v-html="renderedContent"
       ></div>
+      <div
+        v-else-if="message.role === 'agent'"
+        class="whitespace-pre-wrap"
+      >{{ message.content }}</div>
       <div v-else class="whitespace-pre-wrap">{{ message.content }}</div>
     </div>
   </div>
@@ -131,6 +135,7 @@ const bubbleClass = computed(() =>
 
 const renderedContent = computed(() => {
   if (!props.message.content) return ''
+  if (props.message.streaming) return ''
   return md.render(props.message.content)
 })
 

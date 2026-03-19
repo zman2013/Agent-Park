@@ -55,6 +55,12 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  function appendChunks(chunks) {
+    for (const chunk of chunks) {
+      appendChunk(chunk.taskId, chunk.messageId, chunk.delta)
+    }
+  }
+
   function markMessageDone(taskId, messageId) {
     const task = tasks.value[taskId]
     if (!task) return
@@ -188,6 +194,7 @@ export const useAgentStore = defineStore('agent', () => {
     updateTaskStatus,
     addMessage,
     appendChunk,
+    appendChunks,
     markMessageDone,
     selectTask,
     toggleAgent,
