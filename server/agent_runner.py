@@ -22,10 +22,12 @@ import logging
 import os
 import pty
 import signal
+import threading
 from pathlib import Path
 from typing import Any
 
 from server.models import Message, TaskStatus
+from server.models import _utcnow as _model_utcnow
 from server.state import app_state
 
 logger = logging.getLogger(__name__)
@@ -66,6 +68,7 @@ class AgentRunner:
             return
 
         task.status = TaskStatus.running
+        task.updated_at = _model_utcnow()
         await self._broadcast_status(task_id, TaskStatus.running)
 
         asyncio.create_task(self._run_subprocess(task_id, prompt))
@@ -86,6 +89,18 @@ class AgentRunner:
         command = agent.command if agent else "cco"
         agent_cwd = agent.cwd if agent and agent.cwd else ""
 
+        session_id = self._session_ids.get(task_id)
+
+        # Inject memory only on new sessions (no existing session_id)
+        if not session_id:
+            from server.memory import load_memory
+            from server.config import memory_config
+            mem_cfg = memory_config()
+            memory_lines = load_memory(task.agent_id, mem_cfg["max_lines"])
+            if memory_lines:
+                memory_text = "\n".join(memory_lines)
+                prompt = f"<memory>\n{memory_text}\n</memory>\n\n{prompt}"
+
         # Build command args
         args = [
             command,
@@ -97,7 +112,6 @@ class AgentRunner:
             prompt,
         ]
 
-        session_id = self._session_ids.get(task_id)
         if session_id:
             args = [
                 command,
@@ -146,13 +160,37 @@ class AgentRunner:
 
                 logger.info("Spawned cco pid=%d for task %s", pid, task_id)
 
-                # Read from master_fd asynchronously
                 loop = asyncio.get_event_loop()
+
+                # Wait for the direct child (ept wrapper) in a background thread.
+                # When ept exits, close master_fd so the pty read loop gets EOF,
+                # even if the grandchild (claude) is still alive.
+                wait_future: asyncio.Future = loop.create_future()
+
+                def _wait_child():
+                    try:
+                        _, st = os.waitpid(pid, 0)
+                        rc = os.WEXITSTATUS(st) if os.WIFEXITED(st) else -1
+                    except ChildProcessError:
+                        rc = -1
+                    loop.call_soon_threadsafe(wait_future.set_result, rc)
+
+                threading.Thread(target=_wait_child, daemon=True).start()
+
+                # Read from master_fd asynchronously
                 reader = asyncio.StreamReader()
                 read_protocol = asyncio.StreamReaderProtocol(reader)
                 read_transport, _ = await loop.connect_read_pipe(
                     lambda: read_protocol, os.fdopen(master_fd, "rb", 0)
                 )
+
+                # When ept exits, close the transport to unblock reader.read().
+                # Must be done after connect_read_pipe so read_transport is available.
+                async def _close_transport_on_exit():
+                    await wait_future
+                    read_transport.close()
+
+                closer_task = asyncio.create_task(_close_transport_on_exit())
 
                 buf = b""
                 try:
@@ -180,10 +218,9 @@ class AgentRunner:
                                 pass
                 finally:
                     read_transport.close()
+                    closer_task.cancel()
 
-                # Wait for child to finish
-                _, status = await loop.run_in_executor(None, os.waitpid, pid, 0)
-                returncode = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+                returncode = await wait_future
                 logger.info("cco pid=%d exited with code %d", pid, returncode)
 
                 await self._finish_task(
@@ -576,6 +613,7 @@ class AgentRunner:
         task = app_state.get_task(task_id)
         if task and task.status not in (TaskStatus.success, TaskStatus.failed):
             task.status = status
+            task.updated_at = _model_utcnow()
         await self._broadcast_status(task_id, status)
         app_state.save_tasks()
 
@@ -593,6 +631,7 @@ class AgentRunner:
             return
 
         task.status = TaskStatus.running
+        task.updated_at = _model_utcnow()
         await self._broadcast_status(task_id, TaskStatus.running)
 
         # Mark as resuming so the dying subprocess doesn't overwrite status with failed
