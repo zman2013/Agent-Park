@@ -585,6 +585,23 @@ class AgentRunner:
                         {"type": "message", "task_id": task_id, "message": notice.model_dump()}
                     )
 
+            # If task succeeded silently (no result text and no agent text messages
+            # were streamed), send a default completion notice so the user gets feedback.
+            if subtype == "success" and not result_text:
+                has_agent_text = any(
+                    m.role == "agent" and m.type == "text"
+                    for m in task.messages
+                )
+                if not has_agent_text:
+                    notice = Message(
+                        role="agent", type="system", streaming=False,
+                        content="任务已完成。",
+                    )
+                    task.messages.append(notice)
+                    await broadcast(
+                        {"type": "message", "task_id": task_id, "message": notice.model_dump()}
+                    )
+
             if is_error or subtype in ("error", "error_during_execution"):
                 error_msgs = chunk.get("errors", [])
                 if error_msgs:
@@ -610,6 +627,8 @@ class AgentRunner:
                         {"type": "message", "task_id": task_id, "message": notice.model_dump()}
                     )
                 await self._finish_task(task_id, TaskStatus.failed)
+            elif subtype == "success":
+                await self._finish_task(task_id, TaskStatus.success)
             return
 
     async def _append_text(self, task_id: str, text: str) -> None:
@@ -659,7 +678,7 @@ class AgentRunner:
         if task and task.status not in (TaskStatus.success, TaskStatus.failed):
             task.status = status
             task.updated_at = _model_utcnow()
-        await self._broadcast_status(task_id, status)
+        await self._broadcast_status(task_id, task.status if task else status)
         app_state.save_tasks()
 
     async def _broadcast_status(self, task_id: str, status: TaskStatus) -> None:
@@ -692,15 +711,25 @@ class AgentRunner:
         pid = self._pids.pop(task_id, None)
         if pid:
             try:
-                os.kill(pid, signal.SIGTERM)
-                # Give it a moment to exit
-                await asyncio.sleep(0.5)
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except Exception:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            # Give it a moment to exit
+            await asyncio.sleep(0.5)
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except Exception:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            except ProcessLookupError:
-                pass
         fd = self._master_fds.pop(task_id, None)
         if fd is not None:
             try:

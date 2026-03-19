@@ -1,7 +1,15 @@
 <template>
   <div class="bg-[#111] border-r border-gray-800 flex flex-col h-full overflow-hidden">
-    <div class="p-4 text-xs text-gray-500 uppercase tracking-wider font-semibold">
-      Agents
+    <div class="p-4 flex items-center justify-between">
+      <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Agents</span>
+      <span
+        v-if="usage.amount !== null"
+        class="text-xs text-gray-500 tabular-nums"
+        :title="'本月使用总金额（点击刷新）'"
+        style="cursor: pointer"
+        @click="fetchUsage"
+      >¥{{ usage.amount }}</span>
+      <span v-else-if="usage.loading" class="text-xs text-gray-600">...</span>
     </div>
     <div class="flex-1 overflow-auto px-2 pb-4">
       <AgentGroup
@@ -56,7 +64,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick } from 'vue'
+import { ref, nextTick, onMounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import AgentGroup from './AgentGroup.vue'
 
@@ -66,6 +74,23 @@ const showForm = ref(false)
 const newName = ref('')
 const newCwd = ref('')
 const nameInput = ref(null)
+
+const usage = ref({ amount: null, loading: false })
+
+async function fetchUsage() {
+  usage.value.loading = true
+  try {
+    const res = await fetch('/api/ept-usage')
+    const data = await res.json()
+    usage.value.amount = data.amount !== null ? Number(data.amount).toFixed(2) : null
+  } catch {
+    usage.value.amount = null
+  } finally {
+    usage.value.loading = false
+  }
+}
+
+onMounted(fetchUsage)
 
 function openForm() {
   newName.value = ''

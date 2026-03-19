@@ -168,6 +168,29 @@ async def delete_memory(agent_id: str, line_index: int):
     return {"ok": True}
 
 
+@router.get("/ept-usage")
+async def ept_usage():
+    """Run `ept usage` and return the monthly total cost."""
+    import re
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ept", "usage",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env={**os.environ},
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=15)
+        text = stdout.decode("utf-8", errors="replace")
+        # Extract: 本月使用总金额: 5,969.13 元
+        m = re.search(r"本月使用总金额[^:：]*[:：]\s*([\d,]+(?:\.\d+)?)\s*元", text)
+        if m:
+            amount = m.group(1).replace(",", "")
+            return {"amount": float(amount), "currency": "元"}
+        return {"amount": None, "currency": "元", "raw": text[:500]}
+    except Exception as e:
+        return {"amount": None, "currency": "元", "error": str(e)}
+
+
 @router.post("/shell/exec")
 async def shell_exec(body: ShellExecBody):
     cwd = body.cwd or None
