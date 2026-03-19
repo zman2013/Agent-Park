@@ -4,7 +4,7 @@
     <div v-if="task.num_turns" class="flex items-center justify-end px-6 py-1 border-b border-gray-800 text-xs text-gray-500 shrink-0">
       <span>累计 <span class="text-gray-300 font-mono">{{ task.num_turns }}</span> turns</span>
     </div>
-    <div ref="chatContainer" class="flex-1 overflow-auto p-6 space-y-3">
+    <div ref="chatContainer" class="flex-1 overflow-auto p-6 space-y-3" @scroll="onScroll">
       <div v-if="task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
         No messages yet. Send a prompt to get started.
       </div>
@@ -31,11 +31,28 @@ const visibleMessages = computed(() =>
 )
 
 const chatContainer = ref(null)
+// Whether the user has not yet manually scrolled up after opening the window
+const isAtBottom = ref(true)
 
-// Scroll to bottom when switching tasks (e.g. clicking a historical task)
+function scrollToBottom() {
+  const el = chatContainer.value
+  if (el) {
+    el.scrollTop = el.scrollHeight
+  }
+}
+
+function onScroll() {
+  const el = chatContainer.value
+  if (!el) return
+  const threshold = 150
+  isAtBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+}
+
+// Scroll to bottom and reset state when switching tasks (first open)
 watch(
   () => props.task?.id,
   async () => {
+    isAtBottom.value = true
     await nextTick()
     scrollToBottom()
   }
@@ -47,16 +64,17 @@ onMounted(async () => {
   scrollToBottom()
 })
 
-// Auto-scroll to bottom on new messages
+// On new messages: only auto-scroll if user is still at the bottom
 watch(
   () => props.task.messages.length,
   async () => {
+    if (!isAtBottom.value) return
     await nextTick()
     scrollToBottom()
   }
 )
 
-// Also watch for streaming content changes
+// Watch for streaming content changes, only scroll if near the bottom
 watch(
   () => {
     const msgs = props.task.messages
@@ -68,19 +86,11 @@ watch(
     await nextTick()
     const el = chatContainer.value
     if (!el) return
-    // Only auto-scroll if user is near the bottom
     const threshold = 150
-    const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
-    if (isNearBottom) {
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < threshold
+    if (nearBottom) {
       scrollToBottom()
     }
   }
 )
-
-function scrollToBottom() {
-  const el = chatContainer.value
-  if (el) {
-    el.scrollTop = el.scrollHeight
-  }
-}
 </script>
