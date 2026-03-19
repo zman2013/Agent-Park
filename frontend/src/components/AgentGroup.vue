@@ -49,6 +49,14 @@
           placeholder="/path/to/project"
         />
       </div>
+      <div>
+        <label class="text-xs text-gray-500 block mb-1">Command</label>
+        <input
+          v-model="editCommand"
+          class="w-full bg-[#111] border border-gray-700 rounded px-2 py-1 text-sm outline-none focus:border-gray-500"
+          placeholder="cco"
+        />
+      </div>
       <div class="flex gap-2 justify-end">
         <button
           class="text-xs text-gray-500 hover:text-gray-300 px-2 py-1"
@@ -116,6 +124,7 @@ const taskCount = computed(() => props.agent.task_ids?.length || 0)
 const showEdit = ref(false)
 const editName = ref('')
 const editCwd = ref('')
+const editCommand = ref('')
 const showAllTasks = ref(false)
 
 // Reversed task ids: sort by updated_at desc, fallback to creation order reversed
@@ -144,6 +153,7 @@ watch(showEdit, (v) => {
   if (v) {
     editName.value = props.agent.name || ''
     editCwd.value = props.agent.cwd || ''
+    editCommand.value = props.agent.command || 'cco'
   }
 })
 
@@ -151,6 +161,7 @@ async function saveEdit() {
   const body = {}
   if (editName.value !== props.agent.name) body.name = editName.value
   if (editCwd.value !== props.agent.cwd) body.cwd = editCwd.value
+  if (editCommand.value !== props.agent.command) body.command = editCommand.value
 
   if (Object.keys(body).length === 0) {
     showEdit.value = false

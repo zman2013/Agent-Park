@@ -39,6 +39,15 @@
             @keydown.enter="submitNewAgent"
           />
         </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Command</label>
+          <input
+            v-model="newCommand"
+            class="w-full bg-[#111] border border-gray-700 rounded px-2 py-1 text-sm outline-none focus:border-gray-500"
+            placeholder="cco"
+            @keydown.enter="submitNewAgent"
+          />
+        </div>
         <div class="flex gap-2 justify-end">
           <button
             class="text-xs text-gray-500 hover:text-gray-300 px-2 py-1"
@@ -73,6 +82,7 @@ const store = useAgentStore()
 const showForm = ref(false)
 const newName = ref('')
 const newCwd = ref('')
+const newCommand = ref('cco')
 const nameInput = ref(null)
 
 const usage = ref({ amount: null, loading: false })
@@ -95,6 +105,7 @@ onMounted(fetchUsage)
 function openForm() {
   newName.value = ''
   newCwd.value = ''
+  newCommand.value = 'cco'
   showForm.value = true
   nextTick(() => nameInput.value?.focus())
 }
@@ -106,7 +117,7 @@ async function submitNewAgent() {
     const res = await fetch('/api/agents', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, cwd: newCwd.value.trim() }),
+      body: JSON.stringify({ name, cwd: newCwd.value.trim(), command: newCommand.value.trim() || 'cco' }),
     })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))
