@@ -83,6 +83,7 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
         agent.cwd = body.cwd
     if body.command is not None:
         agent.command = body.command
+    app_state.save_tasks()
     from server.routes_ws import broadcast
     await broadcast({"type": "state_sync", "data": app_state.snapshot()})
     return agent.model_dump()
