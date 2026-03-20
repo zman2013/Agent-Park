@@ -70,7 +70,17 @@
       :class="bubbleClass"
     >
       <div
-        v-if="message.role === 'agent' && !message.streaming"
+        v-if="shouldCollapseLargeAgentMessage"
+        class="space-y-3"
+      >
+        <div class="whitespace-pre-wrap max-h-64 overflow-hidden">{{ largeMessagePreview }}</div>
+        <div class="flex items-center justify-between gap-3 text-xs text-gray-400">
+          <span>{{ largeMessageSummary }}</span>
+          <button class="text-blue-400 hover:text-blue-300" @click="messageExpanded = true">Render full message</button>
+        </div>
+      </div>
+      <div
+        v-else-if="message.role === 'agent' && !message.streaming"
         class="markdown-body"
         v-html="renderedContent"
       ></div>
@@ -88,6 +98,12 @@ import { computed, ref } from 'vue'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js'
 
+const LARGE_MESSAGE_CHAR_LIMIT = 12000
+const LARGE_MESSAGE_LINE_LIMIT = 400
+const LARGE_MESSAGE_PREVIEW_CHAR_LIMIT = 4000
+const LARGE_MESSAGE_PREVIEW_LINE_LIMIT = 120
+const markdownRenderCache = new WeakMap()
+
 const md = new MarkdownIt({
   html: false,
   linkify: true,
@@ -101,11 +117,42 @@ const md = new MarkdownIt({
   },
 })
 
+function getLineCount(content) {
+  if (!content) return 0
+  return content.split('\n').length
+}
+
+function buildLargeMessagePreview(content) {
+  const lines = content.split('\n').slice(0, LARGE_MESSAGE_PREVIEW_LINE_LIMIT)
+  let preview = lines.join('\n')
+  if (preview.length > LARGE_MESSAGE_PREVIEW_CHAR_LIMIT) {
+    preview = preview.slice(0, LARGE_MESSAGE_PREVIEW_CHAR_LIMIT)
+  }
+  return `${preview}\n\n...`
+}
+
+function formatMessageSize(length) {
+  if (length < 1024) return `${length} chars`
+  return `${(length / 1024).toFixed(1)} KB`
+}
+
+function renderMarkdownCached(message) {
+  const cached = markdownRenderCache.get(message)
+  if (cached && cached.content === message.content) {
+    return cached.html
+  }
+
+  const html = md.render(message.content)
+  markdownRenderCache.set(message, { content: message.content, html })
+  return html
+}
+
 const props = defineProps({
   message: { type: Object, required: true },
 })
 
 const expanded = ref(false)
+const messageExpanded = ref(false)
 
 const parsedToolInput = computed(() => {
   try {
@@ -133,10 +180,34 @@ const bubbleClass = computed(() =>
     : 'bg-gray-800 text-gray-200'
 )
 
+const messageLineCount = computed(() => getLineCount(props.message.content || ''))
+
+const isLargeAgentMessage = computed(() =>
+  props.message.role === 'agent' &&
+  !props.message.streaming &&
+  (
+    (props.message.content || '').length > LARGE_MESSAGE_CHAR_LIMIT ||
+    messageLineCount.value > LARGE_MESSAGE_LINE_LIMIT
+  )
+)
+
+const shouldCollapseLargeAgentMessage = computed(() =>
+  isLargeAgentMessage.value && !messageExpanded.value
+)
+
+const largeMessagePreview = computed(() =>
+  buildLargeMessagePreview(props.message.content || '')
+)
+
+const largeMessageSummary = computed(() =>
+  `${formatMessageSize((props.message.content || '').length)} • ${messageLineCount.value} lines`
+)
+
 const renderedContent = computed(() => {
   if (!props.message.content) return ''
   if (props.message.streaming) return ''
-  return md.render(props.message.content)
+  if (shouldCollapseLargeAgentMessage.value) return ''
+  return renderMarkdownCached(props.message)
 })
 
 const formattedToolInput = computed(() => {

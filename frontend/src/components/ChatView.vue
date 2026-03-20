@@ -11,6 +11,14 @@
       <div v-if="isLiveWindowing" class="text-gray-600 text-xs text-center">
         Showing the latest {{ renderedMessageCount }} messages during live streaming for performance.
       </div>
+      <div v-else-if="isCompletedWindowing" class="flex items-center justify-center gap-3 text-gray-600 text-xs text-center">
+        <span>Showing the latest {{ renderedMessageCount }} of {{ allVisibleMessages.length }} messages.</span>
+        <button class="text-blue-400 hover:text-blue-300" @click="showAllHistory = true">Load full history</button>
+      </div>
+      <div v-else-if="canToggleHistoryWindow" class="flex items-center justify-center gap-3 text-gray-600 text-xs text-center">
+        <span>Showing all {{ renderedMessageCount }} messages.</span>
+        <button class="text-blue-400 hover:text-blue-300" @click="showAllHistory = false">Show latest only</button>
+      </div>
       <MessageBubble
         v-for="msg in visibleMessages"
         :key="msg.id"
@@ -27,6 +35,7 @@ import MessageBubble from './MessageBubble.vue'
 
 const AUTO_SCROLL_DELAY_MS = 120
 const MAX_LIVE_MESSAGES = 200
+const MAX_COMPLETED_MESSAGES = 250
 
 const props = defineProps({
   task: { type: Object, required: true },
@@ -35,6 +44,7 @@ const props = defineProps({
 const chatContainer = ref(null)
 // Whether the user has not yet manually scrolled up after opening the window
 const isAtBottom = ref(true)
+const showAllHistory = ref(false)
 let autoScrollTimer = null
 
 const allVisibleMessages = computed(() =>
@@ -47,9 +57,27 @@ const isLiveWindowing = computed(() =>
   allVisibleMessages.value.length > MAX_LIVE_MESSAGES
 )
 
+const hasLargeCompletedHistory = computed(() =>
+  props.task.status !== 'running' &&
+  allVisibleMessages.value.length > MAX_COMPLETED_MESSAGES
+)
+
+const isCompletedWindowing = computed(() =>
+  hasLargeCompletedHistory.value && !showAllHistory.value
+)
+
+const canToggleHistoryWindow = computed(() =>
+  hasLargeCompletedHistory.value && showAllHistory.value
+)
+
 const visibleMessages = computed(() => {
-  if (!isLiveWindowing.value) return allVisibleMessages.value
-  return allVisibleMessages.value.slice(-MAX_LIVE_MESSAGES)
+  if (isLiveWindowing.value) {
+    return allVisibleMessages.value.slice(-MAX_LIVE_MESSAGES)
+  }
+  if (isCompletedWindowing.value) {
+    return allVisibleMessages.value.slice(-MAX_COMPLETED_MESSAGES)
+  }
+  return allVisibleMessages.value
 })
 
 const renderedMessageCount = computed(() => visibleMessages.value.length)
@@ -96,6 +124,7 @@ watch(
   () => props.task?.id,
   async () => {
     isAtBottom.value = true
+    showAllHistory.value = false
     await nextTick()
     scrollToBottom()
   }
