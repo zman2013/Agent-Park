@@ -77,12 +77,12 @@ function onCreateTask(e) {
 }
 
 function onSendMessage(e) {
-  const { taskId, content } = e.detail
+  const { taskId, content, command } = e.detail
   if (!wsConnected.value) {
     store.addToast('Cannot send message: WebSocket not connected', 'error')
     return
   }
-  sendUserMessage(taskId, content)
+  sendUserMessage(taskId, content, command)
 }
 
 function onOpenMemory(e) {
