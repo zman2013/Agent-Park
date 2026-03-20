@@ -47,9 +47,14 @@ class AppState:
         try:
             raw = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
 
-            # Load persisted agents (those not already from config)
+            # Load persisted agents; update existing (default) agents with saved fields
             for aid, adata in raw.get("agents", {}).items():
-                if aid not in self.agents:
+                if aid in self.agents:
+                    # Override default agent fields with persisted values (e.g. command, cwd)
+                    for field in ("name", "command", "cwd"):
+                        if field in adata:
+                            setattr(self.agents[aid], field, adata[field])
+                else:
                     self.agents[aid] = Agent(**adata)
                     self._agent_order.append(aid)
 
@@ -84,13 +89,11 @@ class AppState:
     def save_tasks(self) -> None:
         """Persist non-default agents, all tasks, and agent order to disk (atomic write)."""
         DATA_DIR.mkdir(exist_ok=True)
-        default_ids = {_stable_agent_id(cfg["name"]) for cfg in agent_defaults()}
         payload = {
             "agent_order": self._agent_order,
             "agents": {
                 aid: a.model_dump()
                 for aid, a in self.agents.items()
-                if aid not in default_ids
             },
             "tasks": {tid: t.model_dump() for tid, t in self.tasks.items()},
         }
