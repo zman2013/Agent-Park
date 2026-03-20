@@ -245,6 +245,8 @@ const contentPreview = computed(() => {
   return firstLine
 })
 
+const toolDescription = computed(() => parsedToolInput.value?.description || '')
+
 async function copyContent() {
   try {
     await navigator.clipboard.writeText(props.message.content)
