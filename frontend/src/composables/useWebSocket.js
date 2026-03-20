@@ -186,12 +186,8 @@ export function useWebSocket() {
     send({ type: 'create_task', agent_id: agentId, name })
   }
 
-  function sendUserMessage(taskId, content, command = null) {
-    const payload = { type: 'user_message', task_id: taskId, content };
-    if (command) {
-      payload.command = command;
-    }
-    send(payload);
+  function sendUserMessage(taskId, content) {
+    send({ type: 'user_message', task_id: taskId, content })
   }
 
   onMounted(() => {

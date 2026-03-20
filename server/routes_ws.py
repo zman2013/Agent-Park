@@ -86,18 +86,4 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         # Send input to agent process
         from server.agent_runner import runner
 
-        # Check if a specific command is provided in the message
-        command = data.get("command")
-        if command:
-            # Temporarily override the agent's command for this run
-            original_command = None
-            agent = app_state.get_agent(task.agent_id)
-            if agent:
-                original_command = agent.command
-                agent.command = command
-
         await runner.send_input(task_id, content)
-
-        # Restore the original command if it was overridden
-        if command and original_command is not None and agent:
-            agent.command = original_command
