@@ -1,11 +1,19 @@
 <template>
-  <div class="flex justify-start">
+  <div class="flex justify-start relative group">
     <!-- System notice -->
     <div
       v-if="message.type === 'system'"
       class="w-full rounded-lg px-4 py-2 text-xs text-yellow-300 bg-yellow-900/30 border border-yellow-700/50"
     >
       ⚠ {{ message.content }}
+      <button
+        v-if="!message.streaming"
+        @click="copyContent"
+        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
+        title="复制"
+      >
+        复制
+      </button>
     </div>
 
     <!-- Write tool: show file path + markdown-rendered content -->
@@ -66,7 +74,7 @@
     <!-- Regular text message -->
     <div
       v-else
-      class="w-full rounded-lg px-4 py-2 text-sm"
+      class="w-full rounded-lg px-4 py-2 text-sm relative group"
       :class="bubbleClass"
     >
       <div
@@ -89,6 +97,15 @@
         class="whitespace-pre-wrap"
       >{{ message.content }}</div>
       <div v-else class="whitespace-pre-wrap">{{ message.content }}</div>
+
+      <button
+        v-if="!message.streaming"
+        @click="copyContent"
+        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
+        title="复制"
+      >
+        复制
+      </button>
     </div>
   </div>
 </template>
@@ -97,6 +114,7 @@
 import { computed, ref } from 'vue'
 import MarkdownIt from 'markdown-it'
 import hljs from 'highlight.js'
+import { useAgentStore } from '../stores/agentStore'
 
 const LARGE_MESSAGE_CHAR_LIMIT = 12000
 const LARGE_MESSAGE_LINE_LIMIT = 400
@@ -151,6 +169,7 @@ const props = defineProps({
   message: { type: Object, required: true },
 })
 
+const store = useAgentStore()
 const expanded = ref(false)
 const messageExpanded = ref(false)
 
@@ -226,6 +245,12 @@ const contentPreview = computed(() => {
   return firstLine
 })
 
-const toolDescription = computed(() => parsedToolInput.value?.description || '')
-const toolCommand = computed(() => parsedToolInput.value?.command || '')
+async function copyContent() {
+  try {
+    await navigator.clipboard.writeText(props.message.content)
+    store.addToast('已复制到剪贴板', 'success')
+  } catch (err) {
+    store.addToast('复制失败', 'error')
+  }
+}
 </script>
