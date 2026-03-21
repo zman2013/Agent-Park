@@ -19,7 +19,7 @@
     <!-- Write tool: show file path + markdown-rendered content -->
     <div
       v-if="message.type === 'tool_use' && isWriteTool"
-      class="w-full rounded-lg px-4 py-2 text-sm bg-gray-800/60 border border-gray-700/50"
+      class="relative group w-full rounded-lg px-4 py-2 text-sm bg-gray-800/60 border border-gray-700/50"
     >
       <div
         class="flex items-center gap-2 cursor-pointer select-none text-gray-400 hover:text-gray-300"
@@ -32,12 +32,19 @@
       <div v-if="expanded" class="mt-2">
         <div class="markdown-body text-xs" v-html="writeContentRendered"></div>
       </div>
+      <button
+        @click="copyWriteContent"
+        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
+        title="复制文件内容"
+      >
+        复制
+      </button>
     </div>
 
     <!-- Tool use: show tool name + collapsible params -->
     <div
       v-else-if="message.type === 'tool_use'"
-      class="w-full rounded-lg px-4 py-2 text-sm bg-gray-800/60 border border-gray-700/50"
+      class="relative group w-full rounded-lg px-4 py-2 text-sm bg-gray-800/60 border border-gray-700/50"
     >
       <div
         class="flex items-center gap-2 min-w-0 cursor-pointer select-none text-gray-400 hover:text-gray-300"
@@ -51,12 +58,19 @@
       <div v-if="expanded" class="mt-2 text-xs">
         <pre class="whitespace-pre-wrap text-gray-400 overflow-x-auto max-h-60 overflow-y-auto">{{ formattedToolInput }}</pre>
       </div>
+      <button
+        @click="copyToolUseContent"
+        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
+        title="复制工具参数"
+      >
+        复制
+      </button>
     </div>
 
     <!-- Tool result: show collapsible output -->
     <div
       v-else-if="message.type === 'tool_result'"
-      class="w-full rounded-lg px-4 py-2 text-sm bg-gray-800/40 border border-gray-700/30"
+      class="relative group w-full rounded-lg px-4 py-2 text-sm bg-gray-800/40 border border-gray-700/30"
     >
       <div
         class="flex items-center gap-2 cursor-pointer select-none text-gray-400 hover:text-gray-300"
@@ -69,6 +83,13 @@
       <div v-if="expanded" class="mt-2 text-xs">
         <pre class="whitespace-pre-wrap text-gray-400 overflow-x-auto max-h-80 overflow-y-auto">{{ message.content }}</pre>
       </div>
+      <button
+        @click="copyContent"
+        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
+        title="复制结果内容"
+      >
+        复制
+      </button>
     </div>
 
     <!-- Regular text message -->
@@ -84,7 +105,17 @@
         <div class="whitespace-pre-wrap max-h-64 overflow-hidden">{{ largeMessagePreview }}</div>
         <div class="flex items-center justify-between gap-3 text-xs text-gray-400">
           <span>{{ largeMessageSummary }}</span>
-          <button class="text-blue-400 hover:text-blue-300" @click="messageExpanded = true">Render full message</button>
+          <div class="flex items-center gap-2">
+            <button
+              v-if="!message.streaming"
+              @click="copyContent"
+              class="text-gray-500 hover:text-gray-200 transition-colors text-xs"
+              title="复制完整消息"
+            >
+              复制
+            </button>
+            <button class="text-blue-400 hover:text-blue-300" @click="messageExpanded = true">Render full message</button>
+          </div>
         </div>
       </div>
       <div
@@ -247,10 +278,45 @@ const contentPreview = computed(() => {
 
 const toolDescription = computed(() => parsedToolInput.value?.description || '')
 
+function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text)
+  }
+  // fallback for non-HTTPS / IP access
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  const ok = document.execCommand('copy')
+  document.body.removeChild(textarea)
+  return ok ? Promise.resolve() : Promise.reject(new Error('execCommand failed'))
+}
+
 async function copyContent() {
   try {
-    await navigator.clipboard.writeText(props.message.content)
+    await copyToClipboard(props.message.content)
     store.addToast('已复制到剪贴板', 'success')
+  } catch (err) {
+    store.addToast('复制失败', 'error')
+  }
+}
+
+async function copyToolUseContent() {
+  try {
+    await copyToClipboard(formattedToolInput.value)
+    store.addToast('已复制工具调用参数', 'success')
+  } catch (err) {
+    store.addToast('复制失败', 'error')
+  }
+}
+
+async function copyWriteContent() {
+  try {
+    await copyToClipboard(parsedToolInput.value?.content || '')
+    store.addToast('已复制文件内容', 'success')
   } catch (err) {
     store.addToast('复制失败', 'error')
   }

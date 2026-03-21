@@ -44,6 +44,7 @@ class AgentRunner:
         self._current_block_type: dict[str, str] = {}  # task_id -> "text"|"tool_use"
         self._session_ids: dict[str, str] = self._load_sessions()
         self._resuming: set[str] = set()          # task_ids being killed for resume
+        self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
 
     def _load_sessions(self) -> dict[str, str]:
         """Load session IDs from disk."""
@@ -323,14 +324,28 @@ class AgentRunner:
                 prev_sid = self._session_ids.get(task_id)
                 if prev_sid and sid != prev_sid:
                     # A new session was opened instead of resuming — the previous
-                    # session likely expired.  Do NOT save the new session ID so
-                    # that the next run will start fresh rather than resuming an
-                    # empty context.  The result chunk will carry is_error=true
-                    # which will mark the task failed.
+                    # session likely expired.  Save the new session ID so that
+                    # subsequent turns use the renewed session, and mark this task
+                    # so the result chunk's is_error=true is treated as a soft
+                    # renewal rather than a hard failure.
                     logger.warning(
-                        "Session changed for task %s: %s -> %s (previous session may have expired)",
+                        "Session changed for task %s: %s -> %s (auto-renewing)",
                         task_id, prev_sid, sid,
                     )
+                    self._session_ids[task_id] = sid
+                    self._save_sessions()
+                    self._session_renewed.add(task_id)
+                    # Notify the user that a new session has started
+                    t = app_state.get_task(task_id)
+                    if t:
+                        notice = Message(
+                            role="agent", type="system", streaming=False,
+                            content="会话已过期，已自动切换至新会话继续对话。（历史上下文已重置）",
+                        )
+                        t.messages.append(notice)
+                        await broadcast(
+                            {"type": "message", "task_id": task_id, "message": notice.model_dump()}
+                        )
                 else:
                     self._session_ids[task_id] = sid
                     self._save_sessions()
@@ -603,6 +618,12 @@ class AgentRunner:
                     )
 
             if is_error or subtype in ("error", "error_during_execution"):
+                # If this error was caused by a session auto-renewal, treat it as
+                # success so the task doesn't get marked failed.
+                if task_id in self._session_renewed:
+                    self._session_renewed.discard(task_id)
+                    await self._finish_task(task_id, TaskStatus.success)
+                    return
                 error_msgs = chunk.get("errors", [])
                 if error_msgs:
                     joined = "；".join(str(e) for e in error_msgs)
