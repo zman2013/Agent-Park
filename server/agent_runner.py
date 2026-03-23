@@ -45,6 +45,7 @@ class AgentRunner:
         self._session_ids: dict[str, str] = self._load_sessions()
         self._resuming: set[str] = set()          # task_ids being killed for resume
         self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
+        self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
 
     def _load_sessions(self) -> dict[str, str]:
         """Load session IDs from disk."""
@@ -72,7 +73,24 @@ class AgentRunner:
         task.updated_at = _model_utcnow()
         await self._broadcast_status(task_id, TaskStatus.running)
 
-        asyncio.create_task(self._run_subprocess(task_id, prompt))
+        self._start_subprocess(task_id, prompt)
+
+    def _start_subprocess(self, task_id: str, prompt: str) -> None:
+        """Create and track an asyncio Task for _run_subprocess to prevent GC."""
+        old = self._subprocess_tasks.pop(task_id, None)
+        if old and not old.done():
+            old.cancel()
+
+        t = asyncio.create_task(
+            self._run_subprocess(task_id, prompt),
+            name=f"subprocess-{task_id}",
+        )
+        self._subprocess_tasks[task_id] = t
+
+        def _on_done(fut: asyncio.Task) -> None:
+            self._subprocess_tasks.pop(task_id, None)
+
+        t.add_done_callback(_on_done)
 
     async def _run_subprocess(self, task_id: str, prompt: str) -> None:
         task = app_state.get_task(task_id)
@@ -725,7 +743,7 @@ class AgentRunner:
         await self.kill_task(task_id)
 
         # Start a new subprocess resuming the session
-        asyncio.create_task(self._run_subprocess(task_id, user_input))
+        self._start_subprocess(task_id, user_input)
 
     async def kill_task(self, task_id: str) -> None:
         """Terminate subprocess for a task."""
@@ -757,6 +775,9 @@ class AgentRunner:
                 os.close(fd)
             except OSError:
                 pass
+        t = self._subprocess_tasks.pop(task_id, None)
+        if t and not t.done():
+            t.cancel()
 
 
 def _strip_ansi(s: str) -> str:
