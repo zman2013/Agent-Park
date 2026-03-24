@@ -202,6 +202,45 @@ async def ept_usage():
         return {"amount": None, "currency": "元", "error": str(e)}
 
 
+@router.get("/skills")
+async def list_skills():
+    """Return available skills from ~/.claude/skills/."""
+    import re
+    from pathlib import Path
+
+    skills_dir = Path.home() / ".claude" / "skills"
+    if not skills_dir.exists():
+        return []
+
+    skills = []
+    for item in sorted(skills_dir.iterdir()):
+        if not (item.is_dir() or item.is_symlink()):
+            continue
+        skill_md = item / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        try:
+            content = skill_md.read_text(encoding="utf-8")
+        except Exception:
+            continue
+        m = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+        if not m:
+            continue
+        fm = m.group(1)
+        name_m = re.search(r"^name:\s*(.+)$", fm, re.MULTILINE)
+        desc_m = re.search(r"^description:\s*\|\s*\n((?:  .+\n?)+)", fm, re.MULTILINE)
+        if not desc_m:
+            desc_m = re.search(r"^description:\s*(.+)$", fm, re.MULTILINE)
+            desc = desc_m.group(1).strip() if desc_m else ""
+        else:
+            lines = desc_m.group(1).strip().split("\n")
+            desc = " ".join(ln.strip() for ln in lines)
+        name = name_m.group(1).strip() if name_m else item.name
+        skills.append({"name": name, "description": desc})
+
+    return skills
+
+
 @router.post("/shell/exec")
 async def shell_exec(body: ShellExecBody):
     cwd = body.cwd or None
