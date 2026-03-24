@@ -51,7 +51,7 @@ class AppState:
             for aid, adata in raw.get("agents", {}).items():
                 if aid in self.agents:
                     # Override default agent fields with persisted values (e.g. command, cwd)
-                    for field in ("name", "command", "cwd"):
+                    for field in ("name", "command", "cwd", "shared_memory_agent_id"):
                         if field in adata:
                             setattr(self.agents[aid], field, adata[field])
                 else:
@@ -119,11 +119,11 @@ class AppState:
         self.save_tasks()
         return task
 
-    def create_agent(self, name: str, command: str = "cco", cwd: str = "") -> Agent:
+    def create_agent(self, name: str, command: str = "cco", cwd: str = "", shared_memory_agent_id: str | None = None) -> Agent:
         aid = _stable_agent_id(name)
         if aid in self.agents:
             raise ValueError(f"Agent with name '{name}' already exists")
-        agent = Agent(id=aid, name=name, command=command, cwd=cwd)
+        agent = Agent(id=aid, name=name, command=command, cwd=cwd, shared_memory_agent_id=shared_memory_agent_id)
         self.agents[aid] = agent
         self._agent_order.append(aid)
         self.save_tasks()

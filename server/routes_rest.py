@@ -27,12 +27,13 @@ class CreateAgentBody(BaseModel):
     name: str
     command: str = "cco"
     cwd: str = ""
+    shared_memory_agent_id: str | None = None
 
 
 @router.post("/agents")
 async def create_agent(body: CreateAgentBody):
     try:
-        agent = app_state.create_agent(body.name, body.command, body.cwd)
+        agent = app_state.create_agent(body.name, body.command, body.cwd, body.shared_memory_agent_id)
     except ValueError as e:
         raise HTTPException(409, str(e))
     from server.routes_ws import broadcast
@@ -70,6 +71,8 @@ class UpdateAgentBody(BaseModel):
     name: str | None = None
     cwd: str | None = None
     command: str | None = None
+    shared_memory_agent_id: str | None = None
+    clear_shared_memory: bool = False
 
 
 @router.patch("/agents/{agent_id}")
@@ -83,6 +86,10 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
         agent.cwd = body.cwd
     if body.command is not None:
         agent.command = body.command
+    if body.shared_memory_agent_id is not None:
+        agent.shared_memory_agent_id = body.shared_memory_agent_id
+    if body.clear_shared_memory:
+        agent.shared_memory_agent_id = None
     app_state.save_tasks()
     from server.routes_ws import broadcast
     await broadcast({"type": "state_sync", "data": app_state.snapshot()})

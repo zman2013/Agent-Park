@@ -48,6 +48,16 @@
             @keydown.enter="submitNewAgent"
           />
         </div>
+        <div>
+          <label class="text-xs text-gray-500 block mb-1">Shared Memory</label>
+          <select
+            v-model="newSharedMemoryAgentId"
+            class="w-full bg-[#111] border border-gray-700 rounded px-2 py-1 text-sm outline-none focus:border-gray-500"
+          >
+            <option value="">— own memory —</option>
+            <option v-for="a in store.agents" :key="a.id" :value="a.id">{{ a.name }}</option>
+          </select>
+        </div>
         <div class="flex gap-2 justify-end">
           <button
             class="text-xs text-gray-500 hover:text-gray-300 px-2 py-1"
@@ -83,6 +93,7 @@ const showForm = ref(false)
 const newName = ref('')
 const newCwd = ref('')
 const newCommand = ref('cco')
+const newSharedMemoryAgentId = ref('')
 const nameInput = ref(null)
 
 const usage = ref({ amount: null, loading: false })
@@ -106,6 +117,7 @@ function openForm() {
   newName.value = ''
   newCwd.value = ''
   newCommand.value = 'cco'
+  newSharedMemoryAgentId.value = ''
   showForm.value = true
   nextTick(() => nameInput.value?.focus())
 }
@@ -117,7 +129,12 @@ async function submitNewAgent() {
     const res = await fetch('/api/agents', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, cwd: newCwd.value.trim(), command: newCommand.value.trim() || 'cco' }),
+      body: JSON.stringify({
+        name,
+        cwd: newCwd.value.trim(),
+        command: newCommand.value.trim() || 'cco',
+        shared_memory_agent_id: newSharedMemoryAgentId.value || null,
+      }),
     })
     if (!res.ok) {
       const err = await res.json().catch(() => ({}))

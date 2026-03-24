@@ -7,6 +7,11 @@
     >
       <span class="text-xs text-gray-500 w-4">{{ isOpen ? '▼' : '▶' }}</span>
       <span class="font-medium">{{ agent.name }}</span>
+      <span
+        v-if="sharedMemoryAgentName"
+        class="text-xs text-blue-500/70 font-normal"
+        :title="`共享 memory: ${sharedMemoryAgentName}`"
+      >↗{{ sharedMemoryAgentName }}</span>
       <button
         class="text-gray-600 hover:text-gray-300 transition-colors ml-1"
         title="Memory"
@@ -56,6 +61,20 @@
           class="w-full bg-[#111] border border-gray-700 rounded px-2 py-1 text-sm outline-none focus:border-gray-500"
           placeholder="cco"
         />
+      </div>
+      <div>
+        <label class="text-xs text-gray-500 block mb-1">Shared Memory</label>
+        <select
+          v-model="editSharedMemoryAgentId"
+          class="w-full bg-[#111] border border-gray-700 rounded px-2 py-1 text-sm outline-none focus:border-gray-500"
+        >
+          <option value="">— own memory —</option>
+          <option
+            v-for="a in otherAgents"
+            :key="a.id"
+            :value="a.id"
+          >{{ a.name }}</option>
+        </select>
       </div>
       <div class="flex gap-2 justify-end">
         <button
@@ -125,7 +144,19 @@ const showEdit = ref(false)
 const editName = ref('')
 const editCwd = ref('')
 const editCommand = ref('')
+const editSharedMemoryAgentId = ref('')
 const showAllTasks = ref(false)
+
+// Agents other than the current one (for shared memory picker)
+const otherAgents = computed(() => store.agents.filter(a => a.id !== props.agent.id))
+
+// Display name of the agent whose memory is being shared
+const sharedMemoryAgentName = computed(() => {
+  const sid = props.agent.shared_memory_agent_id
+  if (!sid) return null
+  const a = store.agents.find(a => a.id === sid)
+  return a ? a.name : null
+})
 
 // Reversed task ids: sort by updated_at desc, fallback to creation order reversed
 const reversedTaskIds = computed(() => {
@@ -154,6 +185,7 @@ watch(showEdit, (v) => {
     editName.value = props.agent.name || ''
     editCwd.value = props.agent.cwd || ''
     editCommand.value = props.agent.command || 'cco'
+    editSharedMemoryAgentId.value = props.agent.shared_memory_agent_id || ''
   }
 })
 
@@ -162,6 +194,15 @@ async function saveEdit() {
   if (editName.value !== props.agent.name) body.name = editName.value
   if (editCwd.value !== props.agent.cwd) body.cwd = editCwd.value
   if (editCommand.value !== props.agent.command) body.command = editCommand.value
+
+  const currentShared = props.agent.shared_memory_agent_id || ''
+  if (editSharedMemoryAgentId.value !== currentShared) {
+    if (editSharedMemoryAgentId.value) {
+      body.shared_memory_agent_id = editSharedMemoryAgentId.value
+    } else {
+      body.clear_shared_memory = true
+    }
+  }
 
   if (Object.keys(body).length === 0) {
     showEdit.value = false

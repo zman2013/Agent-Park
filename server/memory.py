@@ -20,6 +20,19 @@ MEMORY_DIR = DATA_DIR / "memory"
 MAX_CONTENT_LENGTH = 300  # characters; reject if compressed result exceeds this
 
 
+def effective_memory_agent_id(agent_id: str) -> str:
+    """Return the agent id whose memory file should be used.
+
+    If the agent has shared_memory_agent_id set, reads/writes go to that
+    agent's memory file instead of its own.
+    """
+    from server.state import app_state
+    agent = app_state.get_agent(agent_id)
+    if agent and agent.shared_memory_agent_id:
+        return agent.shared_memory_agent_id
+    return agent_id
+
+
 def _memory_path(agent_id: str) -> Path:
     return MEMORY_DIR / f"{agent_id}.jsonl"
 
@@ -30,7 +43,7 @@ def _utcnow_iso() -> str:
 
 def load_memory(agent_id: str, max_lines: int = 200) -> list[str]:
     """Return the last *max_lines* memory entries as plain content strings."""
-    path = _memory_path(agent_id)
+    path = _memory_path(effective_memory_agent_id(agent_id))
     if not path.exists():
         return []
     try:
@@ -51,7 +64,7 @@ def load_memory(agent_id: str, max_lines: int = 200) -> list[str]:
 
 def list_memory(agent_id: str) -> list[dict]:
     """Return all memory entries newest-first, each with an added `line_index` field."""
-    path = _memory_path(agent_id)
+    path = _memory_path(effective_memory_agent_id(agent_id))
     if not path.exists():
         return []
     try:
@@ -74,14 +87,14 @@ def list_memory(agent_id: str) -> list[dict]:
 def append_memory(agent_id: str, entry: dict) -> None:
     """Append a single entry to the agent's JSONL file."""
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
-    path = _memory_path(agent_id)
+    path = _memory_path(effective_memory_agent_id(agent_id))
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def delete_memory_line(agent_id: str, line_index: int) -> bool:
     """Remove the entry at *line_index* by rewriting the file. Returns True on success."""
-    path = _memory_path(agent_id)
+    path = _memory_path(effective_memory_agent_id(agent_id))
     if not path.exists():
         return False
     try:
