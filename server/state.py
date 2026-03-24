@@ -125,7 +125,7 @@ class AppState:
             raise ValueError(f"Agent with name '{name}' already exists")
         agent = Agent(id=aid, name=name, command=command, cwd=cwd, shared_memory_agent_id=shared_memory_agent_id)
         self.agents[aid] = agent
-        self._agent_order.append(aid)
+        self._agent_order.insert(0, aid)
         self.save_tasks()
         return agent
 
