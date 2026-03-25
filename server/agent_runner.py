@@ -143,6 +143,16 @@ class AgentRunner:
                 prompt,
             ]
 
+        # Validate working directory before spawning subprocess
+        if agent_cwd and not os.path.isdir(agent_cwd):
+            from server.routes_ws import broadcast
+            err_msg = f"工作目录不存在：{agent_cwd}\n请检查 Agent 配置中的路径是否正确。"
+            notice = Message(role="agent", type="system", streaming=False, content=err_msg)
+            task.messages.append(notice)
+            await broadcast({"type": "message", "task_id": task_id, "message": notice.model_dump()})
+            await self._finish_task(task_id, TaskStatus.failed)
+            return
+
         try:
             # Use pty to give cco a pseudo-terminal (it requires TTY)
             master_fd, slave_fd = pty.openpty()
