@@ -240,6 +240,20 @@ export const useAgentStore = defineStore('agent', () => {
     dismissUnseenTask(taskId)
   }
 
+  function updateTaskFields(taskId, fields) {
+    const task = tasks.value[taskId]
+    if (task) {
+      Object.assign(task, fields)
+    }
+  }
+
+  function addAgent(agent) {
+    const existing = agents.value.find(a => a.id === agent.id)
+    if (!existing) {
+      agents.value.push({ ...agent })
+    }
+  }
+
   function updateAgent(agentId, fields) {
     const agent = agents.value.find(a => a.id === agentId)
     if (agent) {
@@ -405,5 +419,7 @@ export const useAgentStore = defineStore('agent', () => {
     removeMemoryEntry,
     upsertTask,
     replaceAgentTaskIds,
+    updateTaskFields,
+    addAgent,
   }
 })

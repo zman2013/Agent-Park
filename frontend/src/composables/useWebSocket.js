@@ -222,6 +222,15 @@ export function useWebSocket() {
       case 'agent_updated':
         store.updateAgent(data.agent_id, data.fields)
         break
+
+      case 'task_updated':
+        store.updateTaskFields(data.task_id, data.fields)
+        break
+
+      case 'agent_created':
+        store.addAgent(data.agent)
+        store.handleAgentsReordered(data.order || [], null)
+        break
     }
   }
 

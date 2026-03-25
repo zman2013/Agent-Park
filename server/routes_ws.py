@@ -47,6 +47,30 @@ def agents_reordered_message(order: list[str], request_id: int | None = None) ->
     }
 
 
+def task_updated_message(task) -> dict[str, Any]:
+    return {
+        "type": "task_updated",
+        "task_id": task.id,
+        "fields": {"name": task.name, "status": task.status, "updated_at": task.updated_at},
+    }
+
+
+def agent_updated_message(agent, fields: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "agent_updated",
+        "agent_id": agent.id,
+        "fields": fields,
+    }
+
+
+def agent_created_message(agent, order: list[str]) -> dict[str, Any]:
+    return {
+        "type": "agent_created",
+        "agent": agent.model_dump(),
+        "order": order,
+    }
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()

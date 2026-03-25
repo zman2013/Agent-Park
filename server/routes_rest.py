@@ -36,8 +36,8 @@ async def create_agent(body: CreateAgentBody):
         agent = app_state.create_agent(body.name, body.command, body.cwd, body.shared_memory_agent_id)
     except ValueError as e:
         raise HTTPException(409, str(e))
-    from server.routes_ws import broadcast
-    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    from server.routes_ws import broadcast, agent_created_message
+    await broadcast(agent_created_message(agent, app_state.ordered_agent_ids()))
     return agent.model_dump()
 
 
@@ -82,19 +82,25 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
     agent = app_state.get_agent(agent_id)
     if not agent:
         raise HTTPException(404, "agent not found")
+    changed: dict = {}
     if body.name is not None:
         agent.name = body.name
+        changed["name"] = agent.name
     if body.cwd is not None:
         agent.cwd = body.cwd
+        changed["cwd"] = agent.cwd
     if body.command is not None:
         agent.command = body.command
+        changed["command"] = agent.command
     if body.shared_memory_agent_id is not None:
         agent.shared_memory_agent_id = body.shared_memory_agent_id
+        changed["shared_memory_agent_id"] = agent.shared_memory_agent_id
     if body.clear_shared_memory:
         agent.shared_memory_agent_id = None
+        changed["shared_memory_agent_id"] = None
     app_state.save_tasks()
-    from server.routes_ws import broadcast
-    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    from server.routes_ws import broadcast, agent_updated_message
+    await broadcast(agent_updated_message(agent, changed))
     return agent.model_dump()
 
 
@@ -118,9 +124,11 @@ async def pin_agent(agent_id: str):
         app_state.pin_agent(agent_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
-    from server.routes_ws import broadcast
-    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
-    return app_state.agents[agent_id].model_dump()
+    agent = app_state.agents[agent_id]
+    from server.routes_ws import broadcast, agent_updated_message, agents_reordered_message
+    await broadcast(agent_updated_message(agent, {"pinned": True}))
+    await broadcast(agents_reordered_message(app_state.ordered_agent_ids()))
+    return agent.model_dump()
 
 
 @router.post("/agents/{agent_id}/unpin")
@@ -129,9 +137,11 @@ async def unpin_agent(agent_id: str):
         app_state.unpin_agent(agent_id)
     except ValueError as e:
         raise HTTPException(404, str(e))
-    from server.routes_ws import broadcast
-    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
-    return app_state.agents[agent_id].model_dump()
+    agent = app_state.agents[agent_id]
+    from server.routes_ws import broadcast, agent_updated_message, agents_reordered_message
+    await broadcast(agent_updated_message(agent, {"pinned": False}))
+    await broadcast(agents_reordered_message(app_state.ordered_agent_ids()))
+    return agent.model_dump()
 
 
 class UpdateTaskBody(BaseModel):
@@ -146,8 +156,8 @@ async def update_task(task_id: str, body: UpdateTaskBody):
     if body.name is not None:
         task.name = body.name
     app_state.save_tasks()
-    from server.routes_ws import broadcast
-    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    from server.routes_ws import broadcast, task_updated_message
+    await broadcast(task_updated_message(task))
     return task.model_dump()
 
 
