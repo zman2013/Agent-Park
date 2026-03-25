@@ -12,6 +12,7 @@
       <span v-else-if="usage.loading" class="text-xs text-gray-600">...</span>
     </div>
     <div class="flex-1 overflow-auto px-2 pb-4">
+      <UnseenTasksPanel />
       <AgentGroup
         v-for="agent in store.agents"
         :key="agent.id"
@@ -86,6 +87,7 @@
 import { ref, nextTick, onMounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import AgentGroup from './AgentGroup.vue'
+import UnseenTasksPanel from './UnseenTasksPanel.vue'
 
 const store = useAgentStore()
 

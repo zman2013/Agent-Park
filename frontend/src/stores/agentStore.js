@@ -11,6 +11,9 @@ export const useAgentStore = defineStore('agent', () => {
   const pendingAgentOrderRequestId = ref(0)
   let nextAgentOrderRequestId = 0
 
+  // Unseen tasks: tasks that had a status change while not being viewed
+  const unseenTaskIds = ref([])
+
   // Memory panel state
   const memoryPanelOpen = ref(false)
   const memoryAgentId = ref(null)
@@ -124,6 +127,12 @@ export const useAgentStore = defineStore('agent', () => {
     if (task) {
       task.status = status
       task.updated_at = new Date().toISOString()
+      // Mark as unseen if the user isn't currently viewing this task
+      if (taskId !== currentTaskId.value && ['success', 'failed', 'waiting'].includes(status)) {
+        if (!unseenTaskIds.value.includes(taskId)) {
+          unseenTaskIds.value.unshift(taskId)
+        }
+      }
     }
   }
 
@@ -163,6 +172,12 @@ export const useAgentStore = defineStore('agent', () => {
 
   function selectTask(taskId) {
     currentTaskId.value = taskId
+    dismissUnseenTask(taskId)
+  }
+
+  function dismissUnseenTask(taskId) {
+    const idx = unseenTaskIds.value.indexOf(taskId)
+    if (idx !== -1) unseenTaskIds.value.splice(idx, 1)
   }
 
   function toggleAgent(agentId) {
@@ -206,6 +221,7 @@ export const useAgentStore = defineStore('agent', () => {
     if (currentTaskId.value === taskId) {
       currentTaskId.value = null
     }
+    dismissUnseenTask(taskId)
   }
 
   function updateAgent(agentId, fields) {
@@ -324,6 +340,7 @@ export const useAgentStore = defineStore('agent', () => {
     currentTask,
     collapsed,
     toasts,
+    unseenTaskIds,
     memoryPanelOpen,
     memoryAgentId,
     agentMemory,
@@ -341,6 +358,7 @@ export const useAgentStore = defineStore('agent', () => {
     removeTask,
     updateAgent,
     updateTaskTurns,
+    dismissUnseenTask,
     moveAgentUp,
     moveAgentDown,
     handleAgentsReordered,

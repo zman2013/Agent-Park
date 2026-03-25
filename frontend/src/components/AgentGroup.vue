@@ -142,6 +142,7 @@
         <TaskItem
           v-if="store.tasks[taskId]"
           :task="store.tasks[taskId]"
+          :data-task-id="taskId"
         />
       </template>
 
@@ -159,7 +160,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import TaskItem from './TaskItem.vue'
 
@@ -291,4 +292,30 @@ function openMemory() {
     detail: { agentId: props.agent.id }
   }))
 }
+
+function onRevealTask(e) {
+  const { taskId, agentId } = e.detail
+  if (agentId !== props.agent.id) return
+  // Expand the agent if collapsed
+  if (store.isCollapsed(props.agent.id)) {
+    store.toggleAgent(props.agent.id)
+  }
+  // If task is not in visibleTaskIds, expand all tasks
+  if (!visibleTaskIds.value.includes(taskId)) {
+    showAllTasks.value = true
+  }
+  // Scroll the task item into view after DOM update
+  nextTick(() => {
+    const el = document.querySelector(`[data-task-id="${taskId}"]`)
+    el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  })
+}
+
+onMounted(() => {
+  window.addEventListener('reveal-task', onRevealTask)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('reveal-task', onRevealTask)
+})
 </script>
