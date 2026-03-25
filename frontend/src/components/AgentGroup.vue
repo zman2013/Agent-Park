@@ -40,16 +40,6 @@
     >
       <span class="text-xs text-gray-500 w-4">{{ isOpen ? '▼' : '▶' }}</span>
       <span class="font-medium">{{ agent.name }}</span>
-      <span
-        v-if="sharedMemoryAgentName"
-        class="text-xs text-blue-500/70 font-normal"
-        :title="`共享 memory: ${sharedMemoryAgentName}`"
-      >↗{{ sharedMemoryAgentName }}</span>
-      <button
-        class="text-gray-600 hover:text-gray-300 transition-colors ml-1"
-        title="Memory"
-        @click.stop="openMemory"
-      >&#x1F9E0;</button>
       <button
         class="text-gray-600 hover:text-gray-300 transition-colors ml-1"
         title="Edit agent"
@@ -121,10 +111,6 @@
       </div>
     </div>
 
-    <!-- Current cwd display -->
-    <div v-if="agent.cwd && !showEdit" class="px-2 pl-8 text-xs text-gray-500 truncate" :title="agent.cwd">
-      📂 {{ agent.cwd }}
-    </div>
 
     <!-- Tasks -->
     <div v-if="isOpen" class="ml-2">
