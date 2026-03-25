@@ -109,6 +109,14 @@ export const useAgentStore = defineStore('agent', () => {
     if (currentTaskId.value && !tasks.value[currentTaskId.value]) {
       currentTaskId.value = null
     }
+    // Add any running tasks (not currently viewed) to unseenTaskIds
+    for (const [id, task] of Object.entries(tasks.value)) {
+      if (task.status === 'running' && id !== currentTaskId.value) {
+        if (!unseenTaskIds.value.includes(id)) {
+          unseenTaskIds.value.unshift(id)
+        }
+      }
+    }
   }
 
   function upsertTask(task) {
@@ -128,7 +136,7 @@ export const useAgentStore = defineStore('agent', () => {
       task.status = status
       task.updated_at = new Date().toISOString()
       // Mark as unseen if the user isn't currently viewing this task
-      if (taskId !== currentTaskId.value && ['success', 'failed', 'waiting'].includes(status)) {
+      if (taskId !== currentTaskId.value && ['running', 'success', 'failed', 'waiting'].includes(status)) {
         if (!unseenTaskIds.value.includes(taskId)) {
           unseenTaskIds.value.unshift(taskId)
         }
@@ -172,7 +180,11 @@ export const useAgentStore = defineStore('agent', () => {
 
   function selectTask(taskId) {
     currentTaskId.value = taskId
-    dismissUnseenTask(taskId)
+    // Only dismiss if the task is not in 'running' state
+    const task = tasks.value[taskId]
+    if (!task || task.status !== 'running') {
+      dismissUnseenTask(taskId)
+    }
   }
 
   function dismissUnseenTask(taskId) {
