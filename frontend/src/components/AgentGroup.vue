@@ -40,6 +40,7 @@
     >
       <span class="text-xs text-gray-500 w-4">{{ isOpen ? '▼' : '▶' }}</span>
       <span class="font-medium">{{ agent.name }}</span>
+      <span class="text-xs text-gray-500 font-mono">{{ agent.command }}</span>
       <button
         class="text-gray-600 hover:text-gray-300 transition-colors ml-1"
         title="Edit agent"
