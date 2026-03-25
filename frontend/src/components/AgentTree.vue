@@ -13,11 +13,6 @@
     </div>
     <div class="flex-1 overflow-auto px-2 pb-4">
       <UnseenTasksPanel />
-      <AgentGroup
-        v-for="agent in store.agents"
-        :key="agent.id"
-        :agent="agent"
-      />
 
       <!-- New Agent Form -->
       <div v-if="showForm" class="mx-2 mb-2 p-3 bg-gray-800/60 rounded-lg border border-gray-700 space-y-2">
@@ -79,6 +74,12 @@
         <span>+</span>
         <span>new agent</span>
       </div>
+
+      <AgentGroup
+        v-for="agent in store.agents"
+        :key="agent.id"
+        :agent="agent"
+      />
     </div>
   </div>
 </template>
