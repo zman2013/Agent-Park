@@ -322,6 +322,24 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  async function pinAgent(agentId) {
+    try {
+      const res = await fetch(`/api/agents/${agentId}/pin`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch (e) {
+      addToast(`Failed to pin agent: ${e.message}`, 'error')
+    }
+  }
+
+  async function unpinAgent(agentId) {
+    try {
+      const res = await fetch(`/api/agents/${agentId}/unpin`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch (e) {
+      addToast(`Failed to unpin agent: ${e.message}`, 'error')
+    }
+  }
+
   function openMemoryPanel(agentId) {
     memoryAgentId.value = agentId
     memoryPanelOpen.value = true
@@ -378,6 +396,8 @@ export const useAgentStore = defineStore('agent', () => {
     moveAgentUp,
     moveAgentDown,
     handleAgentsReordered,
+    pinAgent,
+    unpinAgent,
     openMemoryPanel,
     closeMemoryPanel,
     setAgentMemory,

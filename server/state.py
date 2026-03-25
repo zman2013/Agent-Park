@@ -51,7 +51,7 @@ class AppState:
             for aid, adata in raw.get("agents", {}).items():
                 if aid in self.agents:
                     # Override default agent fields with persisted values (e.g. command, cwd)
-                    for field in ("name", "command", "cwd", "shared_memory_agent_id"):
+                    for field in ("name", "command", "cwd", "shared_memory_agent_id", "pinned"):
                         if field in adata:
                             setattr(self.agents[aid], field, adata[field])
                 else:
@@ -125,9 +125,36 @@ class AppState:
             raise ValueError(f"Agent with name '{name}' already exists")
         agent = Agent(id=aid, name=name, command=command, cwd=cwd, shared_memory_agent_id=shared_memory_agent_id)
         self.agents[aid] = agent
-        self._agent_order.insert(0, aid)
+        # Insert after all pinned agents
+        insert_pos = sum(1 for oid in self._agent_order if self.agents.get(oid, Agent(name="")).pinned)
+        self._agent_order.insert(insert_pos, aid)
         self.save_tasks()
         return agent
+
+    def pin_agent(self, agent_id: str) -> None:
+        """Pin an agent: mark it pinned and move it to the pinned section top."""
+        agent = self.agents.get(agent_id)
+        if not agent:
+            raise ValueError(f"Agent {agent_id} not found")
+        agent.pinned = True
+        # Remove from current position and insert at the top
+        if agent_id in self._agent_order:
+            self._agent_order.remove(agent_id)
+        self._agent_order.insert(0, agent_id)
+        self.save_tasks()
+
+    def unpin_agent(self, agent_id: str) -> None:
+        """Unpin an agent: clear pinned flag and move it below all pinned agents."""
+        agent = self.agents.get(agent_id)
+        if not agent:
+            raise ValueError(f"Agent {agent_id} not found")
+        agent.pinned = False
+        # Remove from current position and insert after pinned section
+        if agent_id in self._agent_order:
+            self._agent_order.remove(agent_id)
+        insert_pos = sum(1 for oid in self._agent_order if self.agents.get(oid, Agent(name="")).pinned)
+        self._agent_order.insert(insert_pos, agent_id)
+        self.save_tasks()
 
     def delete_task(self, task_id: str) -> bool:
         task = self.tasks.pop(task_id, None)

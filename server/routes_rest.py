@@ -112,6 +112,28 @@ async def reorder_agents(body: ReorderAgentsBody):
     return {"ok": True, "order": order, "request_id": body.request_id}
 
 
+@router.post("/agents/{agent_id}/pin")
+async def pin_agent(agent_id: str):
+    try:
+        app_state.pin_agent(agent_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    from server.routes_ws import broadcast
+    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    return app_state.agents[agent_id].model_dump()
+
+
+@router.post("/agents/{agent_id}/unpin")
+async def unpin_agent(agent_id: str):
+    try:
+        app_state.unpin_agent(agent_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    from server.routes_ws import broadcast
+    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+    return app_state.agents[agent_id].model_dump()
+
+
 class UpdateTaskBody(BaseModel):
     name: str | None = None
 

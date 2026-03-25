@@ -46,6 +46,12 @@
         @click.stop="showEdit = !showEdit"
       >⚙</button>
       <span class="text-xs text-gray-600 ml-auto">{{ taskCount }}</span>
+      <button
+        class="transition-colors px-0.5 opacity-0 group-hover:opacity-100"
+        :class="agent.pinned ? 'text-yellow-400 !opacity-100' : 'text-gray-600 hover:text-yellow-400'"
+        :title="agent.pinned ? 'Unpin agent' : 'Pin to top'"
+        @click.stop="agent.pinned ? store.unpinAgent(agent.id) : store.pinAgent(agent.id)"
+      >{{ agent.pinned ? '★' : '☆' }}</button>
       <span class="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
         <button
           class="text-gray-600 hover:text-gray-300 transition-colors px-0.5"
