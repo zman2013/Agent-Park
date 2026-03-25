@@ -54,6 +54,8 @@ async def create_task(agent_id: str, body: CreateTaskBody):
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
     task = app_state.create_task(agent_id, body.prompt)
+    from server.routes_ws import broadcast, task_created_message
+    await broadcast(task_created_message(task))
     return task.model_dump()
 
 

@@ -1,5 +1,38 @@
 <template>
   <div class="mb-2">
+    <div
+      v-if="showNewTaskModal"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4"
+      @click="closeNewTaskModal"
+    >
+      <div
+        class="w-full max-w-md rounded-xl border border-gray-700 bg-[#161616] p-4 shadow-2xl"
+        @click.stop
+      >
+        <div class="mb-1 text-sm font-medium text-gray-200">Create Task</div>
+        <div class="mb-3 text-xs text-gray-500">{{ agent.name }}</div>
+        <input
+          ref="newTaskInput"
+          v-model="newTaskName"
+          class="w-full bg-[#111] border border-gray-700 rounded px-3 py-2 text-sm outline-none focus:border-gray-500"
+          placeholder="Enter task name"
+          @keydown.esc.prevent="closeNewTaskModal"
+          @keydown.enter.prevent="submitNewTask"
+        />
+        <div class="mt-3 flex justify-end gap-2">
+          <button
+            class="text-xs text-gray-500 hover:text-gray-300 px-2 py-1"
+            @click="closeNewTaskModal"
+          >Cancel</button>
+          <button
+            class="text-xs bg-green-700 hover:bg-green-600 text-white px-3 py-1 rounded disabled:opacity-40 disabled:cursor-not-allowed"
+            :disabled="!newTaskName.trim()"
+            @click="submitNewTask"
+          >Create</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Agent Header -->
     <div
       class="flex items-center gap-2 px-2 py-1.5 cursor-pointer hover:bg-gray-800/50 rounded text-sm text-gray-300 group"
@@ -126,7 +159,7 @@
 </template>
 
 <script setup>
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import TaskItem from './TaskItem.vue'
 
@@ -146,6 +179,9 @@ const editCwd = ref('')
 const editCommand = ref('')
 const editSharedMemoryAgentId = ref('')
 const showAllTasks = ref(false)
+const showNewTaskModal = ref(false)
+const newTaskName = ref('')
+const newTaskInput = ref(null)
 
 // Agents other than the current one (for shared memory picker)
 const otherAgents = computed(() => store.agents.filter(a => a.id !== props.agent.id))
@@ -161,13 +197,14 @@ const sharedMemoryAgentName = computed(() => {
 // Reversed task ids: sort by updated_at desc, fallback to creation order reversed
 const reversedTaskIds = computed(() => {
   const ids = [...(props.agent.task_ids || [])]
+  const orderMap = new Map(ids.map((id, index) => [id, index]))
   return ids.sort((a, b) => {
     const ta = store.tasks[a]?.updated_at || ''
     const tb = store.tasks[b]?.updated_at || ''
     if (tb > ta) return 1
     if (tb < ta) return -1
     // same timestamp: preserve original order reversed
-    return ids.indexOf(b) - ids.indexOf(a)
+    return (orderMap.get(b) || 0) - (orderMap.get(a) || 0)
   })
 })
 
@@ -187,6 +224,16 @@ watch(showEdit, (v) => {
     editCommand.value = props.agent.command || 'cco'
     editSharedMemoryAgentId.value = props.agent.shared_memory_agent_id || ''
   }
+})
+
+watch(showNewTaskModal, async (visible) => {
+  if (!visible) {
+    newTaskName.value = ''
+    return
+  }
+  await nextTick()
+  newTaskInput.value?.focus()
+  newTaskInput.value?.select()
 })
 
 async function saveEdit() {
@@ -223,12 +270,20 @@ async function saveEdit() {
 }
 
 function handleNewTask() {
-  const name = window.prompt('Enter task name:')
-  if (!name) return
+  showNewTaskModal.value = true
+}
 
+function closeNewTaskModal() {
+  showNewTaskModal.value = false
+}
+
+function submitNewTask() {
+  const name = newTaskName.value.trim()
+  if (!name) return
   window.dispatchEvent(new CustomEvent('create-task', {
     detail: { agentId: props.agent.id, name }
   }))
+  closeNewTaskModal()
 }
 
 function openMemory() {

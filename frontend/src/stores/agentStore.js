@@ -18,14 +18,73 @@ export const useAgentStore = defineStore('agent', () => {
     return tasks.value[currentTaskId.value] || null
   })
 
+  function cloneMessage(message) {
+    return { ...message }
+  }
+
+  function mergeMessage(target, source) {
+    Object.assign(target, source)
+    return target
+  }
+
+  function cloneTask(task) {
+    return {
+      ...task,
+      messages: (task.messages || []).map(cloneMessage),
+    }
+  }
+
+  function mergeTask(target, source) {
+    target.agent_id = source.agent_id
+    target.name = source.name
+    target.prompt = source.prompt
+    target.status = source.status
+    target.num_turns = source.num_turns
+    target.updated_at = source.updated_at
+
+    const existingMessages = new Map((target.messages || []).map(message => [message.id, message]))
+    target.messages = (source.messages || []).map((message) => {
+      const existing = existingMessages.get(message.id)
+      return existing ? mergeMessage(existing, message) : cloneMessage(message)
+    })
+
+    return target
+  }
+
+  function syncAgents(nextAgents) {
+    const existingAgents = new Map(agents.value.map(agent => [agent.id, agent]))
+    agents.value = nextAgents.map((agent) => {
+      const existing = existingAgents.get(agent.id)
+      if (existing) {
+        Object.assign(existing, agent)
+        return existing
+      }
+      return { ...agent }
+    })
+  }
+
   function syncState(data) {
-    agents.value = data.agents || []
-    // Merge tasks to preserve reactivity
+    syncAgents(data.agents || [])
     const newTasks = {}
     for (const [id, task] of Object.entries(data.tasks || {})) {
-      newTasks[id] = task
+      const existing = tasks.value[id]
+      newTasks[id] = existing ? mergeTask(existing, task) : cloneTask(task)
     }
     tasks.value = newTasks
+    if (currentTaskId.value && !tasks.value[currentTaskId.value]) {
+      currentTaskId.value = null
+    }
+  }
+
+  function upsertTask(task) {
+    const existing = tasks.value[task.id]
+    tasks.value[task.id] = existing ? mergeTask(existing, task) : cloneTask(task)
+  }
+
+  function replaceAgentTaskIds(agentId, taskIds) {
+    const agent = agents.value.find(item => item.id === agentId)
+    if (!agent) return
+    agent.task_ids = [...taskIds]
   }
 
   function updateTaskStatus(taskId, status) {
@@ -211,5 +270,7 @@ export const useAgentStore = defineStore('agent', () => {
     setAgentMemory,
     prependMemoryEntry,
     removeMemoryEntry,
+    upsertTask,
+    replaceAgentTaskIds,
   }
 })

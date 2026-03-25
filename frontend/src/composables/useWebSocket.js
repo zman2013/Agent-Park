@@ -137,6 +137,12 @@ export function useWebSocket() {
         break
       }
 
+      case 'task_created':
+        store.upsertTask(data.task)
+        store.replaceAgentTaskIds(data.agent_id, data.task_ids || [])
+        store.selectTask(data.task.id)
+        break
+
       case 'task_status': {
         store.updateTaskStatus(data.task_id, data.status)
         const taskName = store.tasks[data.task_id]?.name || data.task_id

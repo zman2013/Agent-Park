@@ -29,6 +29,16 @@ async def broadcast(msg: dict[str, Any]) -> None:
         clients.discard(ws)
 
 
+def task_created_message(task) -> dict[str, Any]:
+    agent = app_state.get_agent(task.agent_id)
+    return {
+        "type": "task_created",
+        "agent_id": task.agent_id,
+        "task": task.model_dump(),
+        "task_ids": list(agent.task_ids) if agent else [task.id],
+    }
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
@@ -61,7 +71,7 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         if agent_id not in app_state.agents:
             return
         task = app_state.create_task(agent_id, name)
-        await broadcast({"type": "state_sync", "data": app_state.snapshot()})
+        await broadcast(task_created_message(task))
 
     elif msg_type == "user_message":
         task_id = data["task_id"]
