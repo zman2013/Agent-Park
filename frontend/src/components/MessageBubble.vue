@@ -30,7 +30,7 @@
         <span class="font-mono text-xs text-gray-400 truncate">{{ writeFilePath }}</span>
       </div>
       <div v-if="expanded" class="mt-2">
-        <div class="markdown-body text-xs" v-html="writeContentRendered"></div>
+        <div class="prose prose-sm prose-invert max-w-none text-xs" v-html="writeContentRendered"></div>
       </div>
       <button
         @click="copyWriteContent"
@@ -120,7 +120,7 @@
       </div>
       <div
         v-else-if="message.role === 'agent' && !message.streaming"
-        class="markdown-body"
+        class="prose prose-sm prose-invert max-w-none"
         v-html="renderedContent"
       ></div>
       <div
