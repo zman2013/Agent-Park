@@ -10,6 +10,7 @@ export function useWebSocket() {
   let reconnectTimer = null
   let chunkFlushTimer = null
   const pendingChunks = new Map()
+  let disposed = false
 
   function getChunkKey(taskId, messageId) {
     return `${taskId}:${messageId}`
@@ -42,14 +43,48 @@ export function useWebSocket() {
     }
   }
 
+  function clearReconnectTimer() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+  }
+
+  function scheduleReconnect() {
+    if (disposed || reconnectTimer) return
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null
+      connect()
+    }, 2000)
+  }
+
+  function detachSocket(socket) {
+    if (!socket) return
+    socket.onopen = null
+    socket.onclose = null
+    socket.onerror = null
+    socket.onmessage = null
+  }
+
   function connect() {
+    if (disposed) return
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return
+    }
+
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
     const url = `${protocol}//${location.host}/ws`
     console.log('[WS] connecting to', url)
 
-    ws = new WebSocket(url)
+    const socket = new WebSocket(url)
+    ws = socket
 
-    ws.onopen = () => {
+    socket.onopen = () => {
+      if (disposed || ws !== socket) {
+        detachSocket(socket)
+        socket.close()
+        return
+      }
       connected.value = true
       console.log('[WS] connected')
       // Request browser notification permission on first connect
@@ -58,19 +93,23 @@ export function useWebSocket() {
       }
     }
 
-    ws.onclose = (e) => {
+    socket.onclose = (e) => {
+      if (ws === socket) {
+        ws = null
+      }
       connected.value = false
       console.log('[WS] closed', e.code, e.reason)
-      // Auto-reconnect
-      reconnectTimer = setTimeout(connect, 2000)
+      scheduleReconnect()
     }
 
-    ws.onerror = (e) => {
+    socket.onerror = (e) => {
+      if (disposed || ws !== socket) return
       console.error('[WS] error', e)
-      ws.close()
+      socket.close()
     }
 
-    ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (disposed || ws !== socket) return
       const data = JSON.parse(event.data)
       handleMessage(data)
     }
@@ -201,13 +240,24 @@ export function useWebSocket() {
   }
 
   onMounted(() => {
+    disposed = false
     connect()
   })
 
   onUnmounted(() => {
+    disposed = true
     flushPendingChunks()
-    clearTimeout(reconnectTimer)
-    if (ws) ws.close()
+    clearReconnectTimer()
+    connected.value = false
+    stopTitleFlash()
+    if (ws) {
+      const socket = ws
+      ws = null
+      detachSocket(socket)
+      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+        socket.close()
+      }
+    }
   })
 
   return {
