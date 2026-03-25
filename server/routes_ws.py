@@ -39,6 +39,14 @@ def task_created_message(task) -> dict[str, Any]:
     }
 
 
+def agents_reordered_message(order: list[str], request_id: int | None = None) -> dict[str, Any]:
+    return {
+        "type": "agents_reordered",
+        "order": order,
+        "request_id": request_id,
+    }
+
+
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()

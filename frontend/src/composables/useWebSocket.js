@@ -143,6 +143,10 @@ export function useWebSocket() {
         store.selectTask(data.task.id)
         break
 
+      case 'agents_reordered':
+        store.handleAgentsReordered(data.order || [], data.request_id ?? null)
+        break
+
       case 'task_status': {
         store.updateTaskStatus(data.task_id, data.status)
         const taskName = store.tasks[data.task_id]?.name || data.task_id

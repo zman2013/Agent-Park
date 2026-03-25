@@ -100,14 +100,16 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
 
 class ReorderAgentsBody(BaseModel):
     order: list[str]
+    request_id: int | None = None
 
 
 @router.post("/agents/reorder")
 async def reorder_agents(body: ReorderAgentsBody):
     app_state.reorder_agents(body.order)
-    from server.routes_ws import broadcast
-    await broadcast({"type": "state_sync", "data": app_state.snapshot()})
-    return {"ok": True}
+    order = app_state.ordered_agent_ids()
+    from server.routes_ws import agents_reordered_message, broadcast
+    await broadcast(agents_reordered_message(order, body.request_id))
+    return {"ok": True, "order": order, "request_id": body.request_id}
 
 
 class UpdateTaskBody(BaseModel):

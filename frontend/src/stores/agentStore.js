@@ -7,6 +7,9 @@ export const useAgentStore = defineStore('agent', () => {
   const currentTaskId = ref(null)
   const collapsed = ref({})
   const toasts = ref([])
+  const pendingAgentOrder = ref(null)
+  const pendingAgentOrderRequestId = ref(0)
+  let nextAgentOrderRequestId = 0
 
   // Memory panel state
   const memoryPanelOpen = ref(false)
@@ -51,9 +54,37 @@ export const useAgentStore = defineStore('agent', () => {
     return target
   }
 
+  function orderAgents(list, preferredOrder) {
+    if (!preferredOrder?.length) return list
+
+    const indexById = new Map(preferredOrder.map((id, index) => [id, index]))
+    const ordered = []
+    const unordered = []
+
+    for (const agent of list) {
+      if (indexById.has(agent.id)) {
+        ordered.push(agent)
+      } else {
+        unordered.push(agent)
+      }
+    }
+
+    ordered.sort((a, b) => indexById.get(a.id) - indexById.get(b.id))
+    return [...ordered, ...unordered]
+  }
+
+  function applyAgentOrder(order) {
+    agents.value = orderAgents([...agents.value], order)
+  }
+
+  function hasSameOrder(left, right) {
+    if (!left || !right || left.length !== right.length) return false
+    return left.every((id, index) => id === right[index])
+  }
+
   function syncAgents(nextAgents) {
     const existingAgents = new Map(agents.value.map(agent => [agent.id, agent]))
-    agents.value = nextAgents.map((agent) => {
+    const mergedAgents = nextAgents.map((agent) => {
       const existing = existingAgents.get(agent.id)
       if (existing) {
         Object.assign(existing, agent)
@@ -61,6 +92,7 @@ export const useAgentStore = defineStore('agent', () => {
       }
       return { ...agent }
     })
+    agents.value = orderAgents(mergedAgents, pendingAgentOrder.value)
   }
 
   function syncState(data) {
@@ -186,30 +218,76 @@ export const useAgentStore = defineStore('agent', () => {
   function moveAgentUp(agentId) {
     const idx = agents.value.findIndex(a => a.id === agentId)
     if (idx > 0) {
-      const tmp = agents.value[idx - 1]
-      agents.value[idx - 1] = agents.value[idx]
-      agents.value[idx] = tmp
-      _saveAgentOrder()
+      const order = agents.value.map(a => a.id)
+      const tmp = order[idx - 1]
+      order[idx - 1] = order[idx]
+      order[idx] = tmp
+      applyAgentOrder(order)
+      _saveAgentOrder(order)
     }
   }
 
   function moveAgentDown(agentId) {
     const idx = agents.value.findIndex(a => a.id === agentId)
     if (idx !== -1 && idx < agents.value.length - 1) {
-      const tmp = agents.value[idx + 1]
-      agents.value[idx + 1] = agents.value[idx]
-      agents.value[idx] = tmp
-      _saveAgentOrder()
+      const order = agents.value.map(a => a.id)
+      const tmp = order[idx + 1]
+      order[idx + 1] = order[idx]
+      order[idx] = tmp
+      applyAgentOrder(order)
+      _saveAgentOrder(order)
     }
   }
 
-  function _saveAgentOrder() {
-    const order = agents.value.map(a => a.id)
-    fetch('/api/agents/reorder', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ order }),
-    }).catch(() => {})
+  function handleAgentsReordered(order, requestId = null) {
+    const pendingOrder = pendingAgentOrder.value
+    const pendingRequestId = pendingAgentOrderRequestId.value
+
+    if (pendingOrder && requestId !== null && requestId < pendingRequestId) {
+      return
+    }
+
+    applyAgentOrder(order)
+
+    if (!pendingOrder) return
+
+    if (requestId !== null) {
+      if (requestId >= pendingRequestId) {
+        pendingAgentOrder.value = null
+        pendingAgentOrderRequestId.value = 0
+      }
+      return
+    }
+
+    if (hasSameOrder(order, pendingOrder)) {
+      pendingAgentOrder.value = null
+      pendingAgentOrderRequestId.value = 0
+    }
+  }
+
+  async function _saveAgentOrder(order) {
+    const requestId = ++nextAgentOrderRequestId
+    pendingAgentOrder.value = [...order]
+    pendingAgentOrderRequestId.value = requestId
+
+    try {
+      const res = await fetch('/api/agents/reorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order, request_id: requestId }),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json().catch(() => ({}))
+      if (Array.isArray(data.order)) {
+        handleAgentsReordered(data.order, data.request_id ?? requestId)
+      }
+    } catch (e) {
+      if (pendingAgentOrderRequestId.value === requestId) {
+        pendingAgentOrder.value = null
+        pendingAgentOrderRequestId.value = 0
+      }
+      addToast(`Failed to reorder agents: ${e.message}`, 'error')
+    }
   }
 
   function openMemoryPanel(agentId) {
@@ -265,6 +343,7 @@ export const useAgentStore = defineStore('agent', () => {
     updateTaskTurns,
     moveAgentUp,
     moveAgentDown,
+    handleAgentsReordered,
     openMemoryPanel,
     closeMemoryPanel,
     setAgentMemory,
