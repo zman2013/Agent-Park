@@ -518,7 +518,7 @@ class AgentRunner:
                         tool_msgs[tool_idx].streaming = False
                     tool_idx += 1
 
-            app_state.save_tasks()
+            app_state.save_agent_tasks(task.agent_id)
             return
 
         # ── user: tool_result ──
@@ -728,7 +728,8 @@ class AgentRunner:
             task.status = status
             task.updated_at = _model_utcnow()
         await self._broadcast_status(task_id, task.status if task else status)
-        app_state.save_tasks()
+        if task:
+            app_state.save_agent_tasks(task.agent_id)
 
     async def _broadcast_status(self, task_id: str, status: TaskStatus) -> None:
         from server.routes_ws import broadcast

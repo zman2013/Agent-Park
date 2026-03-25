@@ -116,7 +116,7 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
 
         user_msg = Message(role="user", content=content)
         task.messages.append(user_msg)
-        app_state.save_tasks()
+        app_state.save_agent_tasks(task.agent_id)
         await broadcast(
             {
                 "type": "message",

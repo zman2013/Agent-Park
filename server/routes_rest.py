@@ -98,7 +98,7 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
     if body.clear_shared_memory:
         agent.shared_memory_agent_id = None
         changed["shared_memory_agent_id"] = None
-    app_state.save_tasks()
+    app_state.save_agents()
     from server.routes_ws import broadcast, agent_updated_message
     await broadcast(agent_updated_message(agent, changed))
     return agent.model_dump()
@@ -155,7 +155,7 @@ async def update_task(task_id: str, body: UpdateTaskBody):
         raise HTTPException(404, "task not found")
     if body.name is not None:
         task.name = body.name
-    app_state.save_tasks()
+    app_state.save_agent_tasks(task.agent_id)
     from server.routes_ws import broadcast, task_updated_message
     await broadcast(task_updated_message(task))
     return task.model_dump()
