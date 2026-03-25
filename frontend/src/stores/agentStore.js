@@ -109,9 +109,9 @@ export const useAgentStore = defineStore('agent', () => {
     if (currentTaskId.value && !tasks.value[currentTaskId.value]) {
       currentTaskId.value = null
     }
-    // Add any running tasks (not currently viewed) to unseenTaskIds
+    // Add any running tasks to unseenTaskIds (regardless of current selection)
     for (const [id, task] of Object.entries(tasks.value)) {
-      if (task.status === 'running' && id !== currentTaskId.value) {
+      if (task.status === 'running') {
         if (!unseenTaskIds.value.includes(id)) {
           unseenTaskIds.value.unshift(id)
         }
@@ -135,10 +135,14 @@ export const useAgentStore = defineStore('agent', () => {
     if (task) {
       task.status = status
       task.updated_at = new Date().toISOString()
-      // Mark as unseen if the user isn't currently viewing this task
-      if (taskId !== currentTaskId.value && ['running', 'success', 'failed', 'waiting'].includes(status)) {
-        if (!unseenTaskIds.value.includes(taskId)) {
-          unseenTaskIds.value.unshift(taskId)
+      // Mark as unseen if status is noteworthy
+      if (['running', 'success', 'failed', 'waiting'].includes(status)) {
+        // For running: always add (even if currently viewed, so it stays visible when user switches away)
+        // For others: only add if not currently viewed
+        if (status === 'running' || taskId !== currentTaskId.value) {
+          if (!unseenTaskIds.value.includes(taskId)) {
+            unseenTaskIds.value.unshift(taskId)
+          }
         }
       }
     }
