@@ -559,9 +559,38 @@ class AgentRunner:
 
             # Update cumulative turn count on the task
             task.num_turns += num_turns
-            await broadcast(
-                {"type": "turns_info", "task_id": task_id, "num_turns": task.num_turns}
-            )
+
+            # Extract token usage from modelUsage (preferred) or usage fallback
+            model_usage = chunk.get("modelUsage", {})
+            if model_usage:
+                # Sum across all models (usually just one)
+                for _model, mu in model_usage.items():
+                    in_tok = mu.get("inputTokens", 0) + mu.get("cacheReadInputTokens", 0) + mu.get("cacheCreationInputTokens", 0)
+                    out_tok = mu.get("outputTokens", 0)
+                    ctx_win = mu.get("contextWindow", 0)
+                    task.total_input_tokens += in_tok
+                    task.total_output_tokens += out_tok
+                    if ctx_win:
+                        task.context_window = ctx_win
+            else:
+                usage = chunk.get("usage", {})
+                in_tok = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+                out_tok = usage.get("output_tokens", 0)
+                task.total_input_tokens += in_tok
+                task.total_output_tokens += out_tok
+
+            cost_usd = chunk.get("total_cost_usd", 0) or 0
+            task.total_cost_cny += cost_usd * 7.3
+
+            await broadcast({
+                "type": "turns_info",
+                "task_id": task_id,
+                "num_turns": task.num_turns,
+                "total_input_tokens": task.total_input_tokens,
+                "total_output_tokens": task.total_output_tokens,
+                "context_window": task.context_window,
+                "total_cost_cny": task.total_cost_cny,
+            })
 
             # The result chunk may carry a "result" text field that contains
             # content not yet streamed (e.g. when AskUserQuestion is denied).

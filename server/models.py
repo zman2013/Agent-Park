@@ -41,6 +41,11 @@ class Task(BaseModel):
     status: TaskStatus = TaskStatus.idle
     messages: list[Message] = Field(default_factory=list)
     num_turns: int = 0
+    # Cumulative token usage across all turns
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    context_window: int = 0
+    total_cost_cny: float = 0.0
     updated_at: str = Field(default_factory=_utcnow)
 
 

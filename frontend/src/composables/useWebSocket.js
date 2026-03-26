@@ -216,7 +216,12 @@ export function useWebSocket() {
         break
 
       case 'turns_info':
-        store.updateTaskTurns(data.task_id, data.num_turns)
+        store.updateTaskTurns(data.task_id, data.num_turns, {
+          total_input_tokens: data.total_input_tokens,
+          total_output_tokens: data.total_output_tokens,
+          context_window: data.context_window,
+          total_cost_cny: data.total_cost_cny,
+        })
         break
 
       case 'agent_updated':

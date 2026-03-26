@@ -46,6 +46,10 @@ export const useAgentStore = defineStore('agent', () => {
     target.prompt = source.prompt
     target.status = source.status
     target.num_turns = source.num_turns
+    target.total_input_tokens = source.total_input_tokens ?? target.total_input_tokens ?? 0
+    target.total_output_tokens = source.total_output_tokens ?? target.total_output_tokens ?? 0
+    target.context_window = source.context_window ?? target.context_window ?? 0
+    target.total_cost_cny = source.total_cost_cny ?? target.total_cost_cny ?? 0
     target.updated_at = source.updated_at
 
     const existingMessages = new Map((target.messages || []).map(message => [message.id, message]))
@@ -220,10 +224,14 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
-  function updateTaskTurns(taskId, numTurns) {
+  function updateTaskTurns(taskId, numTurns, tokenInfo = {}) {
     const task = tasks.value[taskId]
     if (task) {
       task.num_turns = numTurns
+      if (tokenInfo.total_input_tokens !== undefined) task.total_input_tokens = tokenInfo.total_input_tokens
+      if (tokenInfo.total_output_tokens !== undefined) task.total_output_tokens = tokenInfo.total_output_tokens
+      if (tokenInfo.context_window !== undefined) task.context_window = tokenInfo.context_window
+      if (tokenInfo.total_cost_cny !== undefined) task.total_cost_cny = tokenInfo.total_cost_cny
     }
   }
 

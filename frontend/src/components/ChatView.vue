@@ -3,6 +3,15 @@
     <!-- Turns indicator -->
     <div v-if="task.num_turns" class="flex items-center justify-end px-6 py-1 border-b border-gray-800 text-xs text-gray-500 shrink-0">
       <span>累计 <span class="text-gray-300 font-mono">{{ task.num_turns }}</span> turns</span>
+      <template v-if="task.total_input_tokens">
+        <span class="mx-2 text-gray-700">|</span>
+        <span :class="ctxColor" class="font-mono">CTX:{{ ctxPct }}%</span>
+        <span class="text-gray-600 font-mono ml-1">(in:{{ fmtK(task.total_input_tokens) }} out:{{ fmtK(task.total_output_tokens) }})</span>
+        <template v-if="task.total_cost_cny">
+          <span class="mx-2 text-gray-700">|</span>
+          <span class="text-gray-400 font-mono">¥{{ task.total_cost_cny.toFixed(2) }}</span>
+        </template>
+      </template>
     </div>
     <div ref="chatContainer" class="flex-1 overflow-auto p-6 space-y-3" @scroll="onScroll">
       <div v-if="task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
@@ -40,6 +49,25 @@ const MAX_COMPLETED_MESSAGES = 250
 const props = defineProps({
   task: { type: Object, required: true },
 })
+
+// Token usage display helpers
+const ctxPct = computed(() => {
+  const win = props.task.context_window
+  if (!win || !props.task.total_input_tokens) return '0.0'
+  return (props.task.total_input_tokens / win * 100).toFixed(1)
+})
+
+const ctxColor = computed(() => {
+  const pct = parseFloat(ctxPct.value)
+  if (pct >= 80) return 'text-red-400'
+  if (pct >= 50) return 'text-yellow-400'
+  return 'text-green-400'
+})
+
+function fmtK(n) {
+  if (!n) return '0'
+  return Math.round(n / 1000) + 'k'
+}
 
 const chatContainer = ref(null)
 // Whether the user has not yet manually scrolled up after opening the window
