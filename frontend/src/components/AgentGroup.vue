@@ -182,7 +182,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import TaskItem from './TaskItem.vue'
 
-const TASK_LIMIT = 5
+const TASK_LIMIT = 3
 
 const props = defineProps({
   agent: { type: Object, required: true },
