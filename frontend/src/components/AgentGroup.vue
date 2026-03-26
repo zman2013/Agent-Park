@@ -35,43 +35,61 @@
 
     <!-- Agent Header -->
     <div
-      class="flex items-center gap-2 px-2 py-1.5 cursor-pointer hover:bg-gray-800/50 rounded text-sm text-gray-300 group"
+      class="relative flex items-center px-2 py-1.5 cursor-pointer hover:bg-gray-800/50 rounded text-sm text-gray-300 group"
       @click="store.toggleAgent(agent.id)"
     >
-      <span class="text-xs text-gray-500 w-4">{{ isOpen ? '▼' : '▶' }}</span>
-      <span class="font-medium">{{ agent.name }}</span>
-      <span class="text-xs text-gray-500 font-mono">{{ agent.command }}</span>
-      <button
-        class="text-gray-600 hover:text-gray-300 transition-colors ml-1"
-        title="Edit agent"
-        @click.stop="showEdit = !showEdit"
-      >⚙</button>
-      <button
-        class="transition-colors px-0.5 opacity-0 group-hover:opacity-100"
-        :class="agent.cwd ? 'text-gray-600 hover:text-gray-300' : 'text-gray-800 cursor-not-allowed'"
-        :disabled="!agent.cwd"
-        title="Browse files"
-        @click.stop="openFiles()"
-      >📁</button>
-      <span class="text-xs text-gray-600 ml-auto">{{ taskCount }}</span>
-      <button
-        class="transition-colors px-0.5 opacity-0 group-hover:opacity-100"
-        :class="agent.pinned ? 'text-gray-400 !opacity-100' : 'text-gray-600 hover:text-gray-400'"
-        :title="agent.pinned ? 'Unpin agent' : 'Pin to top'"
-        @click.stop="agent.pinned ? store.unpinAgent(agent.id) : store.pinAgent(agent.id)"
-      >{{ agent.pinned ? '★' : '☆' }}</button>
-      <span class="flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+      <!-- 展开/折叠箭头 -->
+      <span class="text-xs text-gray-500 w-4 shrink-0">{{ isOpen ? '▼' : '▶' }}</span>
+
+      <!-- Title + Command，充分利用横向空间 -->
+      <div class="flex items-center gap-2 flex-1 min-w-0 overflow-hidden">
+        <span class="font-medium shrink-0">{{ agent.name }}</span>
+        <span class="text-xs text-gray-500 font-mono truncate">{{ agent.command }}</span>
+      </div>
+
+      <!-- Hover 时显示的右侧按钮层（绝对定位，覆盖在右侧） -->
+      <div
+        class="absolute right-0 top-0 bottom-0 flex items-center gap-1 pr-2 pl-8
+               opacity-0 group-hover:opacity-100 transition-opacity
+               bg-gradient-to-r from-transparent via-[#111]/95 to-[#111]"
+      >
+        <!-- 配置按钮 -->
         <button
-          class="text-gray-600 hover:text-gray-300 transition-colors px-0.5"
-          title="Move up"
-          @click.stop="store.moveAgentUp(agent.id)"
-        >↑</button>
+          class="text-gray-600 hover:text-gray-300 transition-colors"
+          title="Edit agent"
+          @click.stop="showEdit = !showEdit"
+        >⚙</button>
+        <!-- 文件浏览器 -->
         <button
-          class="text-gray-600 hover:text-gray-300 transition-colors px-0.5"
-          title="Move down"
-          @click.stop="store.moveAgentDown(agent.id)"
-        >↓</button>
-      </span>
+          class="transition-colors px-0.5"
+          :class="agent.cwd ? 'text-gray-600 hover:text-gray-300' : 'text-gray-800 cursor-not-allowed'"
+          :disabled="!agent.cwd"
+          title="Browse files"
+          @click.stop="openFiles()"
+        >📁</button>
+        <!-- Task 数量 -->
+        <span class="text-xs text-gray-600 px-0.5">{{ taskCount }}</span>
+        <!-- Pin 按钮 -->
+        <button
+          class="transition-colors px-0.5"
+          :class="agent.pinned ? 'text-gray-400' : 'text-gray-600 hover:text-gray-400'"
+          :title="agent.pinned ? 'Unpin agent' : 'Pin to top'"
+          @click.stop="agent.pinned ? store.unpinAgent(agent.id) : store.pinAgent(agent.id)"
+        >{{ agent.pinned ? '★' : '☆' }}</button>
+        <!-- 上下移动按钮 -->
+        <span class="flex gap-0.5">
+          <button
+            class="text-gray-600 hover:text-gray-300 transition-colors px-0.5"
+            title="Move up"
+            @click.stop="store.moveAgentUp(agent.id)"
+          >↑</button>
+          <button
+            class="text-gray-600 hover:text-gray-300 transition-colors px-0.5"
+            title="Move down"
+            @click.stop="store.moveAgentDown(agent.id)"
+          >↓</button>
+        </span>
+      </div>
     </div>
 
     <!-- Edit Panel -->
