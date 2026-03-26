@@ -1,5 +1,5 @@
 <template>
-  <div class="h-screen flex">
+  <div class="h-screen flex" @mousemove="onDrag" @mouseup="stopDrag" @mouseleave="stopDrag">
     <!-- Connection Status Bar -->
     <div
       v-if="!wsConnected"
@@ -9,25 +9,34 @@
     </div>
 
     <!-- Left Panel -->
-    <template v-if="fileBrowserState.panelOpen">
-      <!-- File browser mode: header + unseen panel + file tree -->
-      <div class="w-72 flex-shrink-0 bg-[#111] border-r border-gray-800 flex flex-col h-full overflow-hidden">
-        <div class="p-4 flex items-center justify-between flex-shrink-0">
-          <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Files</span>
+    <template v-if="leftVisible">
+      <template v-if="fileBrowserState.panelOpen">
+        <div
+          class="flex-shrink-0 bg-[#111] border-r border-gray-800 flex flex-col h-full overflow-hidden"
+          :style="{ width: leftWidth + 'px' }"
+        >
+          <div class="p-4 flex items-center justify-between flex-shrink-0">
+            <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Files</span>
+          </div>
+          <div class="flex-shrink-0 px-2">
+            <UnseenTasksPanel />
+          </div>
+          <FileBrowserPanel
+            :agent-id="fileBrowserState.agentId"
+            @close="closeFileBrowser"
+            @file-select="onFileSelect"
+          />
         </div>
-        <!-- Unseen tasks (near-top, fixed) -->
-        <div class="flex-shrink-0 px-2">
-          <UnseenTasksPanel />
-        </div>
-        <!-- File browser panel (flex-1) -->
-        <FileBrowserPanel
-          :agent-id="fileBrowserState.agentId"
-          @close="closeFileBrowser"
-          @file-select="onFileSelect"
-        />
-      </div>
+      </template>
+      <AgentTree v-else class="flex-shrink-0" :style="{ width: leftWidth + 'px' }" />
+
+      <!-- Resize handle -->
+      <div
+        class="w-1 flex-shrink-0 cursor-col-resize hover:bg-blue-500/40 active:bg-blue-500/60 transition-colors"
+        style="margin-left: -1px; z-index: 10;"
+        @mousedown.prevent="startDrag"
+      />
     </template>
-    <AgentTree v-else class="w-72 flex-shrink-0" />
 
     <!-- Right Panel -->
     <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
@@ -83,6 +92,49 @@ const { connected: wsConnected, createTask, sendUserMessage } = useWebSocket()
 
 const terminalVisible = ref(false)
 
+// ── Left panel width & visibility ────────────────────────────────────────────
+const LEFT_WIDTH_KEY = 'agent-park:left-width'
+const LEFT_MIN = 180
+const LEFT_MAX = 600
+const LEFT_DEFAULT = 288 // w-72 = 18rem = 288px
+
+const leftVisible = ref(true)
+const leftWidth = ref(
+  parseInt(localStorage.getItem(LEFT_WIDTH_KEY) || String(LEFT_DEFAULT), 10)
+)
+
+function saveWidth() {
+  localStorage.setItem(LEFT_WIDTH_KEY, String(leftWidth.value))
+}
+
+// Drag state
+let dragging = false
+let dragStartX = 0
+let dragStartWidth = 0
+
+function startDrag(e) {
+  dragging = true
+  dragStartX = e.clientX
+  dragStartWidth = leftWidth.value
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+}
+
+function onDrag(e) {
+  if (!dragging) return
+  const delta = e.clientX - dragStartX
+  leftWidth.value = Math.min(LEFT_MAX, Math.max(LEFT_MIN, dragStartWidth + delta))
+}
+
+function stopDrag() {
+  if (!dragging) return
+  dragging = false
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
+  saveWidth()
+}
+
+// ── File browser state ────────────────────────────────────────────────────────
 const fileBrowserState = ref({
   panelOpen: false,
   agentId: null,
@@ -115,6 +167,7 @@ function onFileSelect({ path, size }) {
   fileBrowserState.value.fileSize = size
 }
 
+// ── Event handlers ────────────────────────────────────────────────────────────
 function onCreateTask(e) {
   const { agentId, name } = e.detail
   if (!wsConnected.value) {
@@ -145,6 +198,11 @@ function onOpenFiles(e) {
 }
 
 function handleGlobalKeydown(e) {
+  if (e.metaKey && e.key === 'b') {
+    e.preventDefault()
+    leftVisible.value = !leftVisible.value
+    return
+  }
   if (e.metaKey && e.key === 'j') {
     e.preventDefault()
     terminalVisible.value = !terminalVisible.value
@@ -154,7 +212,6 @@ function handleGlobalKeydown(e) {
     if (store.memoryPanelOpen) {
       store.closeMemoryPanel()
     } else {
-      // Open for current task's agent, or first agent
       const task = store.currentTask
       const agentId = task?.agent_id || store.agents[0]?.id
       if (agentId) store.openMemoryPanel(agentId)

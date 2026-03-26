@@ -6,6 +6,14 @@
       <span class="text-gray-600">/</span>
       <span class="font-mono truncate flex-1 min-w-0 text-gray-300" :title="filePath">{{ filePath }}</span>
       <span v-if="displaySize" class="text-gray-600 flex-shrink-0 tabular-nums">{{ displaySize }}</span>
+      <!-- Word wrap toggle: only shown for plain text -->
+      <button
+        v-if="content !== null && !isMarkdown && !isImage"
+        class="flex-shrink-0 transition-colors px-1"
+        :class="wordWrap ? 'text-gray-300' : 'text-gray-600 hover:text-gray-400'"
+        :title="wordWrap ? '关闭自动换行' : '开启自动换行'"
+        @click="wordWrap = !wordWrap"
+      >⇌</button>
       <button
         class="text-gray-600 hover:text-gray-300 transition-colors flex-shrink-0 ml-1"
         title="Close preview"
@@ -60,7 +68,11 @@
       ></div>
 
       <!-- Plain text content -->
-      <pre v-else-if="content !== null" class="p-4 text-xs font-mono text-gray-300 whitespace-pre overflow-auto leading-relaxed">{{ content }}</pre>
+      <pre
+        v-else-if="content !== null"
+        class="p-4 text-xs font-mono text-gray-300 overflow-auto leading-relaxed"
+        :class="wordWrap ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'"
+      >{{ content }}</pre>
 
       <!-- Initial state: image or large file check triggered by watcher -->
     </div>
@@ -98,6 +110,7 @@ const loading = ref(false)
 const loadError = ref('')
 const showLargeConfirm = ref(false)
 const isBinary = ref(false)
+const wordWrap = ref(false)
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.bmp', '.avif'])
 
@@ -172,6 +185,7 @@ watch(
     loadError.value = ''
     showLargeConfirm.value = false
     isBinary.value = false
+    wordWrap.value = false
     loadContent()
   },
   { immediate: true }
