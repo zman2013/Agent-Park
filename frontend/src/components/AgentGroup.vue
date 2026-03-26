@@ -46,6 +46,13 @@
         title="Edit agent"
         @click.stop="showEdit = !showEdit"
       >⚙</button>
+      <button
+        class="transition-colors px-0.5 opacity-0 group-hover:opacity-100"
+        :class="agent.cwd ? 'text-gray-600 hover:text-gray-300' : 'text-gray-800 cursor-not-allowed'"
+        :disabled="!agent.cwd"
+        title="Browse files"
+        @click.stop="openFiles()"
+      >📁</button>
       <span class="text-xs text-gray-600 ml-auto">{{ taskCount }}</span>
       <button
         class="transition-colors px-0.5 opacity-0 group-hover:opacity-100"
@@ -282,6 +289,12 @@ function submitNewTask() {
 
 function openMemory() {
   window.dispatchEvent(new CustomEvent('open-memory', {
+    detail: { agentId: props.agent.id }
+  }))
+}
+
+function openFiles() {
+  window.dispatchEvent(new CustomEvent('open-files', {
     detail: { agentId: props.agent.id }
   }))
 }

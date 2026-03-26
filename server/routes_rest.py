@@ -277,6 +277,105 @@ async def list_skills():
     return skills
 
 
+# ── File browser endpoints ─────────────────────────────────────────────────────
+
+IGNORED_NAMES = {
+    "node_modules", ".git", "__pycache__", ".DS_Store",
+    ".venv", "venv", ".mypy_cache", ".pytest_cache", ".tox",
+}
+IGNORED_SUFFIXES = {".pyc", ".pyo"}
+
+
+def _resolve_agent_path(agent_id: str, rel_path: str) -> tuple[str, str]:
+    """Return (cwd, abs_path) or raise HTTPException."""
+    agent = app_state.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    if not agent.cwd:
+        raise HTTPException(400, "agent has no cwd configured")
+    cwd = os.path.realpath(agent.cwd)
+    if not os.path.isdir(cwd):
+        raise HTTPException(400, "agent cwd does not exist")
+    # Normalise path: strip leading slashes
+    clean = rel_path.lstrip("/").replace("..", "").lstrip("/")
+    abs_path = os.path.realpath(os.path.join(cwd, clean)) if clean else cwd
+    # Jail check
+    if not abs_path.startswith(cwd):
+        raise HTTPException(400, "path outside cwd")
+    return cwd, abs_path
+
+
+@router.get("/agents/{agent_id}/files")
+async def list_files(agent_id: str, path: str = ""):
+    cwd, abs_path = _resolve_agent_path(agent_id, path)
+    if not os.path.isdir(abs_path):
+        raise HTTPException(400, "path is not a directory")
+    entries = []
+    try:
+        for entry in sorted(os.scandir(abs_path), key=lambda e: (e.is_file(), e.name.lower())):
+            if entry.name in IGNORED_NAMES:
+                continue
+            if any(entry.name.endswith(s) for s in IGNORED_SUFFIXES):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                entries.append({"name": entry.name, "type": "dir", "size": None})
+            elif entry.is_file(follow_symlinks=False):
+                try:
+                    size = entry.stat().st_size
+                except OSError:
+                    size = None
+                entries.append({"name": entry.name, "type": "file", "size": size})
+    except PermissionError:
+        raise HTTPException(403, "permission denied")
+    rel = os.path.relpath(abs_path, cwd)
+    return {"cwd": cwd, "path": "" if rel == "." else rel, "entries": entries}
+
+
+@router.get("/agents/{agent_id}/files/content")
+async def file_content(agent_id: str, path: str = ""):
+    cwd, abs_path = _resolve_agent_path(agent_id, path)
+    if not os.path.isfile(abs_path):
+        raise HTTPException(400, "path is not a file")
+    try:
+        size = os.path.getsize(abs_path)
+    except OSError:
+        raise HTTPException(500, "cannot stat file")
+
+    MAX_SIZE = 1 * 1024 * 1024  # 1 MB
+    if size >= MAX_SIZE:
+        from fastapi.responses import Response
+        return Response(status_code=413, headers={"X-File-Size": str(size)})
+
+    # Binary detection: read first 512 bytes, then read whole file
+    try:
+        with open(abs_path, "rb") as f:
+            head = f.read(512)
+            if b"\x00" in head:
+                from fastapi.responses import Response
+                return Response(status_code=415, headers={"X-File-Size": str(size)})
+            rest = f.read()
+        text = (head + rest).decode("utf-8", errors="replace")
+    except (OSError, PermissionError) as e:
+        raise HTTPException(500, str(e))
+
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(text, headers={"X-File-Size": str(size)})
+
+
+@router.get("/agents/{agent_id}/files/download")
+async def download_file(agent_id: str, path: str = ""):
+    cwd, abs_path = _resolve_agent_path(agent_id, path)
+    if not os.path.isfile(abs_path):
+        raise HTTPException(400, "path is not a file")
+    from fastapi.responses import FileResponse
+    filename = os.path.basename(abs_path)
+    return FileResponse(
+        abs_path,
+        filename=filename,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.post("/shell/exec")
 async def shell_exec(body: ShellExecBody):
     cwd = body.cwd or None
