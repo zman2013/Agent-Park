@@ -50,11 +50,11 @@
       </template>
       <template v-else-if="store.currentTask">
         <ChatView :task="store.currentTask" />
-        <ChatInput :task="store.currentTask" />
       </template>
       <div v-else class="flex-1 flex items-center justify-center text-gray-600 text-sm">
         Select a task or create a new one to get started
       </div>
+      <ChatInput v-if="store.currentTask" :task="store.currentTask" />
       <TerminalPanel
         :visible="terminalVisible"
         :cwd="currentAgentCwd"
