@@ -1,7 +1,7 @@
 <template>
   <div
     v-if="task"
-    class="flex items-center gap-2 px-4 py-1.5 cursor-pointer rounded text-sm transition-colors"
+    class="group flex items-center gap-2 px-4 py-1.5 cursor-pointer rounded text-sm transition-colors"
     :class="isActive ? 'bg-gray-800 text-gray-100' : 'hover:bg-gray-800/50 text-gray-400'"
     @click="store.selectTask(task.id)"
   >

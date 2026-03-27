@@ -63,9 +63,20 @@ async def create_task(agent_id: str, body: CreateTaskBody):
 async def delete_task(task_id: str):
     from server.agent_runner import runner
 
-    await runner.kill_task(task_id)
-    if not app_state.delete_task(task_id):
+    task = app_state.get_task(task_id)
+    if not task:
         raise HTTPException(404, "task not found")
+    agent_id = task.agent_id
+    await runner.kill_task(task_id)
+    app_state.delete_task(task_id)
+    agent = app_state.get_agent(agent_id)
+    from server.routes_ws import broadcast
+    await broadcast({
+        "type": "task_deleted",
+        "task_id": task_id,
+        "agent_id": agent_id,
+        "task_ids": list(agent.task_ids) if agent else [],
+    })
     return {"ok": True}
 
 

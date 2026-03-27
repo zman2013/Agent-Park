@@ -238,6 +238,13 @@ export function useWebSocket() {
         store.handleAgentsReordered(data.order || [], null)
         break
 
+      case 'task_deleted':
+        store.removeTask(data.task_id)
+        if (data.agent_id) {
+          store.replaceAgentTaskIds(data.agent_id, data.task_ids || [])
+        }
+        break
+
       case 'session_update':
         store.updateTaskSession(data.task_id, data.session_id)
         break
