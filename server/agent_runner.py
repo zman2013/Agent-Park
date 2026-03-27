@@ -519,6 +519,37 @@ class AgentRunner:
                         tool_msgs[tool_idx].streaming = False
                     tool_idx += 1
 
+            # Extract per-turn token usage and broadcast immediately so the UI
+            # updates after every turn rather than only at task completion.
+            turn_model = message_data.get("model", "")
+            turn_usage = message_data.get("usage", {})
+            if turn_model and turn_usage:
+                in_tok = (turn_usage.get("input_tokens", 0)
+                          + turn_usage.get("cache_read_input_tokens", 0)
+                          + turn_usage.get("cache_creation_input_tokens", 0))
+                out_tok = turn_usage.get("output_tokens", 0)
+                ctx_win = turn_usage.get("context_window", 0)
+                task.total_input_tokens += in_tok
+                task.total_output_tokens += out_tok
+                if ctx_win:
+                    task.context_window = ctx_win
+                if turn_model not in task.model_usage:
+                    task.model_usage[turn_model] = {"inputTokens": 0, "outputTokens": 0, "contextWindow": ctx_win}
+                task.model_usage[turn_model]["inputTokens"] += in_tok
+                task.model_usage[turn_model]["outputTokens"] += out_tok
+                if ctx_win:
+                    task.model_usage[turn_model]["contextWindow"] = ctx_win
+                await broadcast({
+                    "type": "turns_info",
+                    "task_id": task_id,
+                    "num_turns": task.num_turns,
+                    "total_input_tokens": task.total_input_tokens,
+                    "total_output_tokens": task.total_output_tokens,
+                    "context_window": task.context_window,
+                    "total_cost_cny": task.total_cost_cny,
+                    "model_usage": task.model_usage,
+                })
+
             app_state.save_agent_tasks(task.agent_id)
             return
 
@@ -561,9 +592,16 @@ class AgentRunner:
             # Update cumulative turn count on the task
             task.num_turns += num_turns
 
-            # Extract token usage from modelUsage (preferred) or usage fallback
+            # Extract token usage from modelUsage (preferred) or usage fallback.
+            # Note: assistant chunks already accumulate per-turn usage in real time,
+            # so here we overwrite with the authoritative totals from the result chunk
+            # rather than adding on top to avoid double-counting.
             model_usage = chunk.get("modelUsage", {})
             if model_usage:
+                # Reset and overwrite with authoritative totals
+                task.total_input_tokens = 0
+                task.total_output_tokens = 0
+                task.model_usage = {}
                 for _model, mu in model_usage.items():
                     in_tok = mu.get("inputTokens", 0) + mu.get("cacheReadInputTokens", 0) + mu.get("cacheCreationInputTokens", 0)
                     out_tok = mu.get("outputTokens", 0)
@@ -572,22 +610,19 @@ class AgentRunner:
                     task.total_output_tokens += out_tok
                     if ctx_win:
                         task.context_window = ctx_win
-                    # Accumulate per-model usage
-                    if _model not in task.model_usage:
-                        task.model_usage[_model] = {"inputTokens": 0, "outputTokens": 0, "contextWindow": ctx_win}
-                    task.model_usage[_model]["inputTokens"] += in_tok
-                    task.model_usage[_model]["outputTokens"] += out_tok
-                    if ctx_win:
-                        task.model_usage[_model]["contextWindow"] = ctx_win
-            else:
+                    task.model_usage[_model] = {
+                        "inputTokens": in_tok,
+                        "outputTokens": out_tok,
+                        "contextWindow": ctx_win,
+                    }
+            elif not task.total_input_tokens:
+                # Fallback: no per-model data and nothing accumulated yet
                 usage = chunk.get("usage", {})
-                in_tok = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
-                out_tok = usage.get("output_tokens", 0)
-                task.total_input_tokens += in_tok
-                task.total_output_tokens += out_tok
+                task.total_input_tokens = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
+                task.total_output_tokens = usage.get("output_tokens", 0)
 
             cost_usd = chunk.get("total_cost_usd", 0) or 0
-            task.total_cost_cny += cost_usd * 7.3
+            task.total_cost_cny = cost_usd * 7.3
 
             await broadcast({
                 "type": "turns_info",
