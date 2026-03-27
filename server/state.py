@@ -193,11 +193,12 @@ class AppState:
     def ordered_agent_ids(self) -> list[str]:
         return [aid for aid in self._agent_order if aid in self.agents]
 
-    def snapshot(self) -> dict:
+    def snapshot(self, sessions: dict[str, str] | None = None) -> dict:
         ordered = [self.agents[aid] for aid in self.ordered_agent_ids()]
         return {
             "agents": [a.model_dump() for a in ordered],
             "tasks": {tid: t.model_dump() for tid, t in self.tasks.items()},
+            "sessions": sessions or {},
         }
 
 

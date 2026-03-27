@@ -1,5 +1,10 @@
 <template>
   <div class="flex flex-col flex-1 min-h-0">
+    <!-- Session ID indicator -->
+    <div v-if="sessionId" class="flex items-center px-6 py-1 border-b border-gray-800 text-xs text-gray-600 shrink-0 font-mono">
+      <span class="text-gray-700 mr-1">session:</span>
+      <span class="text-gray-500 select-all">{{ sessionId }}</span>
+    </div>
     <!-- Turns indicator -->
     <div v-if="task.num_turns" class="flex items-center justify-end px-6 py-1 border-b border-gray-800 text-xs text-gray-500 shrink-0">
       <span>累计 <span class="text-gray-300 font-mono">{{ task.num_turns }}</span> turns</span>
@@ -41,6 +46,7 @@
 <script setup>
 import { ref, watch, nextTick, computed, onMounted, onUnmounted } from 'vue'
 import MessageBubble from './MessageBubble.vue'
+import { useAgentStore } from '../stores/agentStore'
 
 const AUTO_SCROLL_DELAY_MS = 120
 const MAX_LIVE_MESSAGES = 200
@@ -49,6 +55,10 @@ const MAX_COMPLETED_MESSAGES = 250
 const props = defineProps({
   task: { type: Object, required: true },
 })
+
+const store = useAgentStore()
+
+const sessionId = computed(() => store.taskSessions[props.task.id] || null)
 
 // Token usage display helpers
 const ctxPct = computed(() => {

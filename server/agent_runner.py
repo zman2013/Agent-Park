@@ -377,6 +377,7 @@ class AgentRunner:
                 else:
                     self._session_ids[task_id] = sid
                     self._save_sessions()
+                await broadcast({"type": "session_update", "task_id": task_id, "session_id": sid})
             return
 
         # ── stream_event: real-time deltas ──

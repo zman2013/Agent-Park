@@ -236,6 +236,10 @@ export function useWebSocket() {
         store.addAgent(data.agent)
         store.handleAgentsReordered(data.order || [], null)
         break
+
+      case 'session_update':
+        store.updateTaskSession(data.task_id, data.session_id)
+        break
     }
   }
 

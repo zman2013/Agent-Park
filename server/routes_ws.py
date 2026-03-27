@@ -78,8 +78,9 @@ async def websocket_endpoint(ws: WebSocket):
     logger.info("WS client connected (%d total)", len(clients))
 
     # Send initial state
+    from server.agent_runner import runner as _runner
     await ws.send_text(
-        json.dumps({"type": "state_sync", "data": app_state.snapshot()}, ensure_ascii=False)
+        json.dumps({"type": "state_sync", "data": app_state.snapshot(_runner._session_ids)}, ensure_ascii=False)
     )
 
     try:

@@ -4,6 +4,7 @@ import { ref, computed } from 'vue'
 export const useAgentStore = defineStore('agent', () => {
   const agents = ref([])
   const tasks = ref({})
+  const taskSessions = ref({})  // { task_id: session_id }
   const currentTaskId = ref(null)
   const collapsed = ref({})
   const toasts = ref([])
@@ -112,6 +113,10 @@ export const useAgentStore = defineStore('agent', () => {
     tasks.value = newTasks
     if (currentTaskId.value && !tasks.value[currentTaskId.value]) {
       currentTaskId.value = null
+    }
+    // Sync sessions
+    if (data.sessions) {
+      Object.assign(taskSessions.value, data.sessions)
     }
     // Add any running tasks to unseenTaskIds (regardless of current selection)
     for (const [id, task] of Object.entries(tasks.value)) {
@@ -255,6 +260,10 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  function updateTaskSession(taskId, sessionId) {
+    taskSessions.value[taskId] = sessionId
+  }
+
   function addAgent(agent) {
     const existing = agents.value.find(a => a.id === agent.id)
     if (!existing) {
@@ -392,6 +401,7 @@ export const useAgentStore = defineStore('agent', () => {
   return {
     agents,
     tasks,
+    taskSessions,
     currentTaskId,
     currentTask,
     collapsed,
@@ -428,6 +438,7 @@ export const useAgentStore = defineStore('agent', () => {
     upsertTask,
     replaceAgentTaskIds,
     updateTaskFields,
+    updateTaskSession,
     addAgent,
   }
 })
