@@ -221,6 +221,7 @@ export function useWebSocket() {
           total_output_tokens: data.total_output_tokens,
           context_window: data.context_window,
           total_cost_cny: data.total_cost_cny,
+          model_usage: data.model_usage,
         })
         break
 

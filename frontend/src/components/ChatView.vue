@@ -15,11 +15,6 @@
             <span class="text-gray-700 ml-1">{{ fmtK(mu.inputTokens) }}/{{ fmtK(mu.outputTokens) }}</span>
           </template>
         </template>
-        <template v-else-if="task.total_input_tokens">
-          <span class="mx-2 text-gray-700">|</span>
-          <span :class="ctxColorLegacy">{{ ctxPctLegacy }}%</span>
-          <span class="text-gray-700 ml-1">{{ fmtK(task.total_input_tokens) }}/{{ fmtK(task.total_output_tokens) }}</span>
-        </template>
         <template v-if="task.total_cost_cny">
           <span class="mx-2 text-gray-700">|</span>
           <span class="text-gray-500">¥{{ task.total_cost_cny.toFixed(2) }}</span>
@@ -86,20 +81,6 @@ function ctxColor(mu) {
   if (pct >= 50) return 'text-yellow-400'
   return 'text-green-400'
 }
-
-// Legacy fallback for tasks without per-model data
-const ctxPctLegacy = computed(() => {
-  const win = props.task.context_window
-  if (!win || !props.task.total_input_tokens) return '0.0'
-  return (props.task.total_input_tokens / win * 100).toFixed(1)
-})
-
-const ctxColorLegacy = computed(() => {
-  const pct = parseFloat(ctxPctLegacy.value)
-  if (pct >= 80) return 'text-red-400'
-  if (pct >= 50) return 'text-yellow-400'
-  return 'text-green-400'
-})
 
 function fmtK(n) {
   if (!n) return '0'
