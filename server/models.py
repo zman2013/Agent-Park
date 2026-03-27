@@ -46,6 +46,8 @@ class Task(BaseModel):
     total_output_tokens: int = 0
     context_window: int = 0
     total_cost_cny: float = 0.0
+    # Per-model cumulative usage: {model_name: {inputTokens, outputTokens, contextWindow}}
+    model_usage: dict = Field(default_factory=dict)
     updated_at: str = Field(default_factory=_utcnow)
 
 

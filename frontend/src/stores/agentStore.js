@@ -237,6 +237,7 @@ export const useAgentStore = defineStore('agent', () => {
       if (tokenInfo.total_output_tokens !== undefined) task.total_output_tokens = tokenInfo.total_output_tokens
       if (tokenInfo.context_window !== undefined) task.context_window = tokenInfo.context_window
       if (tokenInfo.total_cost_cny !== undefined) task.total_cost_cny = tokenInfo.total_cost_cny
+      if (tokenInfo.model_usage !== undefined) task.model_usage = tokenInfo.model_usage
     }
   }
 

@@ -1,20 +1,28 @@
 <template>
   <div class="flex flex-col flex-1 min-h-0">
-    <!-- Session ID indicator -->
-    <div v-if="sessionId" class="flex items-center px-6 py-1 border-b border-gray-800 text-xs text-gray-600 shrink-0 font-mono">
-      <span class="text-gray-700 mr-1">session:</span>
-      <span class="text-gray-500 select-all">{{ sessionId }}</span>
-    </div>
-    <!-- Turns indicator -->
-    <div v-if="task.num_turns" class="flex items-center justify-end px-6 py-1 border-b border-gray-800 text-xs text-gray-500 shrink-0">
-      <span>累计 <span class="text-gray-300 font-mono">{{ task.num_turns }}</span> turns</span>
-      <template v-if="task.total_input_tokens">
-        <span class="mx-2 text-gray-700">|</span>
-        <span :class="ctxColor" class="font-mono">CTX:{{ ctxPct }}%</span>
-        <span class="text-gray-600 font-mono ml-1">(in:{{ fmtK(task.total_input_tokens) }} out:{{ fmtK(task.total_output_tokens) }})</span>
+    <!-- Combined session / turns / cost indicator -->
+    <div class="flex items-center px-6 py-1 border-b border-gray-800 text-xs text-gray-600 shrink-0 font-mono overflow-hidden">
+      <span v-if="sessionId" class="text-gray-700 mr-1">session:</span>
+      <span v-if="sessionId" class="text-gray-500 select-all">{{ sessionId }}</span>
+      <span class="flex-1"></span>
+      <template v-if="task.num_turns">
+        <span class="text-gray-600">累计 <span class="text-gray-400">{{ task.num_turns }}</span> turns</span>
+        <template v-if="task.model_usage && Object.keys(task.model_usage).length">
+          <template v-for="(mu, model) in task.model_usage" :key="model">
+            <span class="mx-2 text-gray-700">|</span>
+            <span class="text-gray-500">{{ shortModel(model) }}</span>
+            <span :class="ctxColor(mu)" class="ml-1">{{ ctxPct(mu) }}%</span>
+            <span class="text-gray-700 ml-1">{{ fmtK(mu.inputTokens) }}/{{ fmtK(mu.outputTokens) }}</span>
+          </template>
+        </template>
+        <template v-else-if="task.total_input_tokens">
+          <span class="mx-2 text-gray-700">|</span>
+          <span :class="ctxColorLegacy">{{ ctxPctLegacy }}%</span>
+          <span class="text-gray-700 ml-1">{{ fmtK(task.total_input_tokens) }}/{{ fmtK(task.total_output_tokens) }}</span>
+        </template>
         <template v-if="task.total_cost_cny">
           <span class="mx-2 text-gray-700">|</span>
-          <span class="text-gray-400 font-mono">¥{{ task.total_cost_cny.toFixed(2) }}</span>
+          <span class="text-gray-500">¥{{ task.total_cost_cny.toFixed(2) }}</span>
         </template>
       </template>
     </div>
@@ -61,14 +69,33 @@ const store = useAgentStore()
 const sessionId = computed(() => store.taskSessions[props.task.id] || null)
 
 // Token usage display helpers
-const ctxPct = computed(() => {
+function shortModel(name) {
+  // e.g. "claude-haiku-4-5-20251001" → "haiku", "sonnet-4.6[1m]" → "sonnet", "opus-4.6" → "opus"
+  const m = name.match(/\b(haiku|sonnet|opus)\b/i)
+  return m ? m[1].toLowerCase() : name.split('-')[0]
+}
+function ctxPct(mu) {
+  const win = mu.contextWindow
+  if (!win || !mu.inputTokens) return '0.0'
+  return (mu.inputTokens / win * 100).toFixed(1)
+}
+
+function ctxColor(mu) {
+  const pct = parseFloat(ctxPct(mu))
+  if (pct >= 80) return 'text-red-400'
+  if (pct >= 50) return 'text-yellow-400'
+  return 'text-green-400'
+}
+
+// Legacy fallback for tasks without per-model data
+const ctxPctLegacy = computed(() => {
   const win = props.task.context_window
   if (!win || !props.task.total_input_tokens) return '0.0'
   return (props.task.total_input_tokens / win * 100).toFixed(1)
 })
 
-const ctxColor = computed(() => {
-  const pct = parseFloat(ctxPct.value)
+const ctxColorLegacy = computed(() => {
+  const pct = parseFloat(ctxPctLegacy.value)
   if (pct >= 80) return 'text-red-400'
   if (pct >= 50) return 'text-yellow-400'
   return 'text-green-400'

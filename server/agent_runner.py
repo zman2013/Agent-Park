@@ -564,7 +564,6 @@ class AgentRunner:
             # Extract token usage from modelUsage (preferred) or usage fallback
             model_usage = chunk.get("modelUsage", {})
             if model_usage:
-                # Sum across all models (usually just one)
                 for _model, mu in model_usage.items():
                     in_tok = mu.get("inputTokens", 0) + mu.get("cacheReadInputTokens", 0) + mu.get("cacheCreationInputTokens", 0)
                     out_tok = mu.get("outputTokens", 0)
@@ -573,6 +572,13 @@ class AgentRunner:
                     task.total_output_tokens += out_tok
                     if ctx_win:
                         task.context_window = ctx_win
+                    # Accumulate per-model usage
+                    if _model not in task.model_usage:
+                        task.model_usage[_model] = {"inputTokens": 0, "outputTokens": 0, "contextWindow": ctx_win}
+                    task.model_usage[_model]["inputTokens"] += in_tok
+                    task.model_usage[_model]["outputTokens"] += out_tok
+                    if ctx_win:
+                        task.model_usage[_model]["contextWindow"] = ctx_win
             else:
                 usage = chunk.get("usage", {})
                 in_tok = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
@@ -591,6 +597,7 @@ class AgentRunner:
                 "total_output_tokens": task.total_output_tokens,
                 "context_window": task.context_window,
                 "total_cost_cny": task.total_cost_cny,
+                "model_usage": task.model_usage,
             })
 
             # The result chunk may carry a "result" text field that contains
