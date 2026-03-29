@@ -17,6 +17,7 @@ cco stream-json protocol (with --include-partial-messages):
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -46,6 +47,10 @@ class AgentRunner:
         self._resuming: set[str] = set()          # task_ids being killed for resume
         self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
+        # Snapshot of cumulative token/cost values at the START of each cco session.
+        # Used to correctly accumulate across multiple resume sessions:
+        # final_value = baseline + this_session_authoritative_total
+        self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
 
     def _load_sessions(self) -> dict[str, str]:
         """Load session IDs from disk."""
@@ -96,6 +101,16 @@ class AgentRunner:
         task = app_state.get_task(task_id)
         if not task:
             return
+
+        # Snapshot cumulative totals before this session starts so that the
+        # result chunk (which only covers the current session) can be added on
+        # top of prior sessions rather than overwriting them.
+        self._session_baselines[task_id] = {
+            "total_input_tokens": task.total_input_tokens,
+            "total_output_tokens": task.total_output_tokens,
+            "total_cost_cny": task.total_cost_cny,
+            "model_usage": copy.deepcopy(task.model_usage),
+        }
 
         # Ensure running status is set (send_input sets it before killing the old
         # process, but the old process's _finish_task could race and overwrite it
@@ -593,28 +608,50 @@ class AgentRunner:
             task.num_turns += num_turns
 
             # Extract token usage from modelUsage (preferred) or usage fallback.
-            # Note: assistant chunks already accumulate per-turn usage in real time,
-            # so here we overwrite with the authoritative totals from the result chunk
-            # rather than adding on top to avoid double-counting.
+            # Per the Agent SDK docs, total_cost_usd and modelUsage in the result
+            # chunk are authoritative totals for THIS session only.  When a task
+            # is resumed multiple times each session contributes independently, so
+            # we add the session total on top of the baseline captured at session
+            # start rather than overwriting the cumulative task values.
+            baseline = self._session_baselines.pop(task_id, {
+                "total_input_tokens": 0,
+                "total_output_tokens": 0,
+                "total_cost_cny": 0.0,
+                "model_usage": {},
+            })
             model_usage = chunk.get("modelUsage", {})
             if model_usage:
-                # Reset and overwrite with authoritative totals
-                task.total_input_tokens = 0
-                task.total_output_tokens = 0
-                task.model_usage = {}
+                # Compute this session's authoritative token totals
+                session_input = 0
+                session_output = 0
+                session_model_usage: dict = {}
                 for _model, mu in model_usage.items():
                     in_tok = mu.get("inputTokens", 0) + mu.get("cacheReadInputTokens", 0) + mu.get("cacheCreationInputTokens", 0)
                     out_tok = mu.get("outputTokens", 0)
                     ctx_win = mu.get("contextWindow", 0)
-                    task.total_input_tokens += in_tok
-                    task.total_output_tokens += out_tok
+                    session_input += in_tok
+                    session_output += out_tok
                     if ctx_win:
                         task.context_window = ctx_win
-                    task.model_usage[_model] = {
+                    session_model_usage[_model] = {
                         "inputTokens": in_tok,
                         "outputTokens": out_tok,
                         "contextWindow": ctx_win,
                     }
+                # Merge session totals onto baseline
+                task.total_input_tokens = baseline["total_input_tokens"] + session_input
+                task.total_output_tokens = baseline["total_output_tokens"] + session_output
+                merged_model_usage = dict(baseline["model_usage"])
+                for _model, mu in session_model_usage.items():
+                    if _model in merged_model_usage:
+                        merged_model_usage[_model] = {
+                            "inputTokens": merged_model_usage[_model]["inputTokens"] + mu["inputTokens"],
+                            "outputTokens": merged_model_usage[_model]["outputTokens"] + mu["outputTokens"],
+                            "contextWindow": mu["contextWindow"] or merged_model_usage[_model].get("contextWindow", 0),
+                        }
+                    else:
+                        merged_model_usage[_model] = mu
+                task.model_usage = merged_model_usage
             elif not task.total_input_tokens:
                 # Fallback: no per-model data and nothing accumulated yet
                 usage = chunk.get("usage", {})
@@ -622,7 +659,7 @@ class AgentRunner:
                 task.total_output_tokens = usage.get("output_tokens", 0)
 
             cost_usd = chunk.get("total_cost_usd", 0) or 0
-            task.total_cost_cny = cost_usd * 7.3
+            task.total_cost_cny = baseline["total_cost_cny"] + cost_usd * 7.3
 
             await broadcast({
                 "type": "turns_info",
