@@ -63,8 +63,7 @@ const allSkills = ref([])
 const showSkillMenu = ref(false)
 const activeIndex = ref(0)
 
-// localStorage key for this task's draft
-const draftKey = computed(() => `chat_draft_${props.task.id}`)
+const DRAFT_KEY = 'chat_draft'
 
 // Debounce timer for saving draft
 let saveTimer = null
@@ -72,9 +71,9 @@ function saveDraft(val) {
   clearTimeout(saveTimer)
   saveTimer = setTimeout(() => {
     if (val) {
-      localStorage.setItem(draftKey.value, val)
+      localStorage.setItem(DRAFT_KEY, val)
     } else {
-      localStorage.removeItem(draftKey.value)
+      localStorage.removeItem(DRAFT_KEY)
     }
   }, 500)
 }
@@ -86,7 +85,7 @@ watch(text, (val) => {
 
 onMounted(async () => {
   // Restore draft from localStorage
-  const saved = localStorage.getItem(draftKey.value)
+  const saved = localStorage.getItem(DRAFT_KEY)
   if (saved) {
     text.value = saved
     nextTick(() => autoResize())
@@ -184,7 +183,7 @@ function send() {
 
   text.value = ''
   clearTimeout(saveTimer)
-  localStorage.removeItem(draftKey.value)
+  localStorage.removeItem(DRAFT_KEY)
   showSkillMenu.value = false
   nextTick(() => autoResize())
 }
