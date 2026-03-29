@@ -48,7 +48,7 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onMounted } from 'vue'
+import { ref, computed, nextTick, onMounted, watch } from 'vue'
 
 const props = defineProps({
   task: { type: Object, required: true },
@@ -63,7 +63,35 @@ const allSkills = ref([])
 const showSkillMenu = ref(false)
 const activeIndex = ref(0)
 
+// localStorage key for this task's draft
+const draftKey = computed(() => `chat_draft_${props.task.id}`)
+
+// Debounce timer for saving draft
+let saveTimer = null
+function saveDraft(val) {
+  clearTimeout(saveTimer)
+  saveTimer = setTimeout(() => {
+    if (val) {
+      localStorage.setItem(draftKey.value, val)
+    } else {
+      localStorage.removeItem(draftKey.value)
+    }
+  }, 500)
+}
+
+// Watch text changes and persist with debounce
+watch(text, (val) => {
+  saveDraft(val)
+})
+
 onMounted(async () => {
+  // Restore draft from localStorage
+  const saved = localStorage.getItem(draftKey.value)
+  if (saved) {
+    text.value = saved
+    nextTick(() => autoResize())
+  }
+
   try {
     const res = await fetch('/api/skills')
     if (res.ok) {
@@ -155,6 +183,8 @@ function send() {
   }))
 
   text.value = ''
+  clearTimeout(saveTimer)
+  localStorage.removeItem(draftKey.value)
   showSkillMenu.value = false
   nextTick(() => autoResize())
 }
