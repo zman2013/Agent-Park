@@ -85,7 +85,7 @@
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted } from 'vue'
+import { ref, nextTick, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import AgentGroup from './AgentGroup.vue'
 import UnseenTasksPanel from './UnseenTasksPanel.vue'
@@ -114,7 +114,16 @@ async function fetchUsage() {
   }
 }
 
-onMounted(fetchUsage)
+let usageTimer = null
+
+onMounted(() => {
+  fetchUsage()
+  usageTimer = setInterval(fetchUsage, 10 * 60 * 1000)
+})
+
+onUnmounted(() => {
+  if (usageTimer) clearInterval(usageTimer)
+})
 
 function openForm() {
   newName.value = ''
