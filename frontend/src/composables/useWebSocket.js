@@ -2,6 +2,7 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 
 const CHUNK_FLUSH_INTERVAL_MS = 100
+const HEARTBEAT_TIMEOUT_MS = 45000
 
 export function useWebSocket() {
   const store = useAgentStore()
@@ -9,6 +10,7 @@ export function useWebSocket() {
   let ws = null
   let reconnectTimer = null
   let chunkFlushTimer = null
+  let heartbeatTimer = null
   const pendingChunks = new Map()
   let disposed = false
 
@@ -50,6 +52,22 @@ export function useWebSocket() {
     }
   }
 
+  function clearHeartbeatTimer() {
+    if (heartbeatTimer) {
+      clearTimeout(heartbeatTimer)
+      heartbeatTimer = null
+    }
+  }
+
+  function bumpHeartbeat(socket) {
+    clearHeartbeatTimer()
+    heartbeatTimer = setTimeout(() => {
+      if (disposed || ws !== socket) return
+      console.warn('[WS] heartbeat timeout, reconnecting')
+      socket.close()
+    }, HEARTBEAT_TIMEOUT_MS)
+  }
+
   function scheduleReconnect() {
     if (disposed || reconnectTimer) return
     reconnectTimer = setTimeout(() => {
@@ -86,6 +104,7 @@ export function useWebSocket() {
         return
       }
       connected.value = true
+      bumpHeartbeat(socket)
       console.log('[WS] connected')
       // Request browser notification permission on first connect
       if ('Notification' in window && Notification.permission === 'default') {
@@ -98,6 +117,7 @@ export function useWebSocket() {
         ws = null
       }
       connected.value = false
+      clearHeartbeatTimer()
       console.log('[WS] closed', e.code, e.reason)
       scheduleReconnect()
     }
@@ -110,6 +130,7 @@ export function useWebSocket() {
 
     socket.onmessage = (event) => {
       if (disposed || ws !== socket) return
+      bumpHeartbeat(socket)
       const data = JSON.parse(event.data)
       handleMessage(data)
     }
@@ -248,6 +269,9 @@ export function useWebSocket() {
       case 'session_update':
         store.updateTaskSession(data.task_id, data.session_id)
         break
+
+      case 'ping':
+        break
     }
   }
 
@@ -274,6 +298,7 @@ export function useWebSocket() {
     disposed = true
     flushPendingChunks()
     clearReconnectTimer()
+    clearHeartbeatTimer()
     connected.value = false
     stopTitleFlash()
     if (ws) {
