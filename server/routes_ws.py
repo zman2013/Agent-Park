@@ -160,3 +160,18 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         from server.agent_runner import runner
 
         await runner.send_input(task_id, content)
+
+    elif msg_type == "fork_task":
+        source_task_id = data.get("task_id", "")
+        source_task = app_state.get_task(source_task_id)
+        if not source_task:
+            return
+        from server.agent_runner import runner as _runner
+        source_session_id = _runner._session_ids.get(source_task_id)
+        if not source_session_id:
+            return
+        try:
+            new_task = app_state.fork_task(source_task_id, source_session_id)
+        except ValueError:
+            return
+        await broadcast(task_created_message(new_task))

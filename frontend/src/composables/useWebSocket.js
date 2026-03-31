@@ -289,6 +289,10 @@ export function useWebSocket() {
     send({ type: 'user_message', task_id: taskId, content })
   }
 
+  function forkTask(taskId) {
+    send({ type: 'fork_task', task_id: taskId })
+  }
+
   onMounted(() => {
     disposed = false
     connect()
@@ -315,5 +319,6 @@ export function useWebSocket() {
     connected,
     createTask,
     sendUserMessage,
+    forkTask,
   }
 }

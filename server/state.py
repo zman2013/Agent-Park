@@ -172,6 +172,39 @@ class AppState:
         self._agent_order.insert(insert_pos, agent_id)
         self.save_agents()
 
+    def fork_task(self, source_task_id: str, source_session_id: str) -> Task:
+        """Fork a task: create a new task with copied messages and a fork_session_id."""
+        source = self.tasks.get(source_task_id)
+        if source is None:
+            raise ValueError(f"Source task {source_task_id} not found")
+        agent = self.agents.get(source.agent_id)
+        if agent is None:
+            raise ValueError(f"Agent {source.agent_id} not found")
+
+        from server.models import Message, _uid
+
+        # Deep-copy messages with new IDs
+        forked_messages = []
+        for m in source.messages:
+            forked_messages.append(Message(
+                role=m.role,
+                type=m.type,
+                content=m.content,
+                tool_name=m.tool_name,
+                streaming=False,
+            ))
+
+        task = Task(
+            agent_id=source.agent_id,
+            name=f"{source.name} (fork)",
+            messages=forked_messages,
+            fork_session_id=source_session_id,
+        )
+        self.tasks[task.id] = task
+        agent.task_ids.append(task.id)
+        self.save_agent_tasks(source.agent_id)
+        return task
+
     def delete_task(self, task_id: str) -> bool:
         task = self.tasks.pop(task_id, None)
         if task is None:

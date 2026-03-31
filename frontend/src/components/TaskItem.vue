@@ -27,6 +27,14 @@
     >{{ task.name || 'Untitled' }}</span>
 
     <button
+      v-if="hasSession"
+      class="text-gray-600 hover:text-blue-400 text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+      @click.stop="handleFork"
+      title="Fork task"
+    >
+      ⑂
+    </button>
+    <button
       class="text-gray-600 hover:text-red-400 text-xs opacity-0 group-hover:opacity-100 transition-opacity"
       @click.stop="handleDelete"
       title="Delete task"
@@ -46,6 +54,7 @@ const props = defineProps({
 
 const store = useAgentStore()
 const isActive = computed(() => store.currentTaskId === props.task?.id)
+const hasSession = computed(() => !!store.taskSessions[props.task?.id])
 
 const editing = ref(false)
 const editName = ref('')
@@ -109,5 +118,11 @@ async function handleDelete() {
   } catch (e) {
     // ignore
   }
+}
+
+function handleFork() {
+  window.dispatchEvent(new CustomEvent('fork-task', {
+    detail: { taskId: props.task.id }
+  }))
 }
 </script>

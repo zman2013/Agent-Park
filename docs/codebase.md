@@ -89,6 +89,7 @@ class Task(BaseModel):
     total_cost_cny: float      # 累计成本（人民币）
     model_usage: dict          # 按模型统计：{model_name: {inputTokens, outputTokens, ...}}
     updated_at: str            # ISO UTC 时间戳
+    fork_session_id: str | None = None  # Fork 时记录源 session_id（一次性消费）
 
 class Message(BaseModel):
     id: str
@@ -110,8 +111,12 @@ run_task()
 
 _run_subprocess()
   1. 获取 agent.cwd，校验路径存在性（不存在则报错返回）
-  2. 构建 cco 命令参数（含 --resume session_id 若有续话）
-  3. os.fork() + pty.openpty() 启动子进程
+  2. 检查 task.fork_session_id（fork 模式）或 session_id（resume 模式）
+  3. 构建 cco 命令参数：
+     - fork 模式：--resume <源sid> --fork-session <prompt>
+     - resume 模式：--resume <sid> <prompt>
+     - 新会话模式：<prompt>
+  4. os.fork() + pty.openpty() 启动子进程
   4. 子进程：os.chdir(cwd) → os.execvpe(cco, args, env)
   5. 父进程：异步读取 master_fd，逐行解析 stream-json
   6. 每行 JSON 交给 _handle_chunk() 处理
@@ -136,6 +141,30 @@ _run_subprocess()
 - **子进程异常退出**：非 0 退出码 → `TaskStatus.failed`
 - **服务重启**：`state.py` 启动时将 running/waiting 状态重置为 failed
 
+### Fork Task（会话分支）
+
+从已有 Task 分叉出独立会话分支，继承完整消息历史：
+
+```
+用户点击 ⑂ Fork 按钮
+  → WS: { type: "fork_task", task_id: "xxx" }
+  → state.fork_task(): 创建新 Task，深拷贝消息，设置 fork_session_id
+  → broadcast task_created → 前端自动切换到新 Task
+
+用户在新 Task 中发送第一条消息
+  → _run_subprocess() 检测 fork_session_id
+  → 启动 cco --resume <源sid> --fork-session <prompt>
+  → cco 返回新 session_id → 自动保存
+  → 后续消息走正常 --resume <新sid> 流程
+```
+
+关键实现：
+- `Task.fork_session_id`：一次性字段，记录待 fork 的源 session_id，首次发消息时消费
+- `state.fork_task()`：深拷贝消息（新 id），名称加 "(fork)" 后缀
+- `_run_subprocess()`：检测 `fork_session_id` 构建 `--fork-session` 命令参数
+- Fork 模式不注入 memory（fork 会话已有完整上下文）
+- Token/Cost 统计从 0 开始，不继承源 Task
+
 ## WebSocket 消息协议（routes_ws.py ↔ useWebSocket.js）
 
 ### 客户端 → 服务端
@@ -144,6 +173,7 @@ _run_subprocess()
 |---|---|
 | `create_task` | 创建新任务 |
 | `user_message` | 发送消息（触发 run_task） |
+| `fork_task` | Fork 一个已有任务（复制消息历史，创建独立会话分支） |
 | `stop_task` | 中止任务 |
 | `set_agent_order` | 重排序 Agent |
 

@@ -125,8 +125,14 @@ class AgentRunner:
 
         session_id = self._session_ids.get(task_id)
 
-        # Inject memory only on new sessions (no existing session_id)
-        if not session_id:
+        # Check if this is a fork: task has a fork_session_id to consume
+        fork_sid = task.fork_session_id
+        if fork_sid:
+            task.fork_session_id = None  # consume once
+            app_state.save_agent_tasks(task.agent_id)
+
+        # Inject memory only on new sessions (no existing session_id and not a fork)
+        if not session_id and not fork_sid:
             from server.memory import load_memory
             from server.config import memory_config
             mem_cfg = memory_config()
@@ -136,27 +142,22 @@ class AgentRunner:
                 prompt = f"<memory>\n{memory_text}\n</memory>\n\n{prompt}"
 
         # Build command args
-        args = [
+        base_args = [
             command,
             "-p",
             "--output-format", "stream-json",
             "--verbose",
             "--include-partial-messages",
             "--dangerously-skip-permissions",
-            prompt,
         ]
 
-        if session_id:
-            args = [
-                command,
-                "-p",
-                "--output-format", "stream-json",
-                "--verbose",
-                "--include-partial-messages",
-                "--dangerously-skip-permissions",
-                "--resume", session_id,
-                prompt,
-            ]
+        if fork_sid:
+            # Fork mode: resume source session with --fork-session
+            args = base_args + ["--resume", fork_sid, "--fork-session", prompt]
+        elif session_id:
+            args = base_args + ["--resume", session_id, prompt]
+        else:
+            args = base_args + [prompt]
 
         # Validate working directory before spawning subprocess
         if agent_cwd and not os.path.isdir(agent_cwd):

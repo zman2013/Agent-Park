@@ -49,6 +49,8 @@ class Task(BaseModel):
     # Per-model cumulative usage: {model_name: {inputTokens, outputTokens, contextWindow}}
     model_usage: dict = Field(default_factory=dict)
     updated_at: str = Field(default_factory=_utcnow)
+    # Set when this task was forked from another session; consumed on first message
+    fork_session_id: str | None = None
 
 
 class Agent(BaseModel):

@@ -93,7 +93,7 @@ import FileContentView from './components/FileContentView.vue'
 import UnseenTasksPanel from './components/UnseenTasksPanel.vue'
 
 const store = useAgentStore()
-const { connected: wsConnected, createTask, sendUserMessage } = useWebSocket()
+const { connected: wsConnected, createTask, sendUserMessage, forkTask } = useWebSocket()
 
 const terminalVisible = ref(false)
 
@@ -195,6 +195,15 @@ function onOpenMemory(e) {
   store.openMemoryPanel(e.detail.agentId)
 }
 
+function onForkTask(e) {
+  const { taskId } = e.detail
+  if (!wsConnected.value) {
+    store.addToast('Cannot fork task: WebSocket not connected', 'error')
+    return
+  }
+  forkTask(taskId)
+}
+
 function onOpenFiles(e) {
   fileBrowserState.value.panelOpen = true
   fileBrowserState.value.agentId = e.detail.agentId
@@ -240,6 +249,7 @@ onMounted(() => {
   window.addEventListener('send-message', onSendMessage)
   window.addEventListener('open-memory', onOpenMemory)
   window.addEventListener('open-files', onOpenFiles)
+  window.addEventListener('fork-task', onForkTask)
   window.addEventListener('keydown', handleGlobalKeydown)
 })
 
@@ -248,6 +258,7 @@ onUnmounted(() => {
   window.removeEventListener('send-message', onSendMessage)
   window.removeEventListener('open-memory', onOpenMemory)
   window.removeEventListener('open-files', onOpenFiles)
+  window.removeEventListener('fork-task', onForkTask)
   window.removeEventListener('keydown', handleGlobalKeydown)
 })
 </script>
