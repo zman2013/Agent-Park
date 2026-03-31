@@ -1,9 +1,10 @@
 <template>
-  <div v-if="unseenTasks.length > 0" class="border-b border-gray-800 pb-2 mb-1">
-    <div class="flex items-center justify-between px-4 py-1.5">
+  <div v-if="unseenTasks.length > 0" class="border-b border-gray-800 pb-2 mb-1 max-h-[40vh] flex flex-col">
+    <div class="flex items-center justify-between px-4 py-1.5 flex-shrink-0">
       <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">近期更新</span>
       <span class="text-xs text-gray-600 bg-gray-800 rounded-full px-1.5 py-0.5 tabular-nums">{{ unseenTasks.length }}</span>
     </div>
+    <div class="overflow-auto flex-1">
     <div
       v-for="task in unseenTasks"
       :key="task.id"
@@ -18,6 +19,7 @@
         title="关闭"
         @click.stop="store.dismissUnseenTask(task.id)"
       >×</button>
+    </div>
     </div>
   </div>
 </template>
