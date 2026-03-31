@@ -250,42 +250,55 @@ async def ept_usage():
 
 
 @router.get("/skills")
-async def list_skills():
-    """Return available skills from ~/.claude/skills/."""
+async def list_skills(cwd: str = ""):
+    """Return available skills from ~/.claude/skills/ and project-level .claude/skills/."""
     import re
     from pathlib import Path
 
-    skills_dir = Path.home() / ".claude" / "skills"
-    if not skills_dir.exists():
-        return []
+    def scan_skills_dir(skills_dir: Path) -> list[dict]:
+        if not skills_dir.exists():
+            return []
+        result = []
+        for item in sorted(skills_dir.iterdir()):
+            if not (item.is_dir() or item.is_symlink()):
+                continue
+            skill_md = item / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            try:
+                content = skill_md.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            m = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
+            if not m:
+                continue
+            fm = m.group(1)
+            name_m = re.search(r"^name:\s*(.+)$", fm, re.MULTILINE)
+            desc_m = re.search(r"^description:\s*\|\s*\n((?:  .+\n?)+)", fm, re.MULTILINE)
+            if not desc_m:
+                desc_m = re.search(r"^description:\s*(.+)$", fm, re.MULTILINE)
+                desc = desc_m.group(1).strip() if desc_m else ""
+            else:
+                lines = desc_m.group(1).strip().split("\n")
+                desc = " ".join(ln.strip() for ln in lines)
+            name = name_m.group(1).strip() if name_m else item.name
+            result.append({"name": name, "description": desc})
+        return result
 
-    skills = []
-    for item in sorted(skills_dir.iterdir()):
-        if not (item.is_dir() or item.is_symlink()):
-            continue
-        skill_md = item / "SKILL.md"
-        if not skill_md.exists():
-            continue
-        try:
-            content = skill_md.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        m = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
-        if not m:
-            continue
-        fm = m.group(1)
-        name_m = re.search(r"^name:\s*(.+)$", fm, re.MULTILINE)
-        desc_m = re.search(r"^description:\s*\|\s*\n((?:  .+\n?)+)", fm, re.MULTILINE)
-        if not desc_m:
-            desc_m = re.search(r"^description:\s*(.+)$", fm, re.MULTILINE)
-            desc = desc_m.group(1).strip() if desc_m else ""
-        else:
-            lines = desc_m.group(1).strip().split("\n")
-            desc = " ".join(ln.strip() for ln in lines)
-        name = name_m.group(1).strip() if name_m else item.name
-        skills.append({"name": name, "description": desc})
+    global_skills = scan_skills_dir(Path.home() / ".claude" / "skills")
 
-    return skills
+    project_skills: list[dict] = []
+    if cwd:
+        project_dir = Path(cwd)
+        if project_dir.is_dir():
+            project_skills = scan_skills_dir(project_dir / ".claude" / "skills")
+
+    # Merge: project skills override global skills with the same name
+    global_names = {s["name"] for s in project_skills}
+    merged = project_skills + [s for s in global_skills if s["name"] not in global_names]
+    merged.sort(key=lambda s: s["name"])
+
+    return merged
 
 
 # ── File browser endpoints ─────────────────────────────────────────────────────

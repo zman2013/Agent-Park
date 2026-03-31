@@ -49,6 +49,7 @@
 
 <script setup>
 import { ref, computed, nextTick, onMounted, watch } from 'vue'
+import { useAgentStore } from '../stores/agentStore.js'
 
 const props = defineProps({
   task: { type: Object, required: true },
@@ -57,6 +58,7 @@ const props = defineProps({
 const emit = defineEmits(['send'])
 const text = ref('')
 const inputEl = ref(null)
+const store = useAgentStore()
 
 // Skill autocomplete state
 const allSkills = ref([])
@@ -92,7 +94,10 @@ onMounted(async () => {
   }
 
   try {
-    const res = await fetch('/api/skills')
+    const agent = store.agents.find(a => a.id === props.task.agent_id)
+    const cwd = agent?.cwd || ''
+    const url = cwd ? `/api/skills?cwd=${encodeURIComponent(cwd)}` : '/api/skills'
+    const res = await fetch(url)
     if (res.ok) {
       allSkills.value = await res.json()
     }
