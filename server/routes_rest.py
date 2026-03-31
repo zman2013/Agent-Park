@@ -384,6 +384,74 @@ async def list_files(agent_id: str, path: str = ""):
     return {"cwd": cwd, "path": "" if rel == "." else rel, "entries": entries}
 
 
+@router.get("/agents/{agent_id}/files/search")
+async def search_files(agent_id: str, q: str = "", limit: int = 50):
+    """Recursive file search by name substring within agent cwd.
+
+    Uses the system `find` command for performance on large repos.
+    """
+    if not q or len(q) < 1:
+        return {"cwd": "", "query": q, "results": []}
+
+    agent = app_state.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    if not agent.cwd:
+        raise HTTPException(400, "agent has no cwd configured")
+    cwd = os.path.realpath(agent.cwd)
+    if not os.path.isdir(cwd):
+        raise HTTPException(400, "agent cwd does not exist")
+
+    limit = min(limit, 100)
+
+    # Build find command with pruning for ignored dirs
+    # -prune stops descending into ignored directories at kernel level
+    prune_names = list(IGNORED_NAMES)
+    prune_expr = " -o ".join(f'-name {n}' for n in prune_names)
+    # -iname '*q*' does case-insensitive glob match
+    # find outputs: type_char<TAB>relative_path  (via -printf)
+    import subprocess, shlex
+    cmd = (
+        f'find . '
+        f'\\( {prune_expr} \\) -prune '
+        f'-o \\( -iname {shlex.quote("*" + q + "*")} \\) -printf "%y\\t%P\\n"'
+    )
+
+    try:
+        proc = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: subprocess.run(
+                cmd, shell=True, cwd=cwd,
+                capture_output=True, text=True, timeout=5,
+            ),
+        )
+    except Exception:
+        return {"cwd": cwd, "query": q, "results": []}
+
+    results = []
+    for line in proc.stdout.splitlines():
+        if not line or '\t' not in line:
+            continue
+        type_char, rel_path = line.split('\t', 1)
+        if not rel_path:
+            continue
+        name = os.path.basename(rel_path)
+        if any(name.endswith(s) for s in IGNORED_SUFFIXES):
+            continue
+        entry_type = "dir" if type_char == "d" else "file"
+        size = None
+        if entry_type == "file":
+            try:
+                size = os.path.getsize(os.path.join(cwd, rel_path))
+            except OSError:
+                pass
+        results.append({"name": name, "path": rel_path, "type": entry_type, "size": size})
+        if len(results) >= limit:
+            break
+
+    return {"cwd": cwd, "query": q, "results": results}
+
+
 @router.get("/agents/{agent_id}/files/content")
 async def file_content(agent_id: str, path: str = ""):
     cwd, abs_path = _resolve_agent_path(agent_id, path)

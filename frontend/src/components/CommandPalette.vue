@@ -48,7 +48,7 @@
 
             <!-- File navigation mode -->
             <template v-else>
-              <!-- Recent files -->
+              <!-- Recent files (only when no query) -->
               <template v-if="!fileQuery && recentFilesList.length > 0">
                 <div class="px-3 pt-1.5 pb-1 text-gray-600 text-xs uppercase tracking-wider select-none">
                   recently opened
@@ -72,32 +72,65 @@
                 <div class="border-t border-gray-800 mx-2 my-1"></div>
               </template>
 
-              <!-- Directory entries -->
-              <div v-if="dirLoading" class="px-3 py-4 text-xs text-gray-600 text-center">Loading...</div>
-              <div v-else-if="dirError" class="px-3 py-4 text-xs text-red-400 text-center">{{ dirError }}</div>
-              <template v-else>
-                <div v-if="currentDirPath" class="px-3 pt-1.5 pb-1 text-gray-600 text-xs font-mono truncate select-none" :title="fullCurrentPath">
-                  {{ fullCurrentPath }}
+              <!-- Search results (when query is non-empty) -->
+              <template v-if="fileQuery">
+                <div v-if="searchLoading" class="px-3 py-4 text-xs text-gray-600 text-center">Searching...</div>
+                <div v-else-if="searchError" class="px-3 py-4 text-xs text-red-400 text-center">{{ searchError }}</div>
+                <template v-else-if="searchResults.length > 0">
+                  <div
+                    v-for="(item, i) in searchResults"
+                    :key="'search-' + item.path"
+                    :class="[
+                      'flex items-center px-3 py-1.5 cursor-pointer text-sm transition-colors',
+                      i === activeIndex ? 'bg-blue-900/30 text-gray-100' : 'text-gray-400 hover:bg-gray-800/60'
+                    ]"
+                    @click="selectSearchResult(item)"
+                    @mouseenter="activeIndex = i"
+                  >
+                    <span class="text-gray-500 mr-2 flex-shrink-0">{{ item.type === 'dir' ? '📁' : fileIcon(item.name) }}</span>
+                    <span class="truncate min-w-0" style="flex: 0 1 auto">{{ item.name }}{{ item.type === 'dir' ? '/' : '' }}</span>
+                    <span class="text-gray-600 text-xs ml-2 flex-shrink-0 truncate max-w-[240px] font-mono" :title="item.path">
+                      {{ shortenPath(item.path) }}
+                    </span>
+                    <span class="flex-1"></span>
+                    <span v-if="item.type === 'file' && item.size != null" class="text-gray-600 text-xs ml-2 flex-shrink-0 tabular-nums">
+                      {{ formatSize(item.size) }}
+                    </span>
+                  </div>
+                </template>
+                <div v-else class="px-3 py-4 text-xs text-gray-600 text-center">
+                  No matching files
                 </div>
-                <div
-                  v-for="(entry, i) in filteredDirEntries"
-                  :key="'dir-' + entry.name"
-                  :class="[
-                    'flex items-center px-3 py-1.5 cursor-pointer text-sm transition-colors',
-                    (i + dirListOffset) === activeIndex ? 'bg-blue-900/30 text-gray-100' : 'text-gray-400 hover:bg-gray-800/60'
-                  ]"
-                  @click="selectEntry(entry)"
-                  @mouseenter="activeIndex = i + dirListOffset"
-                >
-                  <span class="text-gray-500 mr-2 flex-shrink-0">{{ entry.type === 'dir' ? '📁' : fileIcon(entry.name) }}</span>
-                  <span class="truncate flex-1 min-w-0">{{ entry.name }}{{ entry.type === 'dir' ? '/' : '' }}</span>
-                  <span v-if="entry.type === 'file' && entry.size != null" class="text-gray-600 text-xs ml-2 flex-shrink-0 tabular-nums">
-                    {{ formatSize(entry.size) }}
-                  </span>
-                </div>
-                <div v-if="filteredDirEntries.length === 0 && !dirLoading" class="px-3 py-4 text-xs text-gray-600 text-center">
-                  {{ fileQuery ? 'No matching files' : 'Empty directory' }}
-                </div>
+              </template>
+
+              <!-- Directory listing (when no query) -->
+              <template v-if="!fileQuery">
+                <div v-if="dirLoading" class="px-3 py-4 text-xs text-gray-600 text-center">Loading...</div>
+                <div v-else-if="dirError" class="px-3 py-4 text-xs text-red-400 text-center">{{ dirError }}</div>
+                <template v-else>
+                  <div v-if="currentDirPath" class="px-3 pt-1.5 pb-1 text-gray-600 text-xs font-mono truncate select-none" :title="fullCurrentPath">
+                    {{ fullCurrentPath }}
+                  </div>
+                  <div
+                    v-for="(entry, i) in dirEntries"
+                    :key="'dir-' + entry.name"
+                    :class="[
+                      'flex items-center px-3 py-1.5 cursor-pointer text-sm transition-colors',
+                      (i + dirListOffset) === activeIndex ? 'bg-blue-900/30 text-gray-100' : 'text-gray-400 hover:bg-gray-800/60'
+                    ]"
+                    @click="selectEntry(entry)"
+                    @mouseenter="activeIndex = i + dirListOffset"
+                  >
+                    <span class="text-gray-500 mr-2 flex-shrink-0">{{ entry.type === 'dir' ? '📁' : fileIcon(entry.name) }}</span>
+                    <span class="truncate flex-1 min-w-0">{{ entry.name }}{{ entry.type === 'dir' ? '/' : '' }}</span>
+                    <span v-if="entry.type === 'file' && entry.size != null" class="text-gray-600 text-xs ml-2 flex-shrink-0 tabular-nums">
+                      {{ formatSize(entry.size) }}
+                    </span>
+                  </div>
+                  <div v-if="dirEntries.length === 0 && !dirLoading" class="px-3 py-4 text-xs text-gray-600 text-center">
+                    Empty directory
+                  </div>
+                </template>
               </template>
 
               <!-- No agent hint -->
@@ -113,7 +146,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, nextTick } from 'vue'
+import { ref, computed, watch, nextTick, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 
 const props = defineProps({
@@ -136,6 +169,13 @@ const dirEntries = ref([])
 const dirLoading = ref(false)
 const dirError = ref('')
 const dirCwd = ref('')
+
+// Search state
+const searchResults = ref([])
+const searchLoading = ref(false)
+const searchError = ref('')
+let searchTimer = null
+let searchAbort = null  // AbortController for in-flight request
 
 // ── Command definitions ─────────────────────────────────────────────────────
 const commands = [
@@ -223,12 +263,6 @@ const fullCurrentPath = computed(() => {
   return base + '/' + currentDirPath.value
 })
 
-const filteredDirEntries = computed(() => {
-  const q = fileQuery.value
-  if (!q) return dirEntries.value
-  return dirEntries.value.filter(e => e.name.toLowerCase().includes(q))
-})
-
 async function loadDir(subPath = '') {
   if (!props.agentId) return
   dirLoading.value = true
@@ -252,12 +286,66 @@ async function loadDir(subPath = '') {
   }
 }
 
+// ── File mode: recursive search ─────────────────────────────────────────────
+async function searchFiles(q) {
+  if (!props.agentId || !q) return
+  // Cancel previous in-flight request
+  if (searchAbort) searchAbort.abort()
+  const controller = new AbortController()
+  searchAbort = controller
+
+  searchLoading.value = true
+  searchError.value = ''
+  try {
+    const url = `/api/agents/${props.agentId}/files/search?q=${encodeURIComponent(q)}&limit=50`
+    const res = await fetch(url, { signal: controller.signal })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.detail || `HTTP ${res.status}`)
+    }
+    const data = await res.json()
+    searchResults.value = data.results || []
+  } catch (e) {
+    if (e.name === 'AbortError') return  // superseded by newer request
+    searchError.value = e.message
+    searchResults.value = []
+  } finally {
+    if (searchAbort === controller) {
+      searchLoading.value = false
+      searchAbort = null
+    }
+  }
+}
+
+function cancelSearch() {
+  if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
+  if (searchAbort) { searchAbort.abort(); searchAbort = null }
+  searchResults.value = []
+  searchLoading.value = false
+  searchError.value = ''
+}
+
+// Watch fileQuery to debounce search
+watch(fileQuery, (q) => {
+  if (isCommandMode.value) return
+  cancelSearch()
+  if (!q) return  // empty query → show directory listing, no search
+  searchTimer = setTimeout(() => searchFiles(q), 250)
+})
+
+onUnmounted(() => {
+  cancelSearch()
+})
+
 // ── Item count for keyboard nav ─────────────────────────────────────────────
 const totalItems = computed(() => {
   if (isCommandMode.value) {
     return taskListMode.value ? filteredTaskItems.value.length : filteredCommands.value.length
   }
-  return dirListOffset.value + filteredDirEntries.value.length
+  if (fileQuery.value) {
+    return searchResults.value.length
+  }
+  return dirListOffset.value + dirEntries.value.length
 })
 
 // ── Open / close logic ──────────────────────────────────────────────────────
@@ -269,10 +357,13 @@ watch(() => props.visible, (v) => {
     currentDirPath.value = ''
     dirEntries.value = []
     dirError.value = ''
+    cancelSearch()
     if (props.mode === 'file' && props.agentId) {
       loadDir('')
     }
     nextTick(() => inputEl.value?.focus())
+  } else {
+    cancelSearch()
   }
 })
 
@@ -366,13 +457,19 @@ function onEnter() {
     if (cmd) executeCommand(cmd)
   } else {
     // File mode
-    const recentIdx = activeIndex.value
-    if (!fileQuery.value && recentIdx < recentFilesList.value.length) {
-      selectFile(recentFilesList.value[recentIdx])
+    if (fileQuery.value) {
+      // Search results mode
+      const item = searchResults.value[activeIndex.value]
+      if (item) selectSearchResult(item)
     } else {
-      const dirIdx = activeIndex.value - dirListOffset.value
-      const entry = filteredDirEntries.value[dirIdx]
-      if (entry) selectEntry(entry)
+      const recentIdx = activeIndex.value
+      if (recentIdx < recentFilesList.value.length) {
+        selectFile(recentFilesList.value[recentIdx])
+      } else {
+        const dirIdx = activeIndex.value - dirListOffset.value
+        const entry = dirEntries.value[dirIdx]
+        if (entry) selectEntry(entry)
+      }
     }
   }
 }
@@ -405,6 +502,21 @@ function selectEntry(entry) {
     const filePath = currentDirPath.value ? currentDirPath.value + '/' + entry.name : entry.name
     store.addRecentFile(props.agentId, filePath)
     emit('open-file', { agentId: props.agentId, path: filePath, size: entry.size || 0 })
+    emit('close')
+  }
+}
+
+function selectSearchResult(item) {
+  if (item.type === 'dir') {
+    // Navigate into directory, clear search
+    currentDirPath.value = item.path
+    query.value = ''
+    activeIndex.value = 0
+    cancelSearch()
+    loadDir(item.path)
+  } else {
+    store.addRecentFile(props.agentId, item.path)
+    emit('open-file', { agentId: props.agentId, path: item.path, size: item.size || 0 })
     emit('close')
   }
 }
