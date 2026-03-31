@@ -78,3 +78,9 @@
   max-height: 50vh;
   opacity: 1;
 }
+
+/* Command Palette transitions */
+.palette-enter-active { transition: opacity 0.12s ease, transform 0.12s ease; }
+.palette-leave-active { transition: opacity 0.08s ease, transform 0.08s ease; }
+.palette-enter-from { opacity: 0; transform: translateY(-8px) scale(0.98); }
+.palette-leave-to { opacity: 0; transform: translateY(-4px) scale(0.99); }

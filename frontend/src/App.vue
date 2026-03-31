@@ -72,6 +72,18 @@
       />
     </div>
 
+    <!-- Command Palette -->
+    <CommandPalette
+      :visible="commandPaletteVisible"
+      :mode="commandPaletteMode"
+      :agent-id="currentAgentId"
+      :agent-cwd="currentAgentCwd"
+      @close="commandPaletteVisible = false"
+      @execute-command="onCommandExecute"
+      @open-file="onPaletteOpenFile"
+      @open-directory="onPaletteOpenDirectory"
+    />
+
     <!-- Toasts -->
     <ToastContainer />
   </div>
@@ -91,11 +103,14 @@ import PromptsPanel from './components/PromptsPanel.vue'
 import FileBrowserPanel from './components/FileBrowserPanel.vue'
 import FileContentView from './components/FileContentView.vue'
 import UnseenTasksPanel from './components/UnseenTasksPanel.vue'
+import CommandPalette from './components/CommandPalette.vue'
 
 const store = useAgentStore()
 const { connected: wsConnected, createTask, sendUserMessage, forkTask } = useWebSocket()
 
 const terminalVisible = ref(false)
+const commandPaletteVisible = ref(false)
+const commandPaletteMode = ref('command')
 
 // ── Left panel width & visibility ────────────────────────────────────────────
 const LEFT_WIDTH_KEY = 'agent-park:left-width'
@@ -154,6 +169,12 @@ const currentAgentCwd = computed(() => {
   return agent?.cwd || ''
 })
 
+const currentAgentId = computed(() => {
+  const task = store.currentTask
+  if (!task) return null
+  return task.agent_id
+})
+
 const memoryAgentName = computed(() => {
   if (!store.memoryAgentId) return ''
   const agent = store.agents.find(a => a.id === store.memoryAgentId)
@@ -170,6 +191,9 @@ function closeFileBrowser() {
 function onFileSelect({ path, size }) {
   fileBrowserState.value.selectedFile = path
   fileBrowserState.value.fileSize = size
+  if (fileBrowserState.value.agentId) {
+    store.addRecentFile(fileBrowserState.value.agentId, path)
+  }
 }
 
 // ── Event handlers ────────────────────────────────────────────────────────────
@@ -211,7 +235,82 @@ function onOpenFiles(e) {
   fileBrowserState.value.fileSize = 0
 }
 
+// ── Command Palette handlers ─────────────────────────────────────────────────
+function onCommandExecute(commandId) {
+  switch (commandId) {
+    case 'toggle-sidebar':
+      leftVisible.value = !leftVisible.value
+      break
+    case 'toggle-terminal':
+      terminalVisible.value = !terminalVisible.value
+      break
+    case 'toggle-memory': {
+      if (store.memoryPanelOpen) {
+        store.closeMemoryPanel()
+      } else {
+        const agentId = currentAgentId.value || store.agents[0]?.id
+        if (agentId) store.openMemoryPanel(agentId)
+      }
+      break
+    }
+    case 'toggle-prompts':
+      if (store.promptsPanelOpen) {
+        store.closePromptsPanel()
+      } else {
+        store.openPromptsPanel()
+      }
+      break
+    case 'open-files': {
+      const agentId = currentAgentId.value
+      if (agentId) {
+        fileBrowserState.value.panelOpen = true
+        fileBrowserState.value.agentId = agentId
+        fileBrowserState.value.selectedFile = null
+        fileBrowserState.value.fileSize = 0
+      }
+      break
+    }
+    case 'create-task': {
+      const agentId = currentAgentId.value || store.agents[0]?.id
+      if (agentId && wsConnected.value) {
+        createTask(agentId, '')
+      }
+      break
+    }
+  }
+}
+
+function onPaletteOpenFile({ agentId, path, size }) {
+  // Open file browser to that agent, select the file
+  fileBrowserState.value.panelOpen = true
+  fileBrowserState.value.agentId = agentId
+  fileBrowserState.value.selectedFile = path
+  fileBrowserState.value.fileSize = size
+  store.addRecentFile(agentId, path)
+}
+
+function onPaletteOpenDirectory({ agentId, path }) {
+  fileBrowserState.value.panelOpen = true
+  fileBrowserState.value.agentId = agentId
+  fileBrowserState.value.selectedFile = null
+  fileBrowserState.value.fileSize = 0
+}
+
 function handleGlobalKeydown(e) {
+  // ⌘⇧P — command palette (command mode)
+  if (e.metaKey && e.shiftKey && (e.key === 'p' || e.key === 'P')) {
+    e.preventDefault()
+    commandPaletteMode.value = 'command'
+    commandPaletteVisible.value = true
+    return
+  }
+  // ⌘P — command palette (file mode)
+  if (e.metaKey && !e.shiftKey && e.key === 'p') {
+    e.preventDefault()
+    commandPaletteMode.value = 'file'
+    commandPaletteVisible.value = true
+    return
+  }
   if (e.metaKey && e.key === 'b') {
     e.preventDefault()
     leftVisible.value = !leftVisible.value

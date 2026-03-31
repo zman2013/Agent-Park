@@ -15,6 +15,7 @@ export default defineConfig({
   plugins: [vue()],
   server: {
     port: frontendPort,
+    hmr: false,
     proxy: {
       '/api': {
         target: backendUrl,

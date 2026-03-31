@@ -23,6 +23,25 @@ export const useAgentStore = defineStore('agent', () => {
   // Prompts panel state
   const promptsPanelOpen = ref(false)
 
+  // Recent files (per agent, localStorage-backed)
+  const RECENT_FILES_KEY = 'agent-park:recent-files'
+  const MAX_RECENT_PER_AGENT = 20
+  const recentFiles = ref(JSON.parse(localStorage.getItem(RECENT_FILES_KEY) || '{}'))
+
+  function addRecentFile(agentId, filePath) {
+    if (!recentFiles.value[agentId]) recentFiles.value[agentId] = []
+    const list = recentFiles.value[agentId]
+    const idx = list.findIndex(f => f.path === filePath)
+    if (idx !== -1) list.splice(idx, 1)
+    list.unshift({ path: filePath, name: filePath.split('/').pop(), openedAt: Date.now() })
+    if (list.length > MAX_RECENT_PER_AGENT) list.length = MAX_RECENT_PER_AGENT
+    localStorage.setItem(RECENT_FILES_KEY, JSON.stringify(recentFiles.value))
+  }
+
+  function getRecentFiles(agentId) {
+    return recentFiles.value[agentId] || []
+  }
+
   const currentTask = computed(() => {
     if (!currentTaskId.value) return null
     return tasks.value[currentTaskId.value] || null
@@ -423,6 +442,9 @@ export const useAgentStore = defineStore('agent', () => {
     memoryAgentId,
     agentMemory,
     promptsPanelOpen,
+    recentFiles,
+    addRecentFile,
+    getRecentFiles,
     syncState,
     updateTaskStatus,
     addMessage,
