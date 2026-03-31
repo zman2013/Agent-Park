@@ -48,7 +48,7 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onMounted, watch } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useAgentStore } from '../stores/agentStore.js'
 
 const props = defineProps({
@@ -93,6 +93,8 @@ onMounted(async () => {
     nextTick(() => autoResize())
   }
 
+  window.addEventListener('fill-prompt', onFillPrompt)
+
   try {
     const agent = store.agents.find(a => a.id === props.task.agent_id)
     const cwd = agent?.cwd || ''
@@ -105,6 +107,18 @@ onMounted(async () => {
     // ignore
   }
 })
+
+onUnmounted(() => {
+  window.removeEventListener('fill-prompt', onFillPrompt)
+})
+
+function onFillPrompt(e) {
+  text.value = e.detail.content
+  nextTick(() => {
+    autoResize()
+    inputEl.value?.focus()
+  })
+}
 
 const filteredSkills = computed(() => {
   if (!showSkillMenu.value) return []

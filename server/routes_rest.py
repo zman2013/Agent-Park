@@ -226,6 +226,35 @@ async def delete_memory(agent_id: str, line_index: int):
     return {"ok": True}
 
 
+# ── Prompts endpoints ─────────────────────────────────────────────────────────
+
+class PromptAddBody(BaseModel):
+    title: str = ""
+    content: str
+
+
+@router.get("/prompts")
+async def get_prompts():
+    from server.prompts import list_prompts
+    return list_prompts()
+
+
+@router.post("/prompts")
+async def add_prompt(body: PromptAddBody):
+    if not body.content.strip():
+        raise HTTPException(400, "content is required")
+    from server.prompts import append_prompt
+    return append_prompt(body.title.strip(), body.content)
+
+
+@router.delete("/prompts/{prompt_id}")
+async def delete_prompt(prompt_id: str):
+    from server.prompts import delete_prompt as _delete
+    if not _delete(prompt_id):
+        raise HTTPException(404, "prompt not found")
+    return {"ok": True}
+
+
 @router.get("/ept-usage")
 async def ept_usage():
     """Run `ept usage` and return the monthly total cost."""

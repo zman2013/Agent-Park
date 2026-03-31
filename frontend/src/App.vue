@@ -66,6 +66,10 @@
         :agent-name="memoryAgentName"
         @close="store.closeMemoryPanel()"
       />
+      <PromptsPanel
+        :visible="store.promptsPanelOpen"
+        @close="store.closePromptsPanel()"
+      />
     </div>
 
     <!-- Toasts -->
@@ -83,6 +87,7 @@ import ChatInput from './components/ChatInput.vue'
 import ToastContainer from './components/ToastContainer.vue'
 import TerminalPanel from './components/TerminalPanel.vue'
 import MemoryPanel from './components/MemoryPanel.vue'
+import PromptsPanel from './components/PromptsPanel.vue'
 import FileBrowserPanel from './components/FileBrowserPanel.vue'
 import FileContentView from './components/FileContentView.vue'
 import UnseenTasksPanel from './components/UnseenTasksPanel.vue'
@@ -215,6 +220,14 @@ function handleGlobalKeydown(e) {
       const task = store.currentTask
       const agentId = task?.agent_id || store.agents[0]?.id
       if (agentId) store.openMemoryPanel(agentId)
+    }
+  }
+  if (e.metaKey && e.key === 'u') {
+    e.preventDefault()
+    if (store.promptsPanelOpen) {
+      store.closePromptsPanel()
+    } else {
+      store.openPromptsPanel()
     }
   }
   if (e.key === 'Escape' && fileBrowserState.value.selectedFile) {

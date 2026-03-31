@@ -20,6 +20,9 @@ export const useAgentStore = defineStore('agent', () => {
   const memoryAgentId = ref(null)
   const agentMemory = ref({})  // { agent_id: [entries...] }
 
+  // Prompts panel state
+  const promptsPanelOpen = ref(false)
+
   const currentTask = computed(() => {
     if (!currentTaskId.value) return null
     return tasks.value[currentTaskId.value] || null
@@ -381,6 +384,14 @@ export const useAgentStore = defineStore('agent', () => {
     memoryPanelOpen.value = false
   }
 
+  function openPromptsPanel() {
+    promptsPanelOpen.value = true
+  }
+
+  function closePromptsPanel() {
+    promptsPanelOpen.value = false
+  }
+
   function setAgentMemory(agentId, entries) {
     agentMemory.value[agentId] = entries
   }
@@ -411,6 +422,7 @@ export const useAgentStore = defineStore('agent', () => {
     memoryPanelOpen,
     memoryAgentId,
     agentMemory,
+    promptsPanelOpen,
     syncState,
     updateTaskStatus,
     addMessage,
@@ -433,6 +445,8 @@ export const useAgentStore = defineStore('agent', () => {
     unpinAgent,
     openMemoryPanel,
     closeMemoryPanel,
+    openPromptsPanel,
+    closePromptsPanel,
     setAgentMemory,
     prependMemoryEntry,
     removeMemoryEntry,
