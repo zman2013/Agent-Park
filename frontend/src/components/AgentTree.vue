@@ -1,21 +1,25 @@
 <template>
   <div class="bg-[#111] border-r border-gray-800 flex flex-col h-full overflow-hidden">
-    <div class="p-4 flex items-center justify-between">
-      <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Agents</span>
-      <span
-        v-if="usage.amount !== null"
-        class="text-xs text-gray-500 tabular-nums"
-        :title="'本月使用总金额（点击刷新）'"
-        style="cursor: pointer"
-        @click="fetchUsage"
-      >¥{{ usage.amount }}</span>
-      <span v-else-if="usage.loading" class="text-xs text-gray-600">...</span>
-    </div>
-    <div class="flex-1 overflow-auto px-2 pb-4">
-      <UnseenTasksPanel />
+    <!-- Fixed header area -->
+    <div class="flex-shrink-0">
+      <div class="p-4 flex items-center justify-between">
+        <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Agents</span>
+        <span
+          v-if="usage.amount !== null"
+          class="text-xs text-gray-500 tabular-nums"
+          :title="'本月使用总金额（点击刷新）'"
+          style="cursor: pointer"
+          @click="fetchUsage"
+        >¥{{ usage.amount }}</span>
+        <span v-else-if="usage.loading" class="text-xs text-gray-600">...</span>
+      </div>
+
+      <div class="px-2">
+        <UnseenTasksPanel />
+      </div>
 
       <!-- New Agent Form -->
-      <div v-if="showForm" class="mx-2 mb-2 p-3 bg-gray-800/60 rounded-lg border border-gray-700 space-y-2">
+      <div v-if="showForm" class="mx-4 mb-2 p-3 bg-gray-800/60 rounded-lg border border-gray-700 space-y-2">
         <div>
           <label class="text-xs text-gray-500 block mb-1">Name</label>
           <input
@@ -74,7 +78,10 @@
         <span>+</span>
         <span>new agent</span>
       </div>
+    </div>
 
+    <!-- Scrollable agent list -->
+    <div class="flex-1 overflow-auto px-2 pb-4">
       <AgentGroup
         v-for="agent in store.agents"
         :key="agent.id"
