@@ -123,16 +123,20 @@ function onFillPrompt(e) {
 const filteredSkills = computed(() => {
   if (!showSkillMenu.value) return []
   const query = text.value
-  if (!query.startsWith('/')) return []
+  if (!query.startsWith('/') && !query.startsWith('、')) return []
   const prefix = query.slice(1).toLowerCase()
   if (prefix === '') return allSkills.value
   return allSkills.value.filter(s => s.name.toLowerCase().startsWith(prefix))
 })
 
+function isSkillTrigger(val) {
+  return (val.startsWith('/') || val.startsWith('、')) && !val.includes(' ')
+}
+
 function handleInput() {
   autoResize()
   const val = text.value
-  if (val.startsWith('/') && !val.includes(' ')) {
+  if (isSkillTrigger(val)) {
     showSkillMenu.value = true
     activeIndex.value = 0
   } else {
