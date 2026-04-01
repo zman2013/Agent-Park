@@ -18,7 +18,7 @@
     <div ref="treeEl" class="flex-1 overflow-auto py-1 min-h-0">
       <FileBrowserNode
         v-for="entry in rootEntries"
-        :key="entry.name"
+        :key="`${treeKey}-${entry.name}`"
         :entry="entry"
         :agent-id="agentId"
         :base-path="''"
@@ -49,6 +49,8 @@ const rootEntries = ref([])
 const rootLoading = ref(false)
 const rootError = ref('')
 const treeEl = ref(null)
+// Increment to force re-mount of all FileBrowserNode when initialPath changes
+const treeKey = ref(0)
 
 // Split initialPath into segments for expand-path propagation
 const expandPathSegments = computed(() => {
@@ -84,4 +86,10 @@ async function loadRoot() {
 onMounted(loadRoot)
 
 watch(() => props.agentId, loadRoot)
+
+// When initialPath changes, force re-mount of the tree so nodes start fresh
+// and auto-expand logic runs from scratch
+watch(() => props.initialPath, () => {
+  treeKey.value++
+})
 </script>
