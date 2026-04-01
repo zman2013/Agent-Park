@@ -2,7 +2,9 @@
   <div>
     <!-- Entry row -->
     <div
+      ref="rowEl"
       class="flex items-center gap-1 px-2 py-0.5 text-xs cursor-pointer hover:bg-gray-800/60 rounded transition-colors select-none"
+      :class="{ 'bg-blue-900/40 text-blue-200': isHighlighted }"
       :style="{ paddingLeft: `${0.5 + depth * 1}rem` }"
       @click="onEntryClick"
     >
@@ -11,7 +13,7 @@
         <template v-else>·</template>
       </span>
       <span class="text-gray-500 flex-shrink-0">{{ entry.type === 'dir' ? '📁' : fileIcon(entry.name) }}</span>
-      <span class="truncate text-gray-300 flex-1 min-w-0">{{ entry.name }}</span>
+      <span class="truncate flex-1 min-w-0" :class="isHighlighted ? 'text-blue-200' : 'text-gray-300'">{{ entry.name }}</span>
       <span v-if="entry.type === 'file' && entry.size !== null" class="text-gray-600 flex-shrink-0 ml-1 tabular-nums">{{ formatSize(entry.size) }}</span>
     </div>
 
@@ -26,24 +28,32 @@
         :agent-id="agentId"
         :base-path="childBasePath"
         :depth="depth + 1"
+        :expand-path="childExpandPath"
+        :highlight-path="highlightPath"
         @file-select="$emit('file-select', $event)"
+        @node-mounted="$emit('node-mounted', $event)"
       />
     </template>
   </div>
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, watch, onMounted, nextTick } from 'vue'
 
 const props = defineProps({
   entry: { type: Object, required: true },
   agentId: { type: String, required: true },
   basePath: { type: String, required: true },
   depth: { type: Number, default: 0 },
+  // Array of remaining path segments to auto-expand, e.g. ['components', 'Foo.vue']
+  expandPath: { type: Array, default: () => [] },
+  // Full relative path of the file to highlight, e.g. 'src/components/Foo.vue'
+  highlightPath: { type: String, default: '' },
 })
 
-const emit = defineEmits(['file-select'])
+const emit = defineEmits(['file-select', 'node-mounted'])
 
+const rowEl = ref(null)
 const expanded = ref(false)
 const children = ref([])
 const loadingChildren = ref(false)
@@ -54,6 +64,20 @@ const entryPath = computed(() =>
 )
 
 const childBasePath = computed(() => entryPath.value)
+
+// Whether this node is on the auto-expand path
+const isOnExpandPath = computed(() =>
+  props.expandPath.length > 0 && props.expandPath[0] === props.entry.name
+)
+
+// Remaining segments to pass down to children
+const childExpandPath = computed(() =>
+  isOnExpandPath.value ? props.expandPath.slice(1) : []
+)
+
+const isHighlighted = computed(() =>
+  props.highlightPath ? entryPath.value === props.highlightPath : false
+)
 
 async function loadChildren() {
   loadingChildren.value = true
@@ -83,6 +107,31 @@ function onEntryClick() {
     emit('file-select', { path: entryPath.value, size: props.entry.size ?? 0 })
   }
 }
+
+// Auto-expand when this node is on the expand path
+watch(isOnExpandPath, async (val) => {
+  if (val && props.entry.type === 'dir' && !expanded.value) {
+    if (children.value.length === 0 && !loadingChildren.value) {
+      await loadChildren()
+    }
+    expanded.value = true
+  }
+}, { immediate: true })
+
+// Notify parent when the highlighted file node is mounted so it can scroll into view
+onMounted(() => {
+  if (isHighlighted.value && props.entry.type === 'file' && rowEl.value) {
+    emit('node-mounted', { path: entryPath.value, el: rowEl.value })
+  }
+})
+
+// Also watch for when highlighted becomes true after mount (children load async)
+watch(isHighlighted, async (val) => {
+  if (val && props.entry.type === 'file' && rowEl.value) {
+    await nextTick()
+    emit('node-mounted', { path: entryPath.value, el: rowEl.value })
+  }
+})
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.bmp', '.avif'])
 

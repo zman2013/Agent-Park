@@ -15,7 +15,7 @@
     <div v-if="rootError" class="px-3 py-4 text-xs text-red-400">{{ rootError }}</div>
 
     <!-- Tree -->
-    <div class="flex-1 overflow-auto py-1 min-h-0">
+    <div ref="treeEl" class="flex-1 overflow-auto py-1 min-h-0">
       <FileBrowserNode
         v-for="entry in rootEntries"
         :key="entry.name"
@@ -23,7 +23,10 @@
         :agent-id="agentId"
         :base-path="''"
         :depth="0"
+        :expand-path="expandPathSegments"
+        :highlight-path="initialPath"
         @file-select="$emit('file-select', $event)"
+        @node-mounted="onNodeMounted"
       />
       <div v-if="rootLoading && rootEntries.length === 0" class="px-3 py-2 text-xs text-gray-600">Loading...</div>
     </div>
@@ -31,11 +34,12 @@
 </template>
 
 <script setup>
-import { ref, onMounted, defineAsyncComponent } from 'vue'
+import { ref, computed, onMounted, watch } from 'vue'
 import FileBrowserNode from './FileBrowserNode.vue'
 
 const props = defineProps({
   agentId: { type: String, required: true },
+  initialPath: { type: String, default: '' },
 })
 
 defineEmits(['close', 'file-select'])
@@ -44,6 +48,19 @@ const cwd = ref('')
 const rootEntries = ref([])
 const rootLoading = ref(false)
 const rootError = ref('')
+const treeEl = ref(null)
+
+// Split initialPath into segments for expand-path propagation
+const expandPathSegments = computed(() => {
+  if (!props.initialPath) return []
+  return props.initialPath.split('/').filter(Boolean)
+})
+
+function onNodeMounted({ path, el }) {
+  if (props.initialPath && path === props.initialPath && el) {
+    el.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  }
+}
 
 async function loadRoot() {
   rootLoading.value = true
@@ -65,4 +82,6 @@ async function loadRoot() {
 }
 
 onMounted(loadRoot)
+
+watch(() => props.agentId, loadRoot)
 </script>

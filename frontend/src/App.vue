@@ -23,6 +23,7 @@
           </div>
           <FileBrowserPanel
             :agent-id="fileBrowserState.agentId"
+            :initial-path="fileBrowserState.selectedFile || ''"
             @close="closeFileBrowser"
             @file-select="onFileSelect"
           />
