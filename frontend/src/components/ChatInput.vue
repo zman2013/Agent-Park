@@ -93,6 +93,9 @@ onMounted(async () => {
     nextTick(() => autoResize())
   }
 
+  // Auto-focus input when mounted (e.g. after task creation)
+  nextTick(() => inputEl.value?.focus())
+
   window.addEventListener('fill-prompt', onFillPrompt)
 
   try {
