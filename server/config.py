@@ -45,3 +45,18 @@ def memory_config() -> dict:
         "command": cfg.get("command", "cco"),
         "max_lines": int(cfg.get("max_lines", 200)),
     }
+
+
+def knowledge_config() -> dict:
+    """Return the knowledge summary configuration with defaults."""
+    cfg = get_config().get("knowledge", {})
+    return {
+        "command": cfg.get("command", "minimax"),
+        "errors_max_items": int(cfg.get("errors_max_items", 10)),
+        "errors_max_chars": int(cfg.get("errors_max_chars", 2000)),
+        "project_max_items": int(cfg.get("project_max_items", 15)),
+        "project_max_chars": int(cfg.get("project_max_chars", 2000)),
+        "hotfiles_max_items": int(cfg.get("hotfiles_max_items", 20)),
+        "hotfiles_recent_days": int(cfg.get("hotfiles_recent_days", 7)),
+        "default_task_count": int(cfg.get("default_task_count", 5)),
+    }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +14,15 @@ from server.routes_ws import router as ws_router
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
-app = FastAPI(title="Agent Park")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from server.routes_ws import ensure_daily_summary_task
+    ensure_daily_summary_task()
+    yield
+
+
+app = FastAPI(title="Agent Park", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

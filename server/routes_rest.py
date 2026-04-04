@@ -226,6 +226,17 @@ async def delete_memory(agent_id: str, line_index: int):
     return {"ok": True}
 
 
+# ── Knowledge endpoints ────────────────────────────────────────────────────────
+
+@router.get("/agents/{agent_id}/knowledge")
+async def get_knowledge(agent_id: str):
+    """Return the three knowledge documents for an agent."""
+    if agent_id not in app_state.agents:
+        raise HTTPException(404, "agent not found")
+    from server.knowledge import read_knowledge_docs
+    return read_knowledge_docs(agent_id)
+
+
 # ── Prompts endpoints ─────────────────────────────────────────────────────────
 
 class PromptAddBody(BaseModel):

@@ -13,33 +13,34 @@
 
 ```
 agent-park/
-├── config.json              # 全局配置（端口、默认 Agent 列表）
+├── config.json              # 全局配置（端口、Agent 列表、memory、knowledge）
 ├── run.sh                   # 启动/停止/重启脚本
 ├── requirements.txt
 ├── pyproject.toml
 ├── server/                  # Python 后端
-│   ├── main.py              # FastAPI 入口，挂载路由
+│   ├── main.py              # FastAPI 入口，lifespan 启动定时任务，挂载路由
 │   ├── models.py            # 数据模型（Agent、Task、Message、TaskStatus）
-│   ├── state.py             # 内存状态管理 + JSON 持久化（AppState）(205行)
-│   ├── agent_runner.py      # 核心：子进程管理、PTY、流式输出处理 (837行)
-│   ├── routes_ws.py         # WebSocket 路由，消息分发，broadcast() (132行)
-│   ├── routes_rest.py       # REST API（Agent/Task CRUD、Memory）(404行)
-│   ├── memory.py            # Agent 记忆读写（JSONL 格式）(170行)
+│   ├── state.py             # 内存状态管理 + JSON 持久化（AppState）
+│   ├── agent_runner.py      # 核心：子进程管理、PTY、流式输出处理
+│   ├── routes_ws.py         # WebSocket 路由，消息分发，broadcast()，定时任务
+│   ├── routes_rest.py       # REST API（Agent/Task CRUD、Memory、Knowledge）
+│   ├── memory.py            # Agent 记忆读写（JSONL 格式）
+│   ├── knowledge.py         # 知识总结：信号提取、LLM 合并、文档写入、memory 索引
 │   └── config.py            # 读取 config.json 配置
 ├── frontend/
 │   └── src/
 │       ├── App.vue                           # 根组件（可拖拽左右布局）
 │       ├── main.js                           # Vue 应用入口，挂载 Pinia
-│       ├── stores/agentStore.js              # Pinia 全局状态 (445行)
-│       ├── composables/useWebSocket.js       # WebSocket 连接与消息处理 (286行)
+│       ├── stores/agentStore.js              # Pinia 全局状态
+│       ├── composables/useWebSocket.js       # WebSocket 连接与消息处理
 │       └── components/
 │           ├── AgentTree.vue                 # 左侧 Agent 树形列表
-│           ├── AgentGroup.vue                # Agent 分组面板 (345行)
-│           ├── ChatView.vue                  # 聊天面板，流式消息展示 (224行)
+│           ├── AgentGroup.vue                # Agent 分组面板（含🧠知识总结按钮）
+│           ├── ChatView.vue                  # 聊天面板，流式消息展示
 │           ├── ChatInput.vue                 # 用户输入框
 │           ├── TaskItem.vue                  # 任务列表项
-│           ├── MessageBubble.vue             # 消息气泡（Markdown + 代码高亮）(324行)
-│           ├── MemoryPanel.vue               # Agent 记忆面板
+│           ├── MessageBubble.vue             # 消息气泡（Markdown + 代码高亮）
+│           ├── MemoryPanel.vue               # Agent 记忆面板（含知识标签页）
 │           ├── TerminalPanel.vue             # 终端面板
 │           ├── FileContentView.vue           # 文件内容预览
 │           ├── FileBrowserPanel.vue          # 文件浏览器
@@ -50,9 +51,14 @@ agent-park/
 │   ├── agents.json          # Agent 元数据 + 排序顺序
 │   ├── sessions.json        # cco 会话 ID（用于续话）
 │   ├── tasks/               # 按 Agent 分离的任务文件
-│   │   └── {agent_id}.json  # 每个 Agent 的所有 Task
-│   └── memory/              # Agent 记忆（JSONL 格式）
-│       └── {agent_id}.jsonl
+│   │   └── {agent_id}.json
+│   ├── memory/              # Agent 记忆（JSONL 格式）
+│   │   └── {agent_id}.jsonl
+│   └── knowledge/           # Agent 知识文档（每日 summary 产出）
+│       └── {effective_id}/
+│           ├── errors.md    # 错误经验
+│           ├── project.md   # 项目知识
+│           └── hotfiles.md  # 文件热度统计
 └── docs/                    # 项目文档
 ```
 
@@ -176,6 +182,7 @@ _run_subprocess()
 | `fork_task` | Fork 一个已有任务（复制消息历史，创建独立会话分支） |
 | `stop_task` | 中止任务 |
 | `set_agent_order` | 重排序 Agent |
+| `generate_summary` | 手动触发知识总结（`agent_id`, `date_range: "today"\|"recent_n"`） |
 
 ### 服务端 → 客户端（broadcast）
 
@@ -189,6 +196,9 @@ _run_subprocess()
 | `message_done` | 消息流结束 |
 | `agent_created` | Agent 创建完成 |
 | `agents_reordered` | Agent 排序更新 |
+| `summary_progress` | 知识总结进度（`step`, `detail`） |
+| `summary_done` | 知识总结完成（`files_updated`, `memory_entries`） |
+| `summary_error` | 知识总结失败（`error`） |
 
 ## 状态持久化（state.py）
 
@@ -200,10 +210,74 @@ _run_subprocess()
 
 ## Agent 记忆管理（memory.py）
 
-- 格式：JSONL，每行一条 `MemoryEntry`（timestamp、role、content、tokens）
+- 格式：JSONL，每行一条 `MemoryEntry`（timestamp、type、content）
 - 文件位置：`data/memory/{agent_id}.jsonl`
 - 支持多 Agent 共享记忆（通过 `shared_memory_agent_id`）
 - 最大行数由 `config.json` 的 `memory.max_lines` 控制
+
+## 知识总结系统（knowledge.py）
+
+从 Task 对话历史中提炼可复用知识，沉淀为持久化文档，注入 Agent 记忆。
+
+### 存储
+
+```
+data/knowledge/{effective_id}/
+├── errors.md       # 错误经验（错误 → 正确做法，按频率排序）
+├── project.md      # 项目知识（目录结构、常用命令、约定）
+└── hotfiles.md     # 文件热度统计（最近 7 天读写频率 top 20）
+```
+
+`effective_id` 与 memory 共用同一套 `shared_memory_agent_id` 逻辑，同项目多 worktree agent 共享同一份知识。
+
+### 提取流程
+
+```
+Step 1: 规则提取（无 LLM）
+  - extract_error_signals()：tool_result 含 error/traceback + user 纠正消息
+  - extract_project_signals()：agent text 含路径/命令描述 + user 告知的事实
+  - compute_hotfiles()：统计 Read/Edit/Write tool_use 中的文件访问频率
+
+Step 2: LLM 合并
+  - 旧 errors.md + 新信号 → LLM → 新 errors.md（去重、合并计数、排序）
+  - 旧 project.md + 新信号 → LLM → 新 project.md（同主题覆盖、保持分类）
+  - hotfiles：纯计算，无需 LLM
+
+Step 3: 写入
+  - 覆盖写三个 .md 文件
+  - 从文档内容逐条构建 memory 条目（每条知识独立一条）
+  - 删除 memory 中旧的 knowledge_summary 条目，写入新条目
+```
+
+### Memory 注入格式
+
+```
+[错误经验] 错误简述。正确做法：...。详见 data/knowledge/{eid}/errors.md
+[项目知识] 知识点内容。详见 data/knowledge/{eid}/project.md
+[热点文件] 近期高频文件: file1(读N/改M), ...。详见 data/knowledge/{eid}/hotfiles.md
+```
+
+Agent 启动时通过现有 memory 注入路径自动获取，零改动 agent_runner.py。
+
+### LLM 命令配置
+
+`config.json` 中 `knowledge.command`（默认 `minimax`），可改为 `ccs`、`cco` 等。
+
+## 定时任务（routes_ws.py）
+
+所有定时任务均用 asyncio 原生实现，无外部框架依赖。
+
+| 任务 | 实现 | 触发时机 |
+|------|------|----------|
+| WebSocket 心跳 | `_heartbeat_loop()`，每 20 秒 broadcast ping | 首个 WS 客户端连接时 |
+| 每日知识总结 | `_daily_summary_loop()`，每天凌晨 0 点 | 应用启动时（lifespan） |
+
+**每日知识总结流程**：
+1. 应用启动 → `lifespan` → `ensure_daily_summary_task()`
+2. 循环计算到下一个本地时间凌晨 0 点的秒数，`asyncio.sleep()`
+3. 醒来 → 对所有 agent 执行 `_run_daily_summary(agent_id, yesterday)`
+4. 按 `task.updated_at` 过滤前一天的任务，无任务则跳过
+5. 调用 `generate_summary()`，结果写入 knowledge 文档并更新 memory 索引
 
 ## 前端状态管理（agentStore.js）
 
@@ -219,6 +293,23 @@ memoryPanelOpen / memoryAgentId / agentMemory  // 记忆面板
 
 - WebSocket 消息驱动状态更新，无需手动轮询
 - 流式消息通过 `message_chunk` 增量更新 task.messages
+- `summary_progress/done/error` 消息通过 CustomEvent 分发给 AgentGroup 和 MemoryPanel
+
+## REST API 参考
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/agents` | 列出所有 Agent |
+| POST | `/api/agents` | 创建 Agent |
+| PATCH | `/api/agents/{id}` | 更新 Agent |
+| GET | `/api/agents/{id}/memory` | 读取 Agent 记忆 |
+| POST | `/api/agents/{id}/memory` | 添加记忆条目（LLM 压缩） |
+| DELETE | `/api/agents/{id}/memory/{idx}` | 删除记忆条目 |
+| GET | `/api/agents/{id}/knowledge` | 读取知识文档（errors/project/hotfiles） |
+| GET | `/api/agents/{id}/files` | 文件浏览 |
+| GET | `/api/agents/{id}/files/content` | 读取文件内容 |
+| POST | `/api/agents/{id}/tasks` | 创建任务 |
+| DELETE | `/api/tasks/{id}` | 删除任务 |
 
 ## 常用操作参考
 
@@ -235,4 +326,5 @@ tail -f logs/frontend.log
 cat data/agents.json            # Agent 列表
 cat data/sessions.json          # cco 会话 ID
 cat data/tasks/{agent_id}.json  # 某 Agent 的所有任务
+ls data/knowledge/              # 各 Agent 的知识文档
 ```

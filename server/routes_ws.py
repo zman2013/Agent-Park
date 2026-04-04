@@ -19,6 +19,7 @@ clients: set[WebSocket] = set()
 SEND_TIMEOUT_SECONDS = 2.0
 HEARTBEAT_INTERVAL_SECONDS = 20.0
 _heartbeat_task: asyncio.Task | None = None
+_daily_summary_task: asyncio.Task | None = None
 
 
 async def broadcast(msg: dict[str, Any]) -> None:
@@ -56,6 +57,71 @@ async def _heartbeat_loop() -> None:
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
         await broadcast({"type": "ping"})
+
+
+def ensure_daily_summary_task() -> None:
+    """Start the daily summary background loop if not already running."""
+    global _daily_summary_task
+    if _daily_summary_task is None or _daily_summary_task.done():
+        _daily_summary_task = asyncio.create_task(
+            _daily_summary_loop(), name="daily-summary"
+        )
+
+
+async def _daily_summary_loop() -> None:
+    """Sleep until next midnight (local time), then run summary for all agents."""
+    from datetime import datetime, timedelta
+
+    while True:
+        now = datetime.now()
+        # Next midnight
+        next_midnight = (now + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        sleep_seconds = (next_midnight - now).total_seconds()
+        logger.info(
+            "Daily summary scheduled in %.0f s (at %s)",
+            sleep_seconds,
+            next_midnight.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        await asyncio.sleep(sleep_seconds)
+
+        # Run summary for every agent
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        logger.info("Running daily knowledge summary for date %s", yesterday)
+        for agent_id in list(app_state.agents.keys()):
+            try:
+                await _run_daily_summary(agent_id, yesterday)
+            except Exception:
+                logger.exception("Daily summary failed for agent %s", agent_id)
+
+
+async def _run_daily_summary(agent_id: str, date: str) -> None:
+    """Run knowledge summary for a single agent for a specific date."""
+    from server.knowledge import generate_summary
+
+    agent = app_state.get_agent(agent_id)
+    tasks = [
+        app_state.tasks[tid]
+        for tid in (agent.task_ids if agent else [])
+        if tid in app_state.tasks
+    ]
+    # Filter to tasks updated on the target date
+    tasks = [t for t in tasks if (getattr(t, "updated_at", "") or "").startswith(date)]
+    if not tasks:
+        logger.info("No tasks for agent %s on %s, skipping summary", agent_id, date)
+        return
+
+    logger.info(
+        "Daily summary: agent=%s date=%s tasks=%d", agent_id, date, len(tasks)
+    )
+    result = await generate_summary(agent_id, tasks)
+    logger.info(
+        "Daily summary done: agent=%s files=%s memory_entries=%d",
+        agent_id,
+        result.get("files_updated"),
+        result.get("memory_entries", 0),
+    )
 
 
 def task_created_message(task) -> dict[str, Any]:
@@ -175,3 +241,54 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         except ValueError:
             return
         await broadcast(task_created_message(new_task))
+
+    elif msg_type == "generate_summary":
+        agent_id = data.get("agent_id", "")
+        date_range = data.get("date_range", "recent_n")
+        if not agent_id or agent_id not in app_state.agents:
+            return
+        asyncio.create_task(_run_generate_summary(agent_id, date_range))
+
+
+async def _run_generate_summary(agent_id: str, date_range: str) -> None:
+    """Run knowledge summary generation and broadcast progress."""
+    from server.knowledge import generate_summary
+    from server.config import knowledge_config
+
+    async def progress_cb(step: str, detail: str):
+        await broadcast({
+            "type": "summary_progress",
+            "agent_id": agent_id,
+            "step": step,
+            "detail": detail,
+        })
+
+    try:
+        cfg = knowledge_config()
+        agent = app_state.get_agent(agent_id)
+        tasks = [app_state.tasks[tid] for tid in (agent.task_ids if agent else []) if tid in app_state.tasks]
+        if date_range == "today":
+            from datetime import datetime, timezone
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            tasks = [t for t in tasks if (t.updated_at or "").startswith(today)]
+        else:
+            # recent_n: last N completed tasks
+            n = cfg.get("default_task_count", 5)
+            completed = [t for t in tasks if str(t.status) in ("success", "failed")]
+            completed.sort(key=lambda t: t.updated_at or "", reverse=True)
+            tasks = completed[:n]
+
+        result = await generate_summary(agent_id, tasks, progress_cb)
+        await broadcast({
+            "type": "summary_done",
+            "agent_id": agent_id,
+            "files_updated": result.get("files_updated", []),
+            "memory_entries": result.get("memory_entries", 0),
+        })
+    except Exception as exc:
+        logger.exception("generate_summary failed for agent %s", agent_id)
+        await broadcast({
+            "type": "summary_error",
+            "agent_id": agent_id,
+            "error": str(exc),
+        })

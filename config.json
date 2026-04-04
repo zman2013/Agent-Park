@@ -10,6 +10,16 @@
     "command": "ccs",
     "max_lines": 200
   },
+  "knowledge": {
+    "command": "minimax",
+    "errors_max_items": 10,
+    "errors_max_chars": 2000,
+    "project_max_items": 15,
+    "project_max_chars": 2000,
+    "hotfiles_max_items": 20,
+    "hotfiles_recent_days": 7,
+    "default_task_count": 5
+  },
   "agents": [
     {
       "name": "neo-compiler",

@@ -67,6 +67,14 @@
           title="Browse files"
           @click.stop="openFiles()"
         >📁</button>
+        <!-- 生成知识总结 -->
+        <button
+          class="transition-colors px-0.5 text-xs"
+          :class="summaryLoading ? 'text-yellow-600 cursor-not-allowed' : 'text-gray-600 hover:text-gray-300'"
+          :disabled="summaryLoading"
+          :title="summaryLoading ? summaryStatus : '生成知识总结'"
+          @click.stop="generateSummary"
+        >{{ summaryLoading ? '⏳' : '🧠' }}</button>
         <!-- Task 数量 -->
         <span class="text-xs text-gray-600 px-0.5">{{ taskCount }}</span>
         <!-- Pin 按钮 -->
@@ -202,6 +210,10 @@ const showNewTaskModal = ref(false)
 const newTaskName = ref('')
 const newTaskInput = ref(null)
 
+// Summary state
+const summaryLoading = ref(false)
+const summaryStatus = ref('')
+
 // Agents other than the current one (for shared memory picker)
 const otherAgents = computed(() => store.agents.filter(a => a.id !== props.agent.id))
 
@@ -317,6 +329,35 @@ function openFiles() {
   }))
 }
 
+function generateSummary() {
+  if (summaryLoading.value) return
+  summaryLoading.value = true
+  summaryStatus.value = '正在生成...'
+  window.dispatchEvent(new CustomEvent('generate-summary', {
+    detail: { agentId: props.agent.id, dateRange: 'recent_n' }
+  }))
+}
+
+function onSummaryProgress(e) {
+  if (e.detail?.agentId !== props.agent.id) return
+  summaryStatus.value = e.detail.detail || e.detail.step || '处理中...'
+}
+
+function onSummaryDone(e) {
+  if (e.detail?.agentId !== props.agent.id) return
+  summaryLoading.value = false
+  summaryStatus.value = ''
+  const files = (e.detail.files_updated || []).join(', ')
+  store.addToast(`知识总结完成: ${files}`, 'success')
+}
+
+function onSummaryError(e) {
+  if (e.detail?.agentId !== props.agent.id) return
+  summaryLoading.value = false
+  summaryStatus.value = ''
+  store.addToast(`知识总结失败: ${e.detail.error}`, 'error')
+}
+
 function onRevealTask(e) {
   const { taskId, agentId } = e.detail
   if (agentId !== props.agent.id) return
@@ -337,9 +378,15 @@ function onRevealTask(e) {
 
 onMounted(() => {
   window.addEventListener('reveal-task', onRevealTask)
+  window.addEventListener('summary-progress', onSummaryProgress)
+  window.addEventListener('summary-done', onSummaryDone)
+  window.addEventListener('summary-error', onSummaryError)
 })
 
 onUnmounted(() => {
   window.removeEventListener('reveal-task', onRevealTask)
+  window.removeEventListener('summary-progress', onSummaryProgress)
+  window.removeEventListener('summary-done', onSummaryDone)
+  window.removeEventListener('summary-error', onSummaryError)
 })
 </script>

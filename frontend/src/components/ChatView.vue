@@ -20,6 +20,11 @@
           <span class="text-gray-500">¥{{ task.total_cost_cny.toFixed(2) }}</span>
         </template>
       </template>
+      <button
+        @click="copyConversation"
+        class="ml-3 text-gray-600 hover:text-gray-300 transition-colors px-1"
+        title="复制全部对话（排除工具交互）"
+      >复制对话</button>
     </div>
     <div ref="chatContainer" class="flex-1 overflow-auto p-6 space-y-3" @scroll="onScroll">
       <div v-if="task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
@@ -207,4 +212,42 @@ watch(
 onUnmounted(() => {
   clearAutoScrollTimer()
 })
+
+const conversationText = computed(() => {
+  const textMessages = allVisibleMessages.value.filter(m => m.type === 'text')
+  return textMessages.map(m => {
+    const label = m.role === 'user' ? 'User' : 'Agent'
+    return `${label}:\n${m.content}`
+  }).join('\n\n')
+})
+
+function copyToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    return navigator.clipboard.writeText(text)
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.focus()
+  textarea.select()
+  const ok = document.execCommand('copy')
+  document.body.removeChild(textarea)
+  return ok ? Promise.resolve() : Promise.reject(new Error('execCommand failed'))
+}
+
+async function copyConversation() {
+  const text = conversationText.value
+  if (!text) {
+    store.addToast('无对话内容', 'info')
+    return
+  }
+  try {
+    await copyToClipboard(text)
+    store.addToast('已复制全部对话', 'success')
+  } catch {
+    store.addToast('复制失败', 'error')
+  }
+}
 </script>

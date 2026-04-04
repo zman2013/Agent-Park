@@ -272,6 +272,24 @@ export function useWebSocket() {
 
       case 'ping':
         break
+
+      case 'summary_progress':
+        window.dispatchEvent(new CustomEvent('summary-progress', {
+          detail: { agentId: data.agent_id, step: data.step, detail: data.detail }
+        }))
+        break
+
+      case 'summary_done':
+        window.dispatchEvent(new CustomEvent('summary-done', {
+          detail: { agentId: data.agent_id, files_updated: data.files_updated, memory_entries: data.memory_entries }
+        }))
+        break
+
+      case 'summary_error':
+        window.dispatchEvent(new CustomEvent('summary-error', {
+          detail: { agentId: data.agent_id, error: data.error }
+        }))
+        break
     }
   }
 
@@ -293,9 +311,18 @@ export function useWebSocket() {
     send({ type: 'fork_task', task_id: taskId })
   }
 
+  function generateSummary(agentId, dateRange = 'recent_n') {
+    send({ type: 'generate_summary', agent_id: agentId, date_range: dateRange })
+  }
+
+  function onGenerateSummaryEvent(e) {
+    generateSummary(e.detail.agentId, e.detail.dateRange || 'recent_n')
+  }
+
   onMounted(() => {
     disposed = false
     connect()
+    window.addEventListener('generate-summary', onGenerateSummaryEvent)
   })
 
   onUnmounted(() => {
@@ -305,6 +332,7 @@ export function useWebSocket() {
     clearHeartbeatTimer()
     connected.value = false
     stopTitleFlash()
+    window.removeEventListener('generate-summary', onGenerateSummaryEvent)
     if (ws) {
       const socket = ws
       ws = null
@@ -320,5 +348,6 @@ export function useWebSocket() {
     createTask,
     sendUserMessage,
     forkTask,
+    generateSummary,
   }
 }
