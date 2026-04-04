@@ -14,3 +14,9 @@ data/
 .dolt/
 *.db
 .gstack/
+
+# Local config (contains machine-specific paths, use config.example.json as template)
+config.json
+
+# Beads issue tracker (contains personal/company info)
+.beads/

@@ -7,11 +7,11 @@
     "port": 3000
   },
   "memory": {
-    "command": "ccs",
+    "command": "your-memory-command",
     "max_lines": 200
   },
   "knowledge": {
-    "command": "minimax",
+    "command": "your-knowledge-command",
     "errors_max_items": 10,
     "errors_max_chars": 2000,
     "project_max_items": 15,
@@ -22,19 +22,9 @@
   },
   "agents": [
     {
-      "name": "neo-compiler",
-      "command": "ccs",
-      "cwd": "/data1/neo"
-    },
-    {
-      "name": "agent-park",
-      "command": "ccs",
-      "cwd": "/data1/common/agent-park"
-    },
-    {
-      "name": "Reviewer",
-      "command": "ccs",
-      "cwd": ""
+      "name": "my-agent",
+      "command": "your-agent-command",
+      "cwd": "/path/to/your/project"
     }
   ]
 }
