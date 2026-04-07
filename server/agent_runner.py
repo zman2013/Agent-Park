@@ -1,17 +1,12 @@
-"""Agent subprocess manager – spawns cco and manages I/O.
+"""Agent subprocess manager – spawns agent processes and manages I/O.
 
-cco requires a TTY to produce output, so we use Python's pty module
-to allocate a pseudo-terminal for the child process.
+Supports multiple agent protocols via the adapter pattern:
+  - cco/ccs: PTY-based, stream-json protocol (CcoAdapter)
+  - codex: pipe-based, JSONL protocol (CodexAdapter)
 
-cco stream-json protocol (with --include-partial-messages):
-  {"type":"system","subtype":"init", ...}
-  {"type":"stream_event","event":{"type":"message_start", ...}}
-  {"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text"|"tool_use", ...}}}
-  {"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta"|"input_json_delta", ...}}}
-  {"type":"stream_event","event":{"type":"content_block_stop", ...}}
-  {"type":"assistant","message":{"content":[{"type":"text","text":"..."}, {"type":"tool_use","name":"...","input":{...}}], ...}}
-  {"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"...","content":"..."}]}}
-  {"type":"result","subtype":"success"|"error", ...}
+Protocol-specific logic (command building, chunk handling) is delegated to
+adapters in server/adapters/. This module handles subprocess lifecycle,
+session management, and the ChunkContext callback interface.
 """
 
 from __future__ import annotations
@@ -27,6 +22,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from server.adapters import get_adapter
+from server.adapters.base import BaseAdapter
 from server.models import Message, TaskStatus
 from server.models import _utcnow as _model_utcnow
 from server.state import app_state
@@ -37,19 +34,355 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 
 
+class _RunContext:
+    """Implements ChunkContext — callback interface for adapters.
+
+    Each _run_subprocess call creates one _RunContext.  The adapter calls
+    methods on this object to create messages, update tokens, save sessions,
+    and finish the task.
+    """
+
+    def __init__(self, runner: AgentRunner, task_id: str) -> None:
+        self._runner = runner
+        self.task_id = task_id
+
+    # ── session management ──────────────────────────────────────────────
+
+    async def save_session(self, session_id: str) -> None:
+        from server.routes_ws import broadcast
+
+        prev_sid = self._runner._session_ids.get(self.task_id)
+        if prev_sid and session_id != prev_sid:
+            await self.on_session_renewed(prev_sid, session_id)
+        else:
+            self._runner._session_ids[self.task_id] = session_id
+            self._runner._save_sessions()
+        await broadcast({
+            "type": "session_update",
+            "task_id": self.task_id,
+            "session_id": session_id,
+        })
+
+    async def on_session_renewed(self, old_sid: str, new_sid: str) -> None:
+        logger.warning(
+            "Session changed for task %s: %s -> %s (auto-renewing)",
+            self.task_id, old_sid, new_sid,
+        )
+        self._runner._session_ids[self.task_id] = new_sid
+        self._runner._save_sessions()
+        self._runner._session_renewed.add(self.task_id)
+        await self.send_system_notice(
+            "会话已过期，已自动切换至新会话继续对话。（历史上下文已重置）"
+        )
+
+    # ── message creation ────────────────────────────────────────────────
+
+    async def create_message(
+        self,
+        role: str,
+        type_: str,
+        content: str,
+        tool_name: str = "",
+        streaming: bool = False,
+    ) -> Message:
+        from server.routes_ws import broadcast
+
+        task = app_state.get_task(self.task_id)
+        if not task:
+            # Should not happen, but return a dummy message
+            return Message(role=role, type=type_, content=content, streaming=streaming)
+
+        msg = Message(
+            role=role, type=type_, content=content,
+            tool_name=tool_name, streaming=streaming,
+        )
+        task.messages.append(msg)
+        await broadcast({
+            "type": "message",
+            "task_id": self.task_id,
+            "message": msg.model_dump(),
+        })
+        return msg
+
+    async def append_delta(self, message_id: str, text: str) -> None:
+        from server.routes_ws import broadcast
+
+        await broadcast({
+            "type": "message_chunk",
+            "task_id": self.task_id,
+            "message_id": message_id,
+            "delta": text,
+        })
+
+    async def close_message(self, message_id: str) -> None:
+        from server.routes_ws import broadcast
+
+        await broadcast({
+            "type": "message_done",
+            "task_id": self.task_id,
+            "message_id": message_id,
+        })
+
+    async def send_system_notice(self, content: str) -> None:
+        from server.routes_ws import broadcast
+
+        task = app_state.get_task(self.task_id)
+        if not task:
+            return
+        notice = Message(
+            role="agent", type="system", streaming=False, content=content,
+        )
+        task.messages.append(notice)
+        await broadcast({
+            "type": "message",
+            "task_id": self.task_id,
+            "message": notice.model_dump(),
+        })
+
+    # ── token accounting ────────────────────────────────────────────────
+
+    async def update_tokens(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        model: str = "",
+        context_window: int = 0,
+    ) -> None:
+        from server.routes_ws import broadcast
+
+        task = app_state.get_task(self.task_id)
+        if not task:
+            return
+
+        task.total_input_tokens += input_tokens
+        task.total_output_tokens += output_tokens
+        if context_window:
+            task.context_window = context_window
+        if model:
+            if model not in task.model_usage:
+                task.model_usage[model] = {
+                    "inputTokens": 0, "outputTokens": 0,
+                    "contextWindow": context_window,
+                }
+            task.model_usage[model]["inputTokens"] += input_tokens
+            task.model_usage[model]["outputTokens"] += output_tokens
+            if context_window:
+                task.model_usage[model]["contextWindow"] = context_window
+
+        await broadcast({
+            "type": "turns_info",
+            "task_id": self.task_id,
+            "num_turns": task.num_turns,
+            "total_input_tokens": task.total_input_tokens,
+            "total_output_tokens": task.total_output_tokens,
+            "context_window": task.context_window,
+            "total_cost_cny": task.total_cost_cny,
+            "model_usage": task.model_usage,
+        })
+
+    async def apply_authoritative_usage(
+        self,
+        model_usage: dict[str, dict],
+    ) -> None:
+        """Apply authoritative session-total token usage from a result chunk.
+
+        The result chunk's modelUsage is the definitive total for THIS session.
+        We merge it onto the baseline snapshot captured at session start.
+        """
+        task = app_state.get_task(self.task_id)
+        if not task:
+            return
+
+        baseline = self._runner._session_baselines.get(self.task_id, {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost_cny": 0.0,
+            "model_usage": {},
+        })
+
+        session_input = 0
+        session_output = 0
+        session_model_usage: dict = {}
+        for _model, mu in model_usage.items():
+            in_tok = (
+                mu.get("inputTokens", 0)
+                + mu.get("cacheReadInputTokens", 0)
+                + mu.get("cacheCreationInputTokens", 0)
+            )
+            out_tok = mu.get("outputTokens", 0)
+            ctx_win = mu.get("contextWindow", 0)
+            session_input += in_tok
+            session_output += out_tok
+            if ctx_win:
+                task.context_window = ctx_win
+            session_model_usage[_model] = {
+                "inputTokens": in_tok,
+                "outputTokens": out_tok,
+                "contextWindow": ctx_win,
+            }
+
+        # Merge session totals onto baseline
+        task.total_input_tokens = baseline["total_input_tokens"] + session_input
+        task.total_output_tokens = baseline["total_output_tokens"] + session_output
+        merged_model_usage = dict(baseline["model_usage"])
+        for _model, mu in session_model_usage.items():
+            if _model in merged_model_usage:
+                merged_model_usage[_model] = {
+                    "inputTokens": merged_model_usage[_model]["inputTokens"] + mu["inputTokens"],
+                    "outputTokens": merged_model_usage[_model]["outputTokens"] + mu["outputTokens"],
+                    "contextWindow": mu["contextWindow"] or merged_model_usage[_model].get("contextWindow", 0),
+                }
+            else:
+                merged_model_usage[_model] = mu
+        task.model_usage = merged_model_usage
+
+    # ── task finish (called by adapter for result-bearing protocols) ────
+
+    async def finish(
+        self,
+        status: TaskStatus,
+        num_turns: int = 0,
+        cost_usd: float = 0,
+        result_text: str = "",
+        errors: list[str] | None = None,
+    ) -> None:
+        """Handle protocol-level task completion (e.g. cco result chunk).
+
+        For protocols without an explicit result chunk (codex), the runner
+        calls _finish_task directly based on process exit code.
+        """
+        from server.routes_ws import broadcast
+
+        task = app_state.get_task(self.task_id)
+        if not task:
+            return
+
+        # Accumulate turns
+        task.num_turns += num_turns
+
+        # Token/cost accounting from result chunk (cco-specific authoritative totals)
+        baseline = self._runner._session_baselines.get(self.task_id, {
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "total_cost_cny": 0.0,
+            "model_usage": {},
+        })
+
+        if cost_usd:
+            task.total_cost_cny = baseline["total_cost_cny"] + cost_usd * 7.3
+
+        # Broadcast final turns_info
+        await broadcast({
+            "type": "turns_info",
+            "task_id": self.task_id,
+            "num_turns": task.num_turns,
+            "total_input_tokens": task.total_input_tokens,
+            "total_output_tokens": task.total_output_tokens,
+            "context_window": task.context_window,
+            "total_cost_cny": task.total_cost_cny,
+            "model_usage": task.model_usage,
+        })
+
+        # Handle result text (may contain content not yet streamed)
+        if result_text:
+            result_text = result_text.strip()
+            last_text_msg = None
+            for m in reversed(task.messages):
+                if m.role == "agent" and m.type == "text":
+                    last_text_msg = m
+                    break
+
+            existing_content = (last_text_msg.content if last_text_msg else "").strip()
+
+            if not existing_content or not result_text.startswith(existing_content):
+                if result_text != existing_content:
+                    msg = Message(role="agent", content=result_text, streaming=False)
+                    task.messages.append(msg)
+                    await broadcast({
+                        "type": "message",
+                        "task_id": self.task_id,
+                        "message": msg.model_dump(),
+                    })
+            elif len(result_text) > len(existing_content):
+                delta = result_text[len(existing_content):]
+                if last_text_msg:
+                    last_text_msg.content = result_text
+                    last_text_msg.streaming = False
+                    await broadcast({
+                        "type": "message_chunk",
+                        "task_id": self.task_id,
+                        "message_id": last_text_msg.id,
+                        "delta": delta,
+                    })
+                    await broadcast({
+                        "type": "message_done",
+                        "task_id": self.task_id,
+                        "message_id": last_text_msg.id,
+                    })
+
+        # Max-turns detection
+        if status == TaskStatus.success and not result_text:
+            last_text_msg = None
+            for m in reversed(task.messages):
+                if m.role == "agent" and m.type == "text":
+                    last_text_msg = m
+                    break
+            if last_text_msg and (last_text_msg.streaming or len(last_text_msg.content) < 200):
+                if last_text_msg.streaming:
+                    last_text_msg.streaming = False
+                    await broadcast({
+                        "type": "message_done",
+                        "task_id": self.task_id,
+                        "message_id": last_text_msg.id,
+                    })
+                await self.send_system_notice(
+                    f"已达到单次会话 turns 上限（本轮 {num_turns} turns），输出被截断。发送任意消息可继续。"
+                )
+
+        # Silent success detection
+        if status == TaskStatus.success and not result_text:
+            has_agent_text = any(
+                m.role == "agent" and m.type == "text" for m in task.messages
+            )
+            if not has_agent_text:
+                await self.send_system_notice("任务已完成。")
+
+        # Error handling
+        if errors:
+            # Check for session auto-renewal
+            if self.task_id in self._runner._session_renewed:
+                self._runner._session_renewed.discard(self.task_id)
+                await self._runner._finish_task(self.task_id, TaskStatus.success)
+                return
+
+            joined = "；".join(errors)
+            if "No conversation found" in joined:
+                old_sid = self._runner._session_ids.pop(self.task_id, None)
+                if old_sid:
+                    self._runner._save_sessions()
+                    logger.warning(
+                        "Session expired for task %s (sid=%s), cleared from store",
+                        self.task_id, old_sid,
+                    )
+                notice_content = f"会话已失效，下次发送消息将重新开始会话。（原因：{joined}）"
+            else:
+                notice_content = f"执行出错：{joined}"
+            await self.send_system_notice(notice_content)
+
+        await self._runner._finish_task(self.task_id, status)
+
+
 class AgentRunner:
     def __init__(self) -> None:
         self._pids: dict[str, int] = {}           # task_id -> child pid
         self._master_fds: dict[str, int] = {}     # task_id -> pty master fd
-        self._current_msg: dict[str, Message] = {}
-        self._current_block_type: dict[str, str] = {}  # task_id -> "text"|"tool_use"
+        self._async_procs: dict[str, asyncio.subprocess.Process] = {}  # task_id -> pipe-mode proc
+        self._adapters: dict[str, BaseAdapter] = {}  # task_id -> active adapter
         self._session_ids: dict[str, str] = self._load_sessions()
         self._resuming: set[str] = set()          # task_ids being killed for resume
         self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
-        # Snapshot of cumulative token/cost values at the START of each cco session.
-        # Used to correctly accumulate across multiple resume sessions:
-        # final_value = baseline + this_session_authoritative_total
+        # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
 
     def _load_sessions(self) -> dict[str, str]:
@@ -102,9 +435,7 @@ class AgentRunner:
         if not task:
             return
 
-        # Snapshot cumulative totals before this session starts so that the
-        # result chunk (which only covers the current session) can be added on
-        # top of prior sessions rather than overwriting them.
+        # Snapshot cumulative totals before this session starts
         self._session_baselines[task_id] = {
             "total_input_tokens": task.total_input_tokens,
             "total_output_tokens": task.total_output_tokens,
@@ -112,9 +443,7 @@ class AgentRunner:
             "model_usage": copy.deepcopy(task.model_usage),
         }
 
-        # Ensure running status is set (send_input sets it before killing the old
-        # process, but the old process's _finish_task could race and overwrite it
-        # before this coroutine is scheduled; re-assert here to be safe)
+        # Ensure running status is set
         if task.status not in (TaskStatus.running,):
             task.status = TaskStatus.running
             await self._broadcast_status(task_id, TaskStatus.running)
@@ -141,23 +470,11 @@ class AgentRunner:
                 memory_text = "\n".join(memory_lines)
                 prompt = f"<memory>\n{memory_text}\n</memory>\n\n{prompt}"
 
-        # Build command args
-        base_args = [
-            command,
-            "-p",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--include-partial-messages",
-            "--dangerously-skip-permissions",
-        ]
-
-        if fork_sid:
-            # Fork mode: resume source session with --fork-session
-            args = base_args + ["--resume", fork_sid, "--fork-session", prompt]
-        elif session_id:
-            args = base_args + ["--resume", session_id, prompt]
-        else:
-            args = base_args + [prompt]
+        # Select adapter and build args
+        adapter = get_adapter(command)
+        self._adapters[task_id] = adapter
+        args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd)
+        ctx = _RunContext(self, task_id)
 
         # Validate working directory before spawning subprocess
         if agent_cwd and not os.path.isdir(agent_cwd):
@@ -170,118 +487,10 @@ class AgentRunner:
             return
 
         try:
-            # Use pty to give cco a pseudo-terminal (it requires TTY)
-            master_fd, slave_fd = pty.openpty()
-
-            pid = os.fork()
-            if pid == 0:
-                # ── Child process ──
-                os.close(master_fd)
-                os.setsid()
-                # Set slave as stdin/stdout/stderr
-                os.dup2(slave_fd, 0)
-                os.dup2(slave_fd, 1)
-                os.dup2(slave_fd, 2)
-                if slave_fd > 2:
-                    os.close(slave_fd)
-                if agent_cwd:
-                    os.chdir(agent_cwd)
-                # Strip virtualenv env vars so they don't leak into the agent process
-                env = os.environ.copy()
-                venv = env.pop("VIRTUAL_ENV", None)
-                env.pop("VIRTUAL_ENV_PROMPT", None)
-                if venv:
-                    venv_bin = os.path.join(venv, "bin")
-                    path_parts = env.get("PATH", "").split(os.pathsep)
-                    path_parts = [p for p in path_parts if p != venv_bin]
-                    env["PATH"] = os.pathsep.join(path_parts)
-                os.execvpe(args[0], args, env)
-                # execvp does not return
+            if adapter.needs_pty():
+                await self._run_pty_mode(task_id, args, agent_cwd, adapter, ctx)
             else:
-                # ── Parent process ──
-                os.close(slave_fd)
-                self._pids[task_id] = pid
-                self._master_fds[task_id] = master_fd
-
-                logger.info("Spawned cco pid=%d for task %s", pid, task_id)
-
-                loop = asyncio.get_event_loop()
-
-                # Wait for the direct child (ept wrapper) in a background thread.
-                # When ept exits, close master_fd so the pty read loop gets EOF,
-                # even if the grandchild (claude) is still alive.
-                wait_future: asyncio.Future = loop.create_future()
-
-                def _wait_child():
-                    try:
-                        _, st = os.waitpid(pid, 0)
-                        rc = os.WEXITSTATUS(st) if os.WIFEXITED(st) else -1
-                    except ChildProcessError:
-                        rc = -1
-                    # Guard against the asyncio Task being destroyed before this
-                    # callback fires (e.g. task was killed for resume).
-                    if not wait_future.done():
-                        loop.call_soon_threadsafe(wait_future.set_result, rc)
-
-                threading.Thread(target=_wait_child, daemon=True).start()
-
-                # Read from master_fd asynchronously
-                reader = asyncio.StreamReader()
-                read_protocol = asyncio.StreamReaderProtocol(reader)
-                read_transport, _ = await loop.connect_read_pipe(
-                    lambda: read_protocol, os.fdopen(master_fd, "rb", 0)
-                )
-
-                # When ept exits: close transport (unblocks reader.read) AND
-                # ensure _finish_task is called even if the asyncio Task is destroyed.
-                def _on_ept_exit(fut: asyncio.Future) -> None:
-                    # Always close transport so read loop unblocks
-                    read_transport.close()
-                    # If the coroutine Task was GC'd, finish the agent task here
-                    rc = fut.result() if not fut.cancelled() else -1
-                    status = TaskStatus.success if rc == 0 else TaskStatus.failed
-                    agent_task = app_state.get_task(task_id)
-                    if agent_task and agent_task.status == TaskStatus.running:
-                        asyncio.ensure_future(self._finish_task(task_id, status))
-
-                wait_future.add_done_callback(_on_ept_exit)
-
-                closer_task = None  # transport is now closed via callback
-
-                buf = b""
-                try:
-                    while True:
-                        try:
-                            chunk = await reader.read(65536)
-                        except Exception:
-                            break
-                        if not chunk:
-                            break
-                        buf += chunk
-                        # Process complete lines
-                        while b"\n" in buf:
-                            raw_line, buf = buf.split(b"\n", 1)
-                            line = raw_line.decode("utf-8", errors="replace").strip()
-                            # Strip ANSI escape sequences
-                            line = _strip_ansi(line)
-                            if not line:
-                                continue
-                            try:
-                                parsed = json.loads(line)
-                                await self._handle_chunk(task_id, parsed)
-                            except json.JSONDecodeError:
-                                # Skip non-JSON lines (terminal control codes etc)
-                                pass
-                finally:
-                    read_transport.close()
-
-                returncode = await wait_future
-                logger.info("cco pid=%d exited with code %d", pid, returncode)
-
-                await self._finish_task(
-                    task_id,
-                    TaskStatus.success if returncode == 0 else TaskStatus.failed,
-                )
+                await self._run_pipe_mode(task_id, args, agent_cwd, adapter, ctx)
 
         except FileNotFoundError:
             logger.warning("Command %r not found, using mock mode for task %s", command, task_id)
@@ -292,17 +501,186 @@ class AgentRunner:
         finally:
             self._pids.pop(task_id, None)
             self._master_fds.pop(task_id, None)
-            self._current_msg.pop(task_id, None)
-            self._current_block_type.pop(task_id, None)
-            # Fallback: if the task is still marked running (e.g. asyncio Task was
-            # destroyed before _finish_task could be called), mark it failed so the
-            # UI stops showing a permanent yellow spinner.
+            self._async_procs.pop(task_id, None)
+            self._adapters.pop(task_id, None)
+            self._session_baselines.pop(task_id, None)
+            # Fallback: if the task is still marked running, mark it failed
             task = app_state.get_task(task_id)
             if task and task.status == TaskStatus.running:
                 await self._finish_task(task_id, TaskStatus.failed)
 
+    # ── PTY mode (cco/ccs) ──────────────────────────────────────────────
+
+    async def _run_pty_mode(
+        self,
+        task_id: str,
+        args: list[str],
+        agent_cwd: str,
+        adapter: BaseAdapter,
+        ctx: _RunContext,
+    ) -> None:
+        master_fd, slave_fd = pty.openpty()
+
+        pid = os.fork()
+        if pid == 0:
+            # ── Child process ──
+            os.close(master_fd)
+            os.setsid()
+            os.dup2(slave_fd, 0)
+            os.dup2(slave_fd, 1)
+            os.dup2(slave_fd, 2)
+            if slave_fd > 2:
+                os.close(slave_fd)
+            if agent_cwd:
+                os.chdir(agent_cwd)
+            env = _clean_env()
+            os.execvpe(args[0], args, env)
+            # execvpe does not return
+        else:
+            # ── Parent process ──
+            os.close(slave_fd)
+            self._pids[task_id] = pid
+            self._master_fds[task_id] = master_fd
+
+            logger.info("Spawned %s pid=%d for task %s (pty mode)", args[0], pid, task_id)
+
+            loop = asyncio.get_event_loop()
+
+            wait_future: asyncio.Future = loop.create_future()
+
+            def _wait_child():
+                try:
+                    _, st = os.waitpid(pid, 0)
+                    rc = os.WEXITSTATUS(st) if os.WIFEXITED(st) else -1
+                except ChildProcessError:
+                    rc = -1
+                if not wait_future.done():
+                    loop.call_soon_threadsafe(wait_future.set_result, rc)
+
+            threading.Thread(target=_wait_child, daemon=True).start()
+
+            reader = asyncio.StreamReader()
+            read_protocol = asyncio.StreamReaderProtocol(reader)
+            read_transport, _ = await loop.connect_read_pipe(
+                lambda: read_protocol, os.fdopen(master_fd, "rb", 0)
+            )
+
+            def _on_ept_exit(fut: asyncio.Future) -> None:
+                read_transport.close()
+                rc = fut.result() if not fut.cancelled() else -1
+                status = TaskStatus.success if rc == 0 else TaskStatus.failed
+                agent_task = app_state.get_task(task_id)
+                if agent_task and agent_task.status == TaskStatus.running:
+                    asyncio.ensure_future(self._finish_task(task_id, status))
+
+            wait_future.add_done_callback(_on_ept_exit)
+
+            await self._read_json_lines(reader, read_transport, adapter, ctx, strip_ansi=True)
+
+            returncode = await wait_future
+            logger.info("%s pid=%d exited with code %d", args[0], pid, returncode)
+
+            await self._finish_task(
+                task_id,
+                TaskStatus.success if returncode == 0 else TaskStatus.failed,
+            )
+
+    # ── Pipe mode (codex) ───────────────────────────────────────────────
+
+    async def _run_pipe_mode(
+        self,
+        task_id: str,
+        args: list[str],
+        agent_cwd: str,
+        adapter: BaseAdapter,
+        ctx: _RunContext,
+    ) -> None:
+        env = _clean_env()
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=agent_cwd or None,
+            env=env,
+        )
+        self._async_procs[task_id] = proc
+
+        logger.info("Spawned %s pid=%d for task %s (pipe mode)", args[0], proc.pid, task_id)
+
+        # Read stdout line by line
+        assert proc.stdout is not None
+        buf = b""
+        try:
+            while True:
+                try:
+                    chunk = await proc.stdout.read(65536)
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw_line, buf = buf.split(b"\n", 1)
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                        await adapter.handle_chunk(parsed, ctx)
+                    except json.JSONDecodeError:
+                        pass
+        finally:
+            pass
+
+        returncode = await proc.wait()
+        logger.info("%s pid=%d exited with code %d", args[0], proc.pid, returncode)
+
+        await self._finish_task(
+            task_id,
+            TaskStatus.success if returncode == 0 else TaskStatus.failed,
+        )
+
+    # ── shared JSON line reader ─────────────────────────────────────────
+
+    async def _read_json_lines(
+        self,
+        reader: asyncio.StreamReader,
+        transport: asyncio.ReadTransport,
+        adapter: BaseAdapter,
+        ctx: _RunContext,
+        strip_ansi: bool = False,
+    ) -> None:
+        """Read and dispatch JSON lines from a stream."""
+        buf = b""
+        try:
+            while True:
+                try:
+                    chunk = await reader.read(65536)
+                except Exception:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    raw_line, buf = buf.split(b"\n", 1)
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if strip_ansi:
+                        line = _strip_ansi(line)
+                    if not line:
+                        continue
+                    try:
+                        parsed = json.loads(line)
+                        await adapter.handle_chunk(parsed, ctx)
+                    except json.JSONDecodeError:
+                        pass
+        finally:
+            transport.close()
+
+    # ── mock mode ───────────────────────────────────────────────────────
+
     async def _run_mock(self, task_id: str, prompt: str) -> None:
-        """Fallback mock mode when cco is not available."""
+        """Fallback mock mode when command is not available."""
         task = app_state.get_task(task_id)
         if not task:
             return
@@ -311,7 +689,6 @@ class AgentRunner:
 
         msg = Message(role="agent", content="", streaming=True)
         task.messages.append(msg)
-        self._current_msg[task_id] = msg
 
         await broadcast(
             {"type": "message", "task_id": task_id, "message": msg.model_dump()}
@@ -320,28 +697,24 @@ class AgentRunner:
         mock_text = f"I received your prompt: **{prompt}**\n\nProcessing...\n\n"
         for ch in mock_text:
             msg.content += ch
-            await broadcast(
-                {
-                    "type": "message_chunk",
-                    "task_id": task_id,
-                    "message_id": msg.id,
-                    "delta": ch,
-                }
-            )
+            await broadcast({
+                "type": "message_chunk",
+                "task_id": task_id,
+                "message_id": msg.id,
+                "delta": ch,
+            })
             await asyncio.sleep(0.02)
 
         await asyncio.sleep(0.5)
         done_text = "Done! Task completed successfully."
         for ch in done_text:
             msg.content += ch
-            await broadcast(
-                {
-                    "type": "message_chunk",
-                    "task_id": task_id,
-                    "message_id": msg.id,
-                    "delta": ch,
-                }
-            )
+            await broadcast({
+                "type": "message_chunk",
+                "task_id": task_id,
+                "message_id": msg.id,
+                "delta": ch,
+            })
             await asyncio.sleep(0.02)
 
         msg.streaming = False
@@ -351,471 +724,7 @@ class AgentRunner:
 
         await self._finish_task(task_id, TaskStatus.success)
 
-    async def _handle_chunk(self, task_id: str, chunk: dict[str, Any]) -> None:
-        """Process a stream-json line from cco."""
-        from server.routes_ws import broadcast
-
-        task = app_state.get_task(task_id)
-        if not task:
-            return
-
-        chunk_type = chunk.get("type", "")
-
-        # ── system init: capture session_id ──
-        if chunk_type == "system" and chunk.get("subtype") == "init":
-            sid = chunk.get("session_id")
-            if sid:
-                prev_sid = self._session_ids.get(task_id)
-                if prev_sid and sid != prev_sid:
-                    # A new session was opened instead of resuming — the previous
-                    # session likely expired.  Save the new session ID so that
-                    # subsequent turns use the renewed session, and mark this task
-                    # so the result chunk's is_error=true is treated as a soft
-                    # renewal rather than a hard failure.
-                    logger.warning(
-                        "Session changed for task %s: %s -> %s (auto-renewing)",
-                        task_id, prev_sid, sid,
-                    )
-                    self._session_ids[task_id] = sid
-                    self._save_sessions()
-                    self._session_renewed.add(task_id)
-                    # Notify the user that a new session has started
-                    t = app_state.get_task(task_id)
-                    if t:
-                        notice = Message(
-                            role="agent", type="system", streaming=False,
-                            content="会话已过期，已自动切换至新会话继续对话。（历史上下文已重置）",
-                        )
-                        t.messages.append(notice)
-                        await broadcast(
-                            {"type": "message", "task_id": task_id, "message": notice.model_dump()}
-                        )
-                else:
-                    self._session_ids[task_id] = sid
-                    self._save_sessions()
-                await broadcast({"type": "session_update", "task_id": task_id, "session_id": sid})
-            return
-
-        # ── stream_event: real-time deltas ──
-        if chunk_type == "stream_event":
-            event = chunk.get("event", {})
-            event_type = event.get("type", "")
-
-            if event_type == "message_start":
-                msg = Message(role="agent", content="", streaming=True)
-                task.messages.append(msg)
-                self._current_msg[task_id] = msg
-                self._current_block_type.pop(task_id, None)
-                await broadcast(
-                    {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-                )
-
-            elif event_type == "content_block_start":
-                content_block = event.get("content_block", {})
-                block_type = content_block.get("type", "text")
-                self._current_block_type[task_id] = block_type
-
-                if block_type == "tool_use":
-                    # Start a new tool_use message
-                    tool_name = content_block.get("name", "")
-                    # Close the current text message if streaming
-                    cur = self._current_msg.get(task_id)
-                    if cur and cur.streaming and cur.type == "text":
-                        cur.streaming = False
-                        await broadcast(
-                            {"type": "message_done", "task_id": task_id, "message_id": cur.id}
-                        )
-
-                    msg = Message(
-                        role="agent", type="tool_use", content="",
-                        tool_name=tool_name, streaming=True,
-                    )
-                    task.messages.append(msg)
-                    self._current_msg[task_id] = msg
-                    await broadcast(
-                        {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-                    )
-
-                elif block_type == "text":
-                    # If there's no current text message, create one
-                    cur = self._current_msg.get(task_id)
-                    if not cur or cur.type != "text" or not cur.streaming:
-                        msg = Message(role="agent", content="", streaming=True)
-                        task.messages.append(msg)
-                        self._current_msg[task_id] = msg
-                        await broadcast(
-                            {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-                        )
-
-            elif event_type == "content_block_delta":
-                delta = event.get("delta", {})
-                delta_type = delta.get("type", "")
-                msg = self._current_msg.get(task_id)
-
-                if delta_type == "text_delta":
-                    text = delta.get("text", "")
-                    if msg and text:
-                        msg.content += text
-                        await broadcast(
-                            {
-                                "type": "message_chunk",
-                                "task_id": task_id,
-                                "message_id": msg.id,
-                                "delta": text,
-                            }
-                        )
-
-                elif delta_type == "input_json_delta":
-                    partial = delta.get("partial_json", "")
-                    if msg and partial and msg.type == "tool_use":
-                        msg.content += partial
-                        await broadcast(
-                            {
-                                "type": "message_chunk",
-                                "task_id": task_id,
-                                "message_id": msg.id,
-                                "delta": partial,
-                            }
-                        )
-
-            elif event_type == "content_block_stop":
-                msg = self._current_msg.get(task_id)
-                if msg:
-                    msg.streaming = False
-                    await broadcast(
-                        {"type": "message_done", "task_id": task_id, "message_id": msg.id}
-                    )
-                    self._current_msg.pop(task_id, None)
-                self._current_block_type.pop(task_id, None)
-
-            return
-
-        # ── assistant: complete message (after streaming) ──
-        # The streaming phase (stream_event) already created messages and
-        # broadcast all deltas to the frontend.  The assistant chunk carries
-        # the final, authoritative content – we use it ONLY to fix up the
-        # server-side copies (for persistence accuracy) without broadcasting
-        # anything to the frontend, which already has the correct content.
-        if chunk_type == "assistant":
-            logger.info("assistant chunk for task %s: %d content blocks", task_id, len(chunk.get("message", {}).get("content", [])))
-            message_data = chunk.get("message", {})
-            content_blocks = message_data.get("content", [])
-
-            # Close any still-streaming message
-            cur = self._current_msg.pop(task_id, None)
-            if cur and cur.streaming:
-                cur.streaming = False
-                await broadcast(
-                    {"type": "message_done", "task_id": task_id, "message_id": cur.id}
-                )
-
-            # Collect existing messages by type for matching
-            text_msgs = [m for m in task.messages if m.role == "agent" and m.type == "text"]
-            tool_msgs = [m for m in task.messages if m.role == "agent" and m.type == "tool_use"]
-            text_idx = 0
-            tool_idx = 0
-
-            for block in content_blocks:
-                btype = block.get("type", "")
-
-                if btype == "text":
-                    full_text = block.get("text", "")
-                    if not full_text:
-                        continue
-                    if text_idx < len(text_msgs):
-                        text_msgs[text_idx].content = full_text
-                        text_msgs[text_idx].streaming = False
-                    text_idx += 1
-
-                elif btype == "tool_use":
-                    tool_input = block.get("input", {})
-                    content_str = json.dumps(tool_input, ensure_ascii=False)
-                    if tool_idx < len(tool_msgs):
-                        tool_msgs[tool_idx].content = content_str
-                        tool_msgs[tool_idx].streaming = False
-                    tool_idx += 1
-
-            # Extract per-turn token usage and broadcast immediately so the UI
-            # updates after every turn rather than only at task completion.
-            turn_model = message_data.get("model", "")
-            turn_usage = message_data.get("usage", {})
-            if turn_model and turn_usage:
-                in_tok = (turn_usage.get("input_tokens", 0)
-                          + turn_usage.get("cache_read_input_tokens", 0)
-                          + turn_usage.get("cache_creation_input_tokens", 0))
-                out_tok = turn_usage.get("output_tokens", 0)
-                ctx_win = turn_usage.get("context_window", 0)
-                task.total_input_tokens += in_tok
-                task.total_output_tokens += out_tok
-                if ctx_win:
-                    task.context_window = ctx_win
-                if turn_model not in task.model_usage:
-                    task.model_usage[turn_model] = {"inputTokens": 0, "outputTokens": 0, "contextWindow": ctx_win}
-                task.model_usage[turn_model]["inputTokens"] += in_tok
-                task.model_usage[turn_model]["outputTokens"] += out_tok
-                if ctx_win:
-                    task.model_usage[turn_model]["contextWindow"] = ctx_win
-                await broadcast({
-                    "type": "turns_info",
-                    "task_id": task_id,
-                    "num_turns": task.num_turns,
-                    "total_input_tokens": task.total_input_tokens,
-                    "total_output_tokens": task.total_output_tokens,
-                    "context_window": task.context_window,
-                    "total_cost_cny": task.total_cost_cny,
-                    "model_usage": task.model_usage,
-                })
-
-            app_state.save_agent_tasks(task.agent_id)
-            return
-
-        # ── user: tool_result ──
-        if chunk_type == "user":
-            message_data = chunk.get("message", {})
-            content_blocks = message_data.get("content", [])
-            for block in content_blocks:
-                if block.get("type") == "tool_result":
-                    result_content = block.get("content", "")
-                    # Try to get a readable summary from tool_use_result
-                    tool_result_meta = chunk.get("tool_use_result", {})
-                    if isinstance(result_content, list):
-                        # Some tool results are lists of content blocks
-                        parts = []
-                        for part in result_content:
-                            if isinstance(part, dict) and part.get("type") == "text":
-                                parts.append(part.get("text", ""))
-                        result_content = "\n".join(parts)
-                    if not isinstance(result_content, str):
-                        result_content = json.dumps(result_content, ensure_ascii=False)
-
-                    msg = Message(
-                        role="agent", type="tool_result",
-                        content=result_content, streaming=False,
-                    )
-                    task.messages.append(msg)
-                    await broadcast(
-                        {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-                    )
-            return
-
-        # ── result: process finished ──
-        if chunk_type == "result":
-            logger.info("result chunk for task %s: %s", task_id, json.dumps(chunk, ensure_ascii=False)[:2000])
-            subtype = chunk.get("subtype", "")
-            is_error = chunk.get("is_error", False)
-            num_turns = chunk.get("num_turns", 0)
-
-            # Update cumulative turn count on the task
-            task.num_turns += num_turns
-
-            # Extract token usage from modelUsage (preferred) or usage fallback.
-            # Per the Agent SDK docs, total_cost_usd and modelUsage in the result
-            # chunk are authoritative totals for THIS session only.  When a task
-            # is resumed multiple times each session contributes independently, so
-            # we add the session total on top of the baseline captured at session
-            # start rather than overwriting the cumulative task values.
-            baseline = self._session_baselines.pop(task_id, {
-                "total_input_tokens": 0,
-                "total_output_tokens": 0,
-                "total_cost_cny": 0.0,
-                "model_usage": {},
-            })
-            model_usage = chunk.get("modelUsage", {})
-            if model_usage:
-                # Compute this session's authoritative token totals
-                session_input = 0
-                session_output = 0
-                session_model_usage: dict = {}
-                for _model, mu in model_usage.items():
-                    in_tok = mu.get("inputTokens", 0) + mu.get("cacheReadInputTokens", 0) + mu.get("cacheCreationInputTokens", 0)
-                    out_tok = mu.get("outputTokens", 0)
-                    ctx_win = mu.get("contextWindow", 0)
-                    session_input += in_tok
-                    session_output += out_tok
-                    if ctx_win:
-                        task.context_window = ctx_win
-                    session_model_usage[_model] = {
-                        "inputTokens": in_tok,
-                        "outputTokens": out_tok,
-                        "contextWindow": ctx_win,
-                    }
-                # Merge session totals onto baseline
-                task.total_input_tokens = baseline["total_input_tokens"] + session_input
-                task.total_output_tokens = baseline["total_output_tokens"] + session_output
-                merged_model_usage = dict(baseline["model_usage"])
-                for _model, mu in session_model_usage.items():
-                    if _model in merged_model_usage:
-                        merged_model_usage[_model] = {
-                            "inputTokens": merged_model_usage[_model]["inputTokens"] + mu["inputTokens"],
-                            "outputTokens": merged_model_usage[_model]["outputTokens"] + mu["outputTokens"],
-                            "contextWindow": mu["contextWindow"] or merged_model_usage[_model].get("contextWindow", 0),
-                        }
-                    else:
-                        merged_model_usage[_model] = mu
-                task.model_usage = merged_model_usage
-            elif not task.total_input_tokens:
-                # Fallback: no per-model data and nothing accumulated yet
-                usage = chunk.get("usage", {})
-                task.total_input_tokens = usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0)
-                task.total_output_tokens = usage.get("output_tokens", 0)
-
-            cost_usd = chunk.get("total_cost_usd", 0) or 0
-            task.total_cost_cny = baseline["total_cost_cny"] + cost_usd * 7.3
-
-            await broadcast({
-                "type": "turns_info",
-                "task_id": task_id,
-                "num_turns": task.num_turns,
-                "total_input_tokens": task.total_input_tokens,
-                "total_output_tokens": task.total_output_tokens,
-                "context_window": task.context_window,
-                "total_cost_cny": task.total_cost_cny,
-                "model_usage": task.model_usage,
-            })
-
-            # The result chunk may carry a "result" text field that contains
-            # content not yet streamed (e.g. when AskUserQuestion is denied).
-            # Compare with the last agent text message and send the delta if needed.
-            result_text = chunk.get("result", "")
-            if result_text and isinstance(result_text, str):
-                result_text = result_text.strip()
-                # Find the last agent text message
-                last_text_msg = None
-                for m in reversed(task.messages):
-                    if m.role == "agent" and m.type == "text":
-                        last_text_msg = m
-                        break
-
-                existing_content = (last_text_msg.content if last_text_msg else "").strip()
-
-                if not existing_content or not result_text.startswith(existing_content):
-                    # result text is different from streamed content — send it as a new message
-                    if result_text != existing_content:
-                        msg = Message(role="agent", content=result_text, streaming=False)
-                        task.messages.append(msg)
-                        await broadcast(
-                            {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-                        )
-                elif len(result_text) > len(existing_content):
-                    # result text extends the streamed content — append the delta
-                    delta = result_text[len(existing_content):]
-                    if last_text_msg:
-                        last_text_msg.content = result_text
-                        last_text_msg.streaming = False
-                        await broadcast(
-                            {
-                                "type": "message_chunk",
-                                "task_id": task_id,
-                                "message_id": last_text_msg.id,
-                                "delta": delta,
-                            }
-                        )
-                        await broadcast(
-                            {"type": "message_done", "task_id": task_id, "message_id": last_text_msg.id}
-                        )
-
-            # Detect max-turns exit: success but result text is empty and the last
-            # streamed message is truncated (still streaming or very short).
-            if subtype == "success" and not result_text:
-                last_text_msg = None
-                for m in reversed(task.messages):
-                    if m.role == "agent" and m.type == "text":
-                        last_text_msg = m
-                        break
-                if last_text_msg and (last_text_msg.streaming or len(last_text_msg.content) < 200):
-                    # Close the truncated message first
-                    if last_text_msg.streaming:
-                        last_text_msg.streaming = False
-                        await broadcast(
-                            {"type": "message_done", "task_id": task_id, "message_id": last_text_msg.id}
-                        )
-                    notice = Message(
-                        role="agent", type="system", streaming=False,
-                        content=f"已达到单次会话 turns 上限（本轮 {num_turns} turns），输出被截断。发送任意消息可继续。",
-                    )
-                    task.messages.append(notice)
-                    await broadcast(
-                        {"type": "message", "task_id": task_id, "message": notice.model_dump()}
-                    )
-
-            # If task succeeded silently (no result text and no agent text messages
-            # were streamed), send a default completion notice so the user gets feedback.
-            if subtype == "success" and not result_text:
-                has_agent_text = any(
-                    m.role == "agent" and m.type == "text"
-                    for m in task.messages
-                )
-                if not has_agent_text:
-                    notice = Message(
-                        role="agent", type="system", streaming=False,
-                        content="任务已完成。",
-                    )
-                    task.messages.append(notice)
-                    await broadcast(
-                        {"type": "message", "task_id": task_id, "message": notice.model_dump()}
-                    )
-
-            if is_error or subtype in ("error", "error_during_execution"):
-                # If this error was caused by a session auto-renewal, treat it as
-                # success so the task doesn't get marked failed.
-                if task_id in self._session_renewed:
-                    self._session_renewed.discard(task_id)
-                    await self._finish_task(task_id, TaskStatus.success)
-                    return
-                error_msgs = chunk.get("errors", [])
-                if error_msgs:
-                    joined = "；".join(str(e) for e in error_msgs)
-                    # Detect session expiry and clear stale session ID
-                    if "No conversation found" in joined:
-                        old_sid = self._session_ids.pop(task_id, None)
-                        if old_sid:
-                            self._save_sessions()
-                            logger.warning(
-                                "Session expired for task %s (sid=%s), cleared from store",
-                                task_id, old_sid,
-                            )
-                        notice_content = f"会话已失效，下次发送消息将重新开始会话。（原因：{joined}）"
-                    else:
-                        notice_content = f"执行出错：{joined}"
-                    notice = Message(
-                        role="agent", type="system", streaming=False,
-                        content=notice_content,
-                    )
-                    task.messages.append(notice)
-                    await broadcast(
-                        {"type": "message", "task_id": task_id, "message": notice.model_dump()}
-                    )
-                await self._finish_task(task_id, TaskStatus.failed)
-            elif subtype == "success":
-                await self._finish_task(task_id, TaskStatus.success)
-            return
-
-    async def _append_text(self, task_id: str, text: str) -> None:
-        """Append plain text to current message or create a new one."""
-        from server.routes_ws import broadcast
-
-        task = app_state.get_task(task_id)
-        if not task:
-            return
-
-        msg = self._current_msg.get(task_id)
-        if not msg:
-            msg = Message(role="agent", content="", streaming=True)
-            task.messages.append(msg)
-            self._current_msg[task_id] = msg
-            await broadcast(
-                {"type": "message", "task_id": task_id, "message": msg.model_dump()}
-            )
-
-        msg.content += text + "\n"
-        await broadcast(
-            {
-                "type": "message_chunk",
-                "task_id": task_id,
-                "message_id": msg.id,
-                "delta": text + "\n",
-            }
-        )
+    # ── task finish ─────────────────────────────────────────────────────
 
     async def _finish_task(self, task_id: str, status: TaskStatus) -> None:
         from server.routes_ws import broadcast
@@ -824,14 +733,6 @@ class AgentRunner:
         if status == TaskStatus.failed and task_id in self._resuming:
             self._resuming.discard(task_id)
             return
-
-        # Close any still-streaming message before finishing the task
-        msg = self._current_msg.pop(task_id, None)
-        if msg and msg.streaming:
-            msg.streaming = False
-            await broadcast(
-                {"type": "message_done", "task_id": task_id, "message_id": msg.id}
-            )
 
         task = app_state.get_task(task_id)
         if task and task.status not in (TaskStatus.success, TaskStatus.failed):
@@ -847,6 +748,8 @@ class AgentRunner:
         await broadcast(
             {"type": "task_status", "task_id": task_id, "status": status.value}
         )
+
+    # ── user input (resume) ─────────────────────────────────────────────
 
     async def send_input(self, task_id: str, user_input: str) -> None:
         """Send user reply to agent via --resume."""
@@ -866,8 +769,11 @@ class AgentRunner:
         # Start a new subprocess resuming the session
         self._start_subprocess(task_id, user_input)
 
+    # ── kill ────────────────────────────────────────────────────────────
+
     async def kill_task(self, task_id: str) -> None:
         """Terminate subprocess for a task."""
+        # PTY mode: kill by pid
         pid = self._pids.pop(task_id, None)
         if pid:
             try:
@@ -879,7 +785,6 @@ class AgentRunner:
                     os.kill(pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
-            # Give it a moment to exit
             await asyncio.sleep(0.5)
             try:
                 os.killpg(pid, signal.SIGKILL)
@@ -890,15 +795,45 @@ class AgentRunner:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+
+        # Pipe mode: kill asyncio subprocess
+        proc = self._async_procs.pop(task_id, None)
+        if proc and proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            await asyncio.sleep(0.5)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
         fd = self._master_fds.pop(task_id, None)
         if fd is not None:
             try:
                 os.close(fd)
             except OSError:
                 pass
+
         t = self._subprocess_tasks.pop(task_id, None)
         if t and not t.done():
             t.cancel()
+
+
+# ── helpers ─────────────────────────────────────────────────────────────
+
+def _clean_env() -> dict[str, str]:
+    """Return a copy of os.environ with virtualenv vars stripped."""
+    env = os.environ.copy()
+    venv = env.pop("VIRTUAL_ENV", None)
+    env.pop("VIRTUAL_ENV_PROMPT", None)
+    if venv:
+        venv_bin = os.path.join(venv, "bin")
+        path_parts = env.get("PATH", "").split(os.pathsep)
+        path_parts = [p for p in path_parts if p != venv_bin]
+        env["PATH"] = os.pathsep.join(path_parts)
+    return env
 
 
 def _strip_ansi(s: str) -> str:
