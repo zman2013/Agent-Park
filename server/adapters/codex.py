@@ -45,8 +45,9 @@ class CodexAdapter(BaseAdapter):
             common += ["-C", agent_cwd]
 
         if session_id:
-            # resume: ept codex exec resume --json ... SID PROMPT
-            return parts + ["exec", "resume"] + common + [session_id, prompt]
+            # resume: -C is not accepted by `exec resume`, omit it
+            resume_flags = ["--json", "--dangerously-bypass-approvals-and-sandbox"]
+            return parts + ["exec", "resume"] + resume_flags + [session_id, prompt]
         else:
             # new session: ept codex exec --json ... PROMPT
             return parts + ["exec"] + common + [prompt]
