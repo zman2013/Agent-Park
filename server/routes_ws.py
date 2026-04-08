@@ -169,15 +169,17 @@ def agent_created_message(agent, order: list[str]) -> dict[str, Any]:
 @router.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
-    clients.add(ws)
-    _ensure_heartbeat_task()
-    logger.info("WS client connected (%d total)", len(clients))
 
-    # Send initial state
+    # Send initial state before adding to broadcast list, so concurrent
+    # broadcasts don't race against a connection that isn't ready yet.
     from server.agent_runner import runner as _runner
     await ws.send_text(
         json.dumps({"type": "state_sync", "data": app_state.snapshot(_runner._session_ids)}, ensure_ascii=False)
     )
+
+    clients.add(ws)
+    _ensure_heartbeat_task()
+    logger.info("WS client connected (%d total)", len(clients))
 
     try:
         while True:
