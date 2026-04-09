@@ -167,20 +167,34 @@ _HOTFILE_EXCLUDE_PREFIXES = (
 )
 
 
-def _is_project_file(fp: str) -> bool:
-    """Return True if the file path is a meaningful project file (not temp/system)."""
+def _is_under_root(fp: str, root: str) -> bool:
+    """Return True if fp equals root or is nested under root (prefix-safe)."""
+    root_clean = root.rstrip("/")
+    return fp == root_clean or fp.startswith(f"{root_clean}/")
+
+
+def _is_project_file(fp: str, project_roots: tuple[str, ...] = ()) -> bool:
+    """Return True if the file path is a meaningful project file (not temp/system noise)."""
+    fp = fp.strip()
+    if not fp:
+        return False
+
     for prefix in _HOTFILE_EXCLUDE_PREFIXES:
         if fp.startswith(prefix):
+            # Keep files inside known project roots even if repo is under /tmp, /var, etc.
+            if project_roots and any(_is_under_root(fp, root) for root in project_roots):
+                return True
             return False
     return True
 
 
-def compute_hotfiles(tasks: list, recent_days: int = 7) -> list[dict]:
+def compute_hotfiles(tasks: list, recent_days: int = 7, project_root: str | None = None) -> list[dict]:
     """Count file access frequency from tool_use messages (no LLM)."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
     read_counts: dict[str, int] = defaultdict(int)
     edit_counts: dict[str, int] = defaultdict(int)
     last_access: dict[str, str] = {}
+    project_roots = tuple([project_root.rstrip("/")]) if project_root else ()
 
     for task in tasks:
         # check task updated_at for recency
@@ -207,20 +221,20 @@ def compute_hotfiles(tasks: list, recent_days: int = 7) -> list[dict]:
             if tool_name in ("Read",):
                 # content is JSON with file_path
                 fp = _extract_file_path(content, tool_name)
-                if fp and _is_project_file(fp):
+                if fp and _is_project_file(fp, project_roots):
                     read_counts[fp] += 1
                     last_access[fp] = today
 
             elif tool_name in ("Edit", "Write", "NotebookEdit"):
                 fp = _extract_file_path(content, tool_name)
-                if fp and _is_project_file(fp):
+                if fp and _is_project_file(fp, project_roots):
                     edit_counts[fp] += 1
                     last_access[fp] = today
 
             elif tool_name == "Bash":
                 fps = _extract_paths_from_bash(content)
                 for fp in fps:
-                    if _is_project_file(fp):
+                    if _is_project_file(fp, project_roots):
                         read_counts[fp] += 1
                         last_access[fp] = today
 
@@ -574,7 +588,11 @@ async def generate_summary(
     # Step 1: Extract signals (no LLM)
     error_signals = extract_error_signals(tasks)
     project_signals = extract_project_signals(tasks)
-    hotfiles = compute_hotfiles(tasks, recent_days)
+    from server.state import app_state
+
+    agent = app_state.get_agent(agent_id)
+    project_root = (agent.cwd or "").strip() if agent else ""
+    hotfiles = compute_hotfiles(tasks, recent_days, project_root=project_root or None)
 
     await progress("extracting", f"提取到 {len(error_signals)} 条错误信号，{len(project_signals)} 条知识信号，{len(hotfiles)} 个文件")
 
