@@ -23,6 +23,9 @@ export const useAgentStore = defineStore('agent', () => {
   // Prompts panel state
   const promptsPanelOpen = ref(false)
 
+  // Archived agent filter
+  const showArchived = ref(false)
+
   // Recent files (per agent, localStorage-backed)
   const RECENT_FILES_KEY = 'agent-park:recent-files'
   const MAX_RECENT_PER_AGENT = 20
@@ -394,6 +397,24 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  async function archiveAgent(agentId) {
+    try {
+      const res = await fetch(`/api/agents/${agentId}/archive`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch (e) {
+      addToast(`Failed to archive agent: ${e.message}`, 'error')
+    }
+  }
+
+  async function unarchiveAgent(agentId) {
+    try {
+      const res = await fetch(`/api/agents/${agentId}/unarchive`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    } catch (e) {
+      addToast(`Failed to unarchive agent: ${e.message}`, 'error')
+    }
+  }
+
   function openMemoryPanel(agentId) {
     memoryAgentId.value = agentId
     memoryPanelOpen.value = true
@@ -469,6 +490,9 @@ export const useAgentStore = defineStore('agent', () => {
     closeMemoryPanel,
     openPromptsPanel,
     closePromptsPanel,
+    showArchived,
+    archiveAgent,
+    unarchiveAgent,
     setAgentMemory,
     prependMemoryEntry,
     removeMemoryEntry,

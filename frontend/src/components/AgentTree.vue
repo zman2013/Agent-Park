@@ -81,23 +81,41 @@
     </div>
 
     <!-- Scrollable agent list -->
-    <div class="flex-1 overflow-auto px-2 pb-4">
+    <div class="flex-1 overflow-auto px-2 pb-2">
       <AgentGroup
-        v-for="agent in store.agents"
+        v-for="agent in visibleAgents"
         :key="agent.id"
         :agent="agent"
       />
+    </div>
+
+    <!-- Archived toggle at bottom -->
+    <div
+      class="flex-shrink-0 border-t border-gray-800 px-4 py-2 text-xs cursor-pointer transition-colors"
+      :class="store.showArchived ? 'text-gray-400 bg-gray-800/30' : 'text-gray-600 hover:text-gray-400'"
+      @click="store.showArchived = !store.showArchived"
+    >
+      📦 Archived ({{ archivedCount }})
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import AgentGroup from './AgentGroup.vue'
 import UnseenTasksPanel from './UnseenTasksPanel.vue'
 
 const store = useAgentStore()
+
+const visibleAgents = computed(() => {
+  if (store.showArchived) {
+    return store.agents.filter(a => a.archived)
+  }
+  return store.agents.filter(a => !a.archived)
+})
+
+const archivedCount = computed(() => store.agents.filter(a => a.archived).length)
 
 const showForm = ref(false)
 const newName = ref('')

@@ -76,6 +76,34 @@
               <template v-if="fileQuery">
                 <div v-if="searchLoading" class="px-3 py-4 text-xs text-gray-600 text-center">Searching...</div>
                 <div v-else-if="searchError" class="px-3 py-4 text-xs text-red-400 text-center">{{ searchError }}</div>
+                <!-- Path resolve result (single result for path-like queries) -->
+                <template v-else-if="pathResolveResult">
+                  <div
+                    v-if="pathResolveResult.exists"
+                    :class="[
+                      'flex items-center px-3 py-1.5 cursor-pointer text-sm transition-colors',
+                      activeIndex === 0 ? 'bg-blue-900/30 text-gray-100' : 'text-gray-400 hover:bg-gray-800/60'
+                    ]"
+                    @click="selectResolvedPath(pathResolveResult)"
+                    @mouseenter="activeIndex = 0"
+                  >
+                    <span class="text-gray-500 mr-2 flex-shrink-0">{{ pathResolveResult.type === 'dir' ? '📁' : fileIcon(pathResolveResult.path.split('/').pop()) }}</span>
+                    <span class="truncate min-w-0" style="flex: 0 1 auto">{{ pathResolveResult.path.split('/').pop() }}{{ pathResolveResult.type === 'dir' ? '/' : '' }}</span>
+                    <span class="text-gray-600 text-xs ml-2 flex-shrink-0 truncate max-w-[240px] font-mono" :title="pathResolveResult.path">
+                      {{ shortenPath(pathResolveResult.path) }}
+                    </span>
+                    <span class="flex-1"></span>
+                    <span v-if="pathResolveResult.type === 'file' && pathResolveResult.size != null" class="text-gray-600 text-xs ml-2 flex-shrink-0 tabular-nums">
+                      {{ formatSize(pathResolveResult.size) }}
+                    </span>
+                  </div>
+                  <div v-else class="px-3 py-4 text-xs text-gray-600 text-center">
+                    <span class="text-gray-500">Path not found:</span>
+                    <span class="text-gray-400 ml-1 font-mono">{{ pathResolveResult.path || fileQuery }}</span>
+                    <span v-if="pathResolveResult.error" class="block text-red-400 mt-1">{{ pathResolveResult.error }}</span>
+                  </div>
+                </template>
+                <!-- Fuzzy search results -->
                 <template v-else-if="searchResults.length > 0">
                   <div
                     v-for="(item, i) in searchResults"
@@ -202,6 +230,7 @@ function stripCommandPrefix(str) {
 const isCommandMode = computed(() => hasCommandPrefix(query.value))
 const commandQuery = computed(() => stripCommandPrefix(query.value).trim().toLowerCase())
 const fileQuery = computed(() => query.value.trim().toLowerCase())
+const fileQueryRaw = computed(() => query.value.trim())
 
 // ── Command filtering ───────────────────────────────────────────────────────
 const filteredCommands = computed(() => {
@@ -317,20 +346,68 @@ async function searchFiles(q) {
   }
 }
 
+// ── File mode: path resolve (for absolute/relative paths) ────────────────────
+const pathResolveResult = ref(null)  // null | { exists: boolean, ... }
+
+function looksLikePath(q) {
+  // Starts with / or ./ or contains / (likely a path, not a search query)
+  if (!q) return false
+  return q.startsWith('/') || q.startsWith('./') || q.includes('/')
+}
+
+async function resolvePath(path) {
+  if (!props.agentId || !path) return
+  // Cancel previous in-flight request
+  if (searchAbort) searchAbort.abort()
+  const controller = new AbortController()
+  searchAbort = controller
+
+  searchLoading.value = true
+  searchError.value = ''
+  pathResolveResult.value = null
+
+  try {
+    const url = `/api/agents/${props.agentId}/files/resolve?path=${encodeURIComponent(path)}`
+    const res = await fetch(url, { signal: controller.signal })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.detail || `HTTP ${res.status}`)
+    }
+    const data = await res.json()
+    pathResolveResult.value = data
+  } catch (e) {
+    if (e.name === 'AbortError') return
+    searchError.value = e.message
+    pathResolveResult.value = null
+  } finally {
+    if (searchAbort === controller) {
+      searchLoading.value = false
+      searchAbort = null
+    }
+  }
+}
+
 function cancelSearch() {
   if (searchTimer) { clearTimeout(searchTimer); searchTimer = null }
   if (searchAbort) { searchAbort.abort(); searchAbort = null }
   searchResults.value = []
   searchLoading.value = false
   searchError.value = ''
+  pathResolveResult.value = null
 }
 
-// Watch fileQuery to debounce search
+// Watch fileQuery to debounce search or resolve path
 watch(fileQuery, (q) => {
   if (isCommandMode.value) return
   cancelSearch()
   if (!q) return  // empty query → show directory listing, no search
-  searchTimer = setTimeout(() => searchFiles(q), 250)
+
+  // If input looks like a path, use resolve API (preserve original case for path resolution)
+  if (looksLikePath(fileQueryRaw.value)) {
+    searchTimer = setTimeout(() => resolvePath(fileQueryRaw.value), 150)
+  } else {
+    searchTimer = setTimeout(() => searchFiles(q), 250)
+  }
 })
 
 onUnmounted(() => {
@@ -343,6 +420,10 @@ const totalItems = computed(() => {
     return taskListMode.value ? filteredTaskItems.value.length : filteredCommands.value.length
   }
   if (fileQuery.value) {
+    // Path resolve returns single result
+    if (pathResolveResult.value) {
+      return pathResolveResult.value.exists ? 1 : 0
+    }
     return searchResults.value.length
   }
   return dirListOffset.value + dirEntries.value.length
@@ -458,9 +539,14 @@ function onEnter() {
   } else {
     // File mode
     if (fileQuery.value) {
-      // Search results mode
-      const item = searchResults.value[activeIndex.value]
-      if (item) selectSearchResult(item)
+      // Path resolve result (single result)
+      if (pathResolveResult.value && pathResolveResult.value.exists) {
+        selectResolvedPath(pathResolveResult.value)
+      } else {
+        // Search results mode
+        const item = searchResults.value[activeIndex.value]
+        if (item) selectSearchResult(item)
+      }
     } else {
       const recentIdx = activeIndex.value
       if (recentIdx < recentFilesList.value.length) {
@@ -517,6 +603,21 @@ function selectSearchResult(item) {
   } else {
     store.addRecentFile(props.agentId, item.path)
     emit('open-file', { agentId: props.agentId, path: item.path, size: item.size || 0 })
+    emit('close')
+  }
+}
+
+function selectResolvedPath(result) {
+  if (result.type === 'dir') {
+    // Navigate into directory, clear search
+    currentDirPath.value = result.path
+    query.value = ''
+    activeIndex.value = 0
+    cancelSearch()
+    loadDir(result.path)
+  } else {
+    store.addRecentFile(props.agentId, result.path)
+    emit('open-file', { agentId: props.agentId, path: result.path, size: result.size || 0 })
     emit('close')
   }
 }
