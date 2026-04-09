@@ -41,6 +41,12 @@ def knowledge_dir(agent_id: str) -> Path:
 
 # ── Signal extraction (no LLM) ────────────────────────────────────────────────
 
+_USER_CORRECTION_KEYWORDS = (
+    "不对", "错了", "不是", "应该", "正确", "改成", "你弄错", "不要", "不能",
+    "wrong", "incorrect", "should be", "mistake", "fix", "不应该",
+)
+
+
 def extract_error_signals(tasks: list) -> list[dict]:
     """Extract error-related message fragments from tasks."""
     signals = []
@@ -53,7 +59,7 @@ def extract_error_signals(tasks: list) -> list[dict]:
             content = getattr(msg, "content", "")
             tool_name = getattr(msg, "tool_name", "")
 
-            # tool execution failure
+            # tool execution failure (tool_result with error keywords)
             if role == "agent" and msg_type == "tool_result":
                 low = content.lower()
                 if any(kw in low for kw in ["error", "traceback", "failed", "exception", "errno"]):
@@ -65,16 +71,20 @@ def extract_error_signals(tasks: list) -> list[dict]:
                         "task_name": task.name,
                     })
 
-            # user correction
-            if role == "user" and msg_type == "text" and len(content) > 5:
-                task_signals.append({
-                    "source": "user_message",
-                    "content": content[:600],
-                    "task_id": task.id,
-                    "task_name": task.name,
-                })
+            # user correction: only short messages with correction keywords (not arbitrary long texts)
+            if role == "user" and msg_type == "text":
+                has_correction = any(kw in content for kw in _USER_CORRECTION_KEYWORDS)
+                # Short messages are more likely corrections; long ones are new tasks/context
+                is_short = len(content) < 200
+                if has_correction or (is_short and len(content) > 5):
+                    task_signals.append({
+                        "source": "user_correction",
+                        "content": content[:400],
+                        "task_id": task.id,
+                        "task_name": task.name,
+                    })
 
-        # task failed
+        # task failed: keep all signals from that task
         status = getattr(task, "status", "")
         if str(status) == "failed":
             for s in task_signals:
@@ -90,11 +100,28 @@ def extract_error_signals(tasks: list) -> list[dict]:
     return signals
 
 
+_AGENT_PARK_NOISE_KEYWORDS = (
+    "knowledge.py",
+    "knowledge_summary",
+    "merge_errors",
+    "merge_project",
+    "extract_error_signals",
+    "extract_project_signals",
+    "generate_summary",
+    "知识总结",
+    "knowledge summary",
+    "build_memory_entries",
+    "update_memory_index",
+)
+
+
 def extract_project_signals(tasks: list) -> list[dict]:
     """Extract project knowledge fragments from agent text messages."""
     signals = []
     for task in tasks:
         messages = task.messages if hasattr(task, "messages") else []
+        # Only keep the first agent text per task to avoid repetition
+        agent_texts_seen = 0
         for msg in messages:
             role = getattr(msg, "role", "")
             msg_type = getattr(msg, "type", "")
@@ -102,17 +129,25 @@ def extract_project_signals(tasks: list) -> list[dict]:
 
             # agent text describing project structure / commands
             if role == "agent" and msg_type == "text" and len(content) > 30:
+                # Skip content that is about agent-park internals (self-referential noise)
+                if any(kw in content for kw in _AGENT_PARK_NOISE_KEYWORDS):
+                    continue
                 # heuristic: contains path separators or command keywords
                 if any(kw in content for kw in ["/", "python ", "pytest", "目录", "文件", "路径", "命令", "command", "script"]):
-                    signals.append({
-                        "source": "agent_text",
-                        "content": content[:1000],
-                        "task_id": task.id,
-                        "task_name": task.name,
-                    })
+                    if agent_texts_seen < 3:  # limit agent texts per task
+                        signals.append({
+                            "source": "agent_text",
+                            "content": content[:800],
+                            "task_id": task.id,
+                            "task_name": task.name,
+                        })
+                        agent_texts_seen += 1
 
             # user providing facts
             if role == "user" and msg_type == "text" and len(content) > 10:
+                # Skip agent-park internal discussions
+                if any(kw in content for kw in _AGENT_PARK_NOISE_KEYWORDS):
+                    continue
                 signals.append({
                     "source": "user_text",
                     "content": content[:600],
@@ -120,6 +155,24 @@ def extract_project_signals(tasks: list) -> list[dict]:
                     "task_name": task.name,
                 })
     return signals
+
+
+_HOTFILE_EXCLUDE_PREFIXES = (
+    "/tmp/",
+    "/var/",
+    "/proc/",
+    "/sys/",
+    "/dev/",
+    "/run/",
+)
+
+
+def _is_project_file(fp: str) -> bool:
+    """Return True if the file path is a meaningful project file (not temp/system)."""
+    for prefix in _HOTFILE_EXCLUDE_PREFIXES:
+        if fp.startswith(prefix):
+            return False
+    return True
 
 
 def compute_hotfiles(tasks: list, recent_days: int = 7) -> list[dict]:
@@ -154,21 +207,22 @@ def compute_hotfiles(tasks: list, recent_days: int = 7) -> list[dict]:
             if tool_name in ("Read",):
                 # content is JSON with file_path
                 fp = _extract_file_path(content, tool_name)
-                if fp:
+                if fp and _is_project_file(fp):
                     read_counts[fp] += 1
                     last_access[fp] = today
 
             elif tool_name in ("Edit", "Write", "NotebookEdit"):
                 fp = _extract_file_path(content, tool_name)
-                if fp:
+                if fp and _is_project_file(fp):
                     edit_counts[fp] += 1
                     last_access[fp] = today
 
             elif tool_name == "Bash":
                 fps = _extract_paths_from_bash(content)
                 for fp in fps:
-                    read_counts[fp] += 1
-                    last_access[fp] = today
+                    if _is_project_file(fp):
+                        read_counts[fp] += 1
+                        last_access[fp] = today
 
     # merge and sort
     all_files = set(list(read_counts.keys()) + list(edit_counts.keys()))
@@ -327,11 +381,17 @@ async def merge_project(existing_md: str, signals: list[dict], command: str, cfg
     max_chars = cfg.get("project_max_chars", 2000)
 
     signal_parts = []
-    for s in signals[:30]:
-        signal_parts.append(f"[{s['source']}] {s['content']}")
+    for s in signals[:20]:  # tighter limit for better signal/noise
+        signal_parts.append(f"[{s['source']}][task:{s['task_name']}] {s['content']}")
     signal_text = "\n---\n".join(signal_parts)
 
     prompt = f"""你是一个知识整理器。从以下对话记录中提取可复用的项目知识。
+
+**重要约束**：
+- 这些对话来自用户使用某个外部项目（如编译器、ML 框架等）时的记录
+- 你要提取的是**用户工作的那个外部项目**的知识（文件结构、命令、约定、关键文件等）
+- 严禁输出关于「对话管理系统」「agent-park」「知识总结」本身的内容
+- 如果对话内容是关于 agent-park/knowledge.py/memory 等系统内部实现，直接返回已有文档，不做修改
 
 ## 输入
 
@@ -343,12 +403,13 @@ async def merge_project(existing_md: str, signals: list[dict], command: str, cfg
 
 ## 要求
 
-1. 从新对话中识别：项目结构描述、文件用途、常用命令、团队约定、关键路径
+1. 从新对话中识别：项目目录结构、文件用途、构建/运行命令、团队约定、关键路径
 2. 与已有文档合并：同一主题用最新信息覆盖旧的
 3. 保持分类结构（目录结构、常用命令、约定、关键文件）
 4. 最多保留 {max_items} 条知识点，不超过 {max_chars} 字符
 5. 只保留对后续任务有直接帮助的信息，去掉一次性的具体细节
 6. 输出纯 Markdown，无需代码块包裹
+7. 每条知识点以「- 」开头
 
 ## 输出格式
 
@@ -396,18 +457,27 @@ def build_memory_entries(eid: str, errors_md: str, project_md: str, hotfiles: li
                 "content": summary,
             })
 
-    # Parse project.md into entries (one per bullet/section)
+    # Parse project.md into entries (bullet points or ### section headings)
     if project_md and "暂无" not in project_md and project_md.strip():
-        # Extract bullet points from project.md
+        current_section = ""
         for line in project_md.splitlines():
-            line = line.strip()
-            if line.startswith("- ") and len(line) > 10:
-                content = line[2:].strip()
+            stripped = line.strip()
+            # Track section headings for context
+            if stripped.startswith("### "):
+                current_section = stripped.lstrip("# ").strip()
+                continue
+            if stripped.startswith("## "):
+                current_section = stripped.lstrip("# ").strip()
+                continue
+            # Bullet points (- or *)
+            if (stripped.startswith("- ") or stripped.startswith("* ")) and len(stripped) > 10:
+                content = stripped[2:].strip()
                 if content:
+                    label = f"[{current_section}] " if current_section else ""
                     entries.append({
                         "type": "knowledge_summary",
                         "timestamp": ts,
-                        "content": f"[项目知识] {content}。详见 data/knowledge/{eid}/project.md",
+                        "content": f"[项目知识]{label}{content}。详见 data/knowledge/{eid}/project.md",
                     })
 
     # One entry for hotfiles summary
