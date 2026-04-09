@@ -51,7 +51,7 @@ class AppState:
             # Load persisted agents; update existing (default) agents with saved fields
             for aid, adata in raw.get("agents", {}).items():
                 if aid in self.agents:
-                    for field in ("name", "command", "cwd", "shared_memory_agent_id", "pinned"):
+                    for field in ("name", "command", "cwd", "shared_memory_agent_id", "pinned", "archived"):
                         if field in adata:
                             setattr(self.agents[aid], field, adata[field])
                 else:
@@ -172,6 +172,26 @@ class AppState:
         self._agent_order.insert(insert_pos, agent_id)
         self.save_agents()
 
+    def archive_agent(self, agent_id: str) -> None:
+        """Archive an agent: mark archived and remove from display order."""
+        agent = self.agents.get(agent_id)
+        if not agent:
+            raise ValueError(f"Agent {agent_id} not found")
+        agent.archived = True
+        if agent_id in self._agent_order:
+            self._agent_order.remove(agent_id)
+        self.save_agents()
+
+    def unarchive_agent(self, agent_id: str) -> None:
+        """Unarchive an agent: clear archived flag and append to order."""
+        agent = self.agents.get(agent_id)
+        if not agent:
+            raise ValueError(f"Agent {agent_id} not found")
+        agent.archived = False
+        if agent_id not in self._agent_order:
+            self._agent_order.append(agent_id)
+        self.save_agents()
+
     def fork_task(self, source_task_id: str, source_session_id: str) -> Task:
         """Fork a task: create a new task with copied messages and a fork_session_id."""
         source = self.tasks.get(source_task_id)
@@ -228,8 +248,11 @@ class AppState:
 
     def snapshot(self, sessions: dict[str, str] | None = None) -> dict:
         ordered = [self.agents[aid] for aid in self.ordered_agent_ids()]
+        # Include archived agents (not in _agent_order)
+        archived = [a for a in self.agents.values() if a.archived]
+        all_agents = ordered + archived
         return {
-            "agents": [a.model_dump() for a in ordered],
+            "agents": [a.model_dump() for a in all_agents],
             "tasks": {tid: t.model_dump() for tid, t in self.tasks.items()},
             "sessions": sessions or {},
         }

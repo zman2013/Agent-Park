@@ -86,6 +86,7 @@ class UpdateAgentBody(BaseModel):
     command: str | None = None
     shared_memory_agent_id: str | None = None
     clear_shared_memory: bool = False
+    archived: bool | None = None
 
 
 @router.patch("/agents/{agent_id}")
@@ -109,6 +110,13 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
     if body.clear_shared_memory:
         agent.shared_memory_agent_id = None
         changed["shared_memory_agent_id"] = None
+    if body.archived is not None:
+        agent.archived = body.archived
+        changed["archived"] = agent.archived
+        if agent.archived and agent_id in app_state._agent_order:
+            app_state._agent_order.remove(agent_id)
+        elif not agent.archived and agent_id not in app_state._agent_order:
+            app_state._agent_order.append(agent_id)
     app_state.save_agents()
     from server.routes_ws import broadcast, agent_updated_message
     await broadcast(agent_updated_message(agent, changed))
@@ -152,6 +160,34 @@ async def unpin_agent(agent_id: str):
     from server.routes_ws import broadcast, agent_updated_message, agents_reordered_message
     await broadcast(agent_updated_message(agent, {"pinned": False}))
     await broadcast(agents_reordered_message(app_state.ordered_agent_ids()))
+    return agent.model_dump()
+
+
+@router.post("/agents/{agent_id}/archive")
+async def archive_agent(agent_id: str):
+    agent = app_state.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    try:
+        app_state.archive_agent(agent_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    from server.routes_ws import broadcast, agent_updated_message
+    await broadcast(agent_updated_message(agent, {"archived": True}))
+    return agent.model_dump()
+
+
+@router.post("/agents/{agent_id}/unarchive")
+async def unarchive_agent(agent_id: str):
+    agent = app_state.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    try:
+        app_state.unarchive_agent(agent_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    from server.routes_ws import broadcast, agent_updated_message
+    await broadcast(agent_updated_message(agent, {"archived": False}))
     return agent.model_dump()
 
 
@@ -461,6 +497,74 @@ async def search_files(agent_id: str, q: str = "", limit: int = 50):
             break
 
     return {"cwd": cwd, "query": q, "results": results}
+
+
+@router.get("/agents/{agent_id}/files/resolve")
+async def resolve_file_path(agent_id: str, path: str = ""):
+    """Resolve a relative or absolute path and return file info if it exists.
+
+    Supports:
+    - Relative paths: "src/main.py" → resolved against agent cwd
+    - Absolute paths: "/home/user/project/src/main.py" → checked if within cwd
+
+    Returns file/directory info if exists, or exists=false if not found.
+    """
+    if not path or not path.strip():
+        return {"exists": False, "error": "path is required"}
+
+    agent = app_state.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    if not agent.cwd:
+        raise HTTPException(400, "agent has no cwd configured")
+
+    cwd = os.path.realpath(agent.cwd)
+    if not os.path.isdir(cwd):
+        raise HTTPException(400, "agent cwd does not exist")
+
+    input_path = path.strip()
+
+    # Handle absolute/relative path and enforce cwd jail using path boundary check
+    if os.path.isabs(input_path):
+        abs_path = os.path.realpath(input_path)
+    else:
+        # Relative path: resolve against cwd
+        # Remove leading ./ if present
+        clean = input_path.lstrip("./")
+        abs_path = os.path.realpath(os.path.join(cwd, clean))
+
+    try:
+        if os.path.commonpath([cwd, abs_path]) != cwd:
+            return {"exists": False, "error": "path outside cwd", "cwd": cwd}
+    except ValueError:
+        # Different mount/drive roots are always outside cwd
+        return {"exists": False, "error": "path outside cwd", "cwd": cwd}
+
+    # Check if path exists
+    if not os.path.exists(abs_path):
+        rel_path = os.path.relpath(abs_path, cwd)
+        return {"exists": False, "path": rel_path if rel_path != "." else "", "cwd": cwd}
+
+    # Get file info
+    rel_path = os.path.relpath(abs_path, cwd)
+    is_dir = os.path.isdir(abs_path)
+    is_file = os.path.isfile(abs_path)
+
+    result = {
+        "exists": True,
+        "path": rel_path if rel_path != "." else "",
+        "abs_path": abs_path,
+        "cwd": cwd,
+        "type": "dir" if is_dir else "file" if is_file else "other",
+    }
+
+    if is_file:
+        try:
+            result["size"] = os.path.getsize(abs_path)
+        except OSError:
+            result["size"] = None
+
+    return result
 
 
 @router.get("/agents/{agent_id}/files/content")

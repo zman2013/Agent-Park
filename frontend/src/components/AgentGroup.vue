@@ -33,8 +33,26 @@
       </div>
     </div>
 
-    <!-- Agent Header -->
+    <!-- Archived Agent Header -->
     <div
+      v-if="agent.archived"
+      class="flex items-center px-2 py-1.5 text-sm text-gray-500 rounded group"
+    >
+      <span class="font-medium shrink-0">{{ agent.name }}</span>
+      <span class="text-xs text-gray-600 font-mono ml-2">{{ agent.command }}</span>
+      <span class="text-xs text-gray-600 ml-2 opacity-60">archived</span>
+      <div class="ml-auto flex items-center gap-1">
+        <button
+          class="text-xs text-gray-500 hover:text-gray-300 transition-colors px-2 py-0.5 rounded"
+          title="Unarchive agent"
+          @click.stop="handleUnarchive"
+        >⬆ unarchive</button>
+      </div>
+    </div>
+
+    <!-- Active Agent Header -->
+    <div
+      v-else
       class="relative flex items-center px-2 py-1.5 cursor-pointer hover:bg-gray-800/50 rounded text-sm text-gray-300 group"
       @click="store.toggleAgent(agent.id)"
     >
@@ -84,6 +102,12 @@
           :title="agent.pinned ? 'Unpin agent' : 'Pin to top'"
           @click.stop="agent.pinned ? store.unpinAgent(agent.id) : store.pinAgent(agent.id)"
         >{{ agent.pinned ? '★' : '☆' }}</button>
+        <!-- 归档按钮 -->
+        <button
+          class="text-gray-600 hover:text-gray-300 transition-colors px-0.5"
+          title="Archive agent"
+          @click.stop="handleArchive"
+        >📦</button>
         <!-- 上下移动按钮 -->
         <span class="flex gap-0.5">
           <button
@@ -336,6 +360,24 @@ function generateSummary() {
   window.dispatchEvent(new CustomEvent('generate-summary', {
     detail: { agentId: props.agent.id, dateRange: 'recent_n' }
   }))
+}
+
+function handleArchive() {
+  // Check if any task is running
+  const hasRunningTask = props.agent.task_ids?.some(tid => {
+    const task = store.tasks[tid]
+    return task && task.status === 'running'
+  })
+  if (hasRunningTask) {
+    store.addToast('请等待任务完成后再归档', 'error')
+    return
+  }
+  store.archiveAgent(props.agent.id)
+}
+
+function handleUnarchive() {
+  store.unarchiveAgent(props.agent.id)
+  store.showArchived = false
 }
 
 function onSummaryProgress(e) {
