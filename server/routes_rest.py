@@ -524,20 +524,21 @@ async def resolve_file_path(agent_id: str, path: str = ""):
 
     input_path = path.strip()
 
-    # Handle absolute path
+    # Handle absolute/relative path and enforce cwd jail using path boundary check
     if os.path.isabs(input_path):
         abs_path = os.path.realpath(input_path)
-        # Jail check: must be within cwd
-        if not abs_path.startswith(cwd):
-            return {"exists": False, "error": "path outside cwd", "cwd": cwd}
     else:
         # Relative path: resolve against cwd
         # Remove leading ./ if present
         clean = input_path.lstrip("./")
         abs_path = os.path.realpath(os.path.join(cwd, clean))
-        # Jail check
-        if not abs_path.startswith(cwd):
+
+    try:
+        if os.path.commonpath([cwd, abs_path]) != cwd:
             return {"exists": False, "error": "path outside cwd", "cwd": cwd}
+    except ValueError:
+        # Different mount/drive roots are always outside cwd
+        return {"exists": False, "error": "path outside cwd", "cwd": cwd}
 
     # Check if path exists
     if not os.path.exists(abs_path):
