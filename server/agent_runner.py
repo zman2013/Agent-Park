@@ -338,7 +338,11 @@ class _RunContext:
                 notice_text = f"已达到单次会话 turns 上限（本轮 {num_turns} turns），已自动回复'继续'让 agent 继续工作。"
                 await self.send_system_notice(notice_text)
                 # Auto-resume: restart subprocess with "继续"
-                await self._runner.send_input(self.task_id, "继续")
+                await self._runner.send_input(
+                    self.task_id,
+                    "继续",
+                    kill_existing=False,
+                )
                 # Yield so the new task claims ownership before we clean up
                 await asyncio.sleep(0)
                 return
@@ -420,10 +424,22 @@ class AgentRunner:
 
         self._start_subprocess(task_id, prompt)
 
-    def _start_subprocess(self, task_id: str, prompt: str) -> None:
+    def _start_subprocess(
+        self,
+        task_id: str,
+        prompt: str,
+        *,
+        cancel_existing: bool = True,
+    ) -> None:
         """Create and track an asyncio Task for _run_subprocess to prevent GC."""
-        old = self._subprocess_tasks.pop(task_id, None)
-        if old and not old.done():
+        old = self._subprocess_tasks.get(task_id)
+        current = asyncio.current_task()
+        if (
+            cancel_existing
+            and old
+            and not old.done()
+            and old is not current
+        ):
             old.cancel()
 
         t = asyncio.create_task(
@@ -433,7 +449,8 @@ class AgentRunner:
         self._subprocess_tasks[task_id] = t
 
         def _on_done(fut: asyncio.Task) -> None:
-            self._subprocess_tasks.pop(task_id, None)
+            if self._subprocess_tasks.get(task_id) is fut:
+                self._subprocess_tasks.pop(task_id, None)
 
         t.add_done_callback(_on_done)
 
@@ -774,7 +791,13 @@ class AgentRunner:
 
     # ── user input (resume) ─────────────────────────────────────────────
 
-    async def send_input(self, task_id: str, user_input: str) -> None:
+    async def send_input(
+        self,
+        task_id: str,
+        user_input: str,
+        *,
+        kill_existing: bool = True,
+    ) -> None:
         """Send user reply to agent via --resume."""
         task = app_state.get_task(task_id)
         if not task:
@@ -784,13 +807,14 @@ class AgentRunner:
         task.updated_at = _model_utcnow()
         await self._broadcast_status(task_id, TaskStatus.running)
 
-        # Mark as resuming so the dying subprocess doesn't overwrite status with failed
-        self._resuming.add(task_id)
-        # Kill current process if still running
-        await self.kill_task(task_id)
+        if kill_existing:
+            # Mark as resuming so the dying subprocess doesn't overwrite status with failed
+            self._resuming.add(task_id)
+            # Kill current process if still running
+            await self.kill_task(task_id)
 
         # Start a new subprocess resuming the session
-        self._start_subprocess(task_id, user_input)
+        self._start_subprocess(task_id, user_input, cancel_existing=kill_existing)
 
     # ── kill ────────────────────────────────────────────────────────────
 
