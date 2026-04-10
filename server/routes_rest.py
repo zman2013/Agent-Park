@@ -387,11 +387,11 @@ IGNORED_SUFFIXES = {".pyc", ".pyo"}
 
 
 def _resolve_agent_path(agent_id: str, rel_path: str) -> tuple[str, str, bool]:
-    """Return (cwd, abs_path, is_symlink_escape) or raise HTTPException.
+    """Return (cwd, abs_path, outside_cwd) or raise HTTPException.
 
-    Unlike the strict jail check, paths that escape cwd via symlinks are
-    allowed — the bool flag indicates when this happens so callers can
-    decide whether to enforce a boundary.
+    Path resolution behavior matches `/files/resolve`:
+    - relative path: resolved against cwd (allows symlink escapes)
+    - absolute path: treated as an absolute filesystem path
     """
     agent = app_state.get_agent(agent_id)
     if not agent:
@@ -401,21 +401,33 @@ def _resolve_agent_path(agent_id: str, rel_path: str) -> tuple[str, str, bool]:
     cwd = os.path.realpath(agent.cwd)
     if not os.path.isdir(cwd):
         raise HTTPException(400, "agent cwd does not exist")
-    # Normalise path: strip leading slashes
-    clean = rel_path.lstrip("/").replace("..", "").lstrip("/")
-    # Use normpath instead of realpath to NOT resolve symlinks
-    abs_path_logical = os.path.normpath(os.path.join(cwd, clean)) if clean else cwd
-    abs_path = os.path.realpath(abs_path_logical) if clean else cwd
-    # Jail check on logical path (before symlink resolution)
-    if not os.path.commonpath([abs_path_logical, cwd]) == cwd:
-        raise HTTPException(400, "path outside cwd")
-    is_symlink_escape = (abs_path != abs_path_logical)
-    return cwd, abs_path, is_symlink_escape
+    input_path = (rel_path or "").strip()
+    if not input_path:
+        return cwd, cwd, False
+
+    if os.path.isabs(input_path):
+        abs_path_logical = os.path.normpath(input_path)
+    else:
+        abs_path_logical = os.path.normpath(os.path.join(cwd, input_path))
+        # Relative path still cannot escape cwd through ".." traversal.
+        try:
+            if os.path.commonpath([abs_path_logical, cwd]) != cwd:
+                raise HTTPException(400, "path outside cwd")
+        except ValueError:
+            raise HTTPException(400, "path outside cwd")
+
+    abs_path = os.path.realpath(abs_path_logical)
+    outside_cwd = False
+    try:
+        outside_cwd = os.path.commonpath([cwd, abs_path]) != cwd
+    except ValueError:
+        outside_cwd = True
+    return cwd, abs_path, outside_cwd
 
 
 @router.get("/agents/{agent_id}/files")
 async def list_files(agent_id: str, path: str = ""):
-    cwd, abs_path, _ = _resolve_agent_path(agent_id, path)
+    cwd, abs_path, outside_cwd = _resolve_agent_path(agent_id, path)
     if not os.path.isdir(abs_path):
         raise HTTPException(400, "path is not a directory")
     entries = []
@@ -451,7 +463,7 @@ async def list_files(agent_id: str, path: str = ""):
     rel = os.path.relpath(abs_path, cwd)
     # When the resolved path escapes cwd via symlink, use the absolute path
     path_field = "" if rel == "." else rel
-    if os.path.isabs(path_field) or not abs_path.startswith(cwd):
+    if os.path.isabs(path_field) or outside_cwd:
         path_field = abs_path
     return {"cwd": cwd, "path": path_field, "entries": entries}
 
