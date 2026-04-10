@@ -12,8 +12,8 @@
         <template v-if="entry.type === 'dir'">{{ expanded ? '▼' : '▶' }}</template>
         <template v-else>·</template>
       </span>
-      <span class="text-gray-500 flex-shrink-0">{{ entry.type === 'dir' ? '📁' : fileIcon(entry.name) }}</span>
-      <span class="truncate flex-1 min-w-0" :class="isHighlighted ? 'text-blue-200' : 'text-gray-300'">{{ entry.name }}</span>
+      <span class="text-gray-500 flex-shrink-0">{{ entry.type === 'dir' ? '📁' : fileIcon(entry.name) }}<template v-if="entry.is_symlink">↗</template></span>
+      <span class="truncate flex-1 min-w-0" :class="isHighlighted ? 'text-blue-200' : 'text-gray-300'">{{ entry.name }}<template v-if="entry.is_symlink" class="text-gray-600"> → </template></span>
       <span v-if="entry.type === 'file' && entry.size !== null" class="text-gray-600 flex-shrink-0 ml-1 tabular-nums">{{ formatSize(entry.size) }}</span>
     </div>
 

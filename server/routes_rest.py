@@ -386,8 +386,13 @@ IGNORED_NAMES = {
 IGNORED_SUFFIXES = {".pyc", ".pyo"}
 
 
-def _resolve_agent_path(agent_id: str, rel_path: str) -> tuple[str, str]:
-    """Return (cwd, abs_path) or raise HTTPException."""
+def _resolve_agent_path(agent_id: str, rel_path: str) -> tuple[str, str, bool]:
+    """Return (cwd, abs_path, outside_cwd) or raise HTTPException.
+
+    Path resolution behavior matches `/files/resolve`:
+    - relative path: resolved against cwd (allows symlink escapes)
+    - absolute path: treated as an absolute filesystem path
+    """
     agent = app_state.get_agent(agent_id)
     if not agent:
         raise HTTPException(404, "agent not found")
@@ -396,18 +401,33 @@ def _resolve_agent_path(agent_id: str, rel_path: str) -> tuple[str, str]:
     cwd = os.path.realpath(agent.cwd)
     if not os.path.isdir(cwd):
         raise HTTPException(400, "agent cwd does not exist")
-    # Normalise path: strip leading slashes
-    clean = rel_path.lstrip("/").replace("..", "").lstrip("/")
-    abs_path = os.path.realpath(os.path.join(cwd, clean)) if clean else cwd
-    # Jail check
-    if not abs_path.startswith(cwd):
-        raise HTTPException(400, "path outside cwd")
-    return cwd, abs_path
+    input_path = (rel_path or "").strip()
+    if not input_path:
+        return cwd, cwd, False
+
+    if os.path.isabs(input_path):
+        abs_path_logical = os.path.normpath(input_path)
+    else:
+        abs_path_logical = os.path.normpath(os.path.join(cwd, input_path))
+        # Relative path still cannot escape cwd through ".." traversal.
+        try:
+            if os.path.commonpath([abs_path_logical, cwd]) != cwd:
+                raise HTTPException(400, "path outside cwd")
+        except ValueError:
+            raise HTTPException(400, "path outside cwd")
+
+    abs_path = os.path.realpath(abs_path_logical)
+    outside_cwd = False
+    try:
+        outside_cwd = os.path.commonpath([cwd, abs_path]) != cwd
+    except ValueError:
+        outside_cwd = True
+    return cwd, abs_path, outside_cwd
 
 
 @router.get("/agents/{agent_id}/files")
 async def list_files(agent_id: str, path: str = ""):
-    cwd, abs_path = _resolve_agent_path(agent_id, path)
+    cwd, abs_path, outside_cwd = _resolve_agent_path(agent_id, path)
     if not os.path.isdir(abs_path):
         raise HTTPException(400, "path is not a directory")
     entries = []
@@ -418,17 +438,34 @@ async def list_files(agent_id: str, path: str = ""):
             if any(entry.name.endswith(s) for s in IGNORED_SUFFIXES):
                 continue
             if entry.is_dir(follow_symlinks=False):
-                entries.append({"name": entry.name, "type": "dir", "size": None})
+                entries.append({"name": entry.name, "type": "dir", "size": None, "is_symlink": False})
             elif entry.is_file(follow_symlinks=False):
                 try:
                     size = entry.stat().st_size
                 except OSError:
                     size = None
-                entries.append({"name": entry.name, "type": "file", "size": size})
+                entries.append({"name": entry.name, "type": "file", "size": size, "is_symlink": False})
+            elif entry.is_symlink():
+                try:
+                    resolved = os.path.realpath(entry.path)
+                    if os.path.isdir(resolved):
+                        entries.append({"name": entry.name, "type": "dir", "size": None, "is_symlink": True})
+                    elif os.path.isfile(resolved):
+                        try:
+                            size = os.stat(resolved).st_size
+                        except OSError:
+                            size = None
+                        entries.append({"name": entry.name, "type": "file", "size": size, "is_symlink": True})
+                except OSError:
+                    pass  # broken symlink
     except PermissionError:
         raise HTTPException(403, "permission denied")
     rel = os.path.relpath(abs_path, cwd)
-    return {"cwd": cwd, "path": "" if rel == "." else rel, "entries": entries}
+    # When the resolved path escapes cwd via symlink, use the absolute path
+    path_field = "" if rel == "." else rel
+    if os.path.isabs(path_field) or outside_cwd:
+        path_field = abs_path
+    return {"cwd": cwd, "path": path_field, "entries": entries}
 
 
 @router.get("/agents/{agent_id}/files/search")
@@ -524,7 +561,8 @@ async def resolve_file_path(agent_id: str, path: str = ""):
 
     input_path = path.strip()
 
-    # Handle absolute/relative path and enforce cwd jail using path boundary check
+    # Handle absolute/relative path — absolute paths are allowed to point anywhere
+    # so that symlink targets outside cwd can be navigated
     if os.path.isabs(input_path):
         abs_path = os.path.realpath(input_path)
     else:
@@ -533,26 +571,34 @@ async def resolve_file_path(agent_id: str, path: str = ""):
         clean = input_path.lstrip("./")
         abs_path = os.path.realpath(os.path.join(cwd, clean))
 
-    try:
-        if os.path.commonpath([cwd, abs_path]) != cwd:
-            return {"exists": False, "error": "path outside cwd", "cwd": cwd}
-    except ValueError:
-        # Different mount/drive roots are always outside cwd
-        return {"exists": False, "error": "path outside cwd", "cwd": cwd}
+    # For relative paths that resolve via symlink outside cwd,
+    # still allow access (use the resolved absolute path)
+    if not os.path.isabs(input_path):
+        try:
+            if os.path.commonpath([cwd, abs_path]) != cwd:
+                # Symlink escapes cwd — return absolute path so frontend can navigate
+                pass  # allow, will return abs_path below
+        except ValueError:
+            pass  # different mount, still allow
 
     # Check if path exists
     if not os.path.exists(abs_path):
-        rel_path = os.path.relpath(abs_path, cwd)
-        return {"exists": False, "path": rel_path if rel_path != "." else "", "cwd": cwd}
+        return {"exists": False, "path": input_path, "cwd": cwd}
 
     # Get file info
-    rel_path = os.path.relpath(abs_path, cwd)
     is_dir = os.path.isdir(abs_path)
     is_file = os.path.isfile(abs_path)
 
+    # Use abs_path when symlink target is outside cwd (relpath would be nonsense)
+    try:
+        rel_path = os.path.relpath(abs_path, cwd)
+        use_path = rel_path if rel_path != "." and not rel_path.startswith("..") else abs_path
+    except ValueError:
+        use_path = abs_path
+
     result = {
         "exists": True,
-        "path": rel_path if rel_path != "." else "",
+        "path": use_path,
         "abs_path": abs_path,
         "cwd": cwd,
         "type": "dir" if is_dir else "file" if is_file else "other",
@@ -569,7 +615,7 @@ async def resolve_file_path(agent_id: str, path: str = ""):
 
 @router.get("/agents/{agent_id}/files/content")
 async def file_content(agent_id: str, path: str = ""):
-    cwd, abs_path = _resolve_agent_path(agent_id, path)
+    cwd, abs_path, _ = _resolve_agent_path(agent_id, path)
     if not os.path.isfile(abs_path):
         raise HTTPException(400, "path is not a file")
     try:
@@ -600,7 +646,7 @@ async def file_content(agent_id: str, path: str = ""):
 
 @router.get("/agents/{agent_id}/files/download")
 async def download_file(agent_id: str, path: str = ""):
-    cwd, abs_path = _resolve_agent_path(agent_id, path)
+    cwd, abs_path, _ = _resolve_agent_path(agent_id, path)
     if not os.path.isfile(abs_path):
         raise HTTPException(400, "path is not a file")
     from fastapi.responses import FileResponse
