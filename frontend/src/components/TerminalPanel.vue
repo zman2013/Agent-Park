@@ -85,7 +85,10 @@ const shortCwd = computed(() => {
 })
 
 watch(() => props.visible, (v) => {
-  if (v) nextTick(() => inputEl.value?.focus())
+  if (v) nextTick(() => {
+    inputEl.value?.focus()
+    scrollToBottom()
+  })
 })
 
 watch(() => props.cwd, (newCwd, oldCwd) => {
