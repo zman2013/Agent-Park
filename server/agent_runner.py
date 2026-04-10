@@ -320,7 +320,7 @@ class _RunContext:
                         "message_id": last_text_msg.id,
                     })
 
-        # Max-turns detection
+        # Max-turns detection — auto-resume with "继续"
         if status == TaskStatus.success and not result_text:
             last_text_msg = None
             for m in reversed(task.messages):
@@ -335,9 +335,13 @@ class _RunContext:
                         "task_id": self.task_id,
                         "message_id": last_text_msg.id,
                     })
-                await self.send_system_notice(
-                    f"已达到单次会话 turns 上限（本轮 {num_turns} turns），输出被截断。发送任意消息可继续。"
-                )
+                notice_text = f"已达到单次会话 turns 上限（本轮 {num_turns} turns），已自动回复'继续'让 agent 继续工作。"
+                await self.send_system_notice(notice_text)
+                # Auto-resume: restart subprocess with "继续"
+                await self._runner.send_input(self.task_id, "继续")
+                # Yield so the new task claims ownership before we clean up
+                await asyncio.sleep(0)
+                return
 
         # Silent success detection
         if status == TaskStatus.success and not result_text:
@@ -384,6 +388,9 @@ class AgentRunner:
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
+        # Track which run owns shared resources (_adapters, _session_baselines)
+        # to prevent a finishing run from cleaning up a resumed run's state.
+        self._run_ids: dict[str, str] = {}  # task_id -> unique run id
 
     def _load_sessions(self) -> dict[str, str]:
         """Load session IDs from disk."""
@@ -431,6 +438,9 @@ class AgentRunner:
         t.add_done_callback(_on_done)
 
     async def _run_subprocess(self, task_id: str, prompt: str) -> None:
+        import uuid as _uuid
+        run_id = _uuid.uuid4().hex[:8]
+
         task = app_state.get_task(task_id)
         if not task:
             return
@@ -442,6 +452,9 @@ class AgentRunner:
             "total_cost_cny": task.total_cost_cny,
             "model_usage": copy.deepcopy(task.model_usage),
         }
+
+        # Claim ownership for this run
+        self._run_ids[task_id] = run_id
 
         # Ensure running status is set
         if task.status not in (TaskStatus.running,):
@@ -484,6 +497,7 @@ class AgentRunner:
             task.messages.append(notice)
             await broadcast({"type": "message", "task_id": task_id, "message": notice.model_dump()})
             await self._finish_task(task_id, TaskStatus.failed)
+            self._cleanup_run_resources(task_id, run_id)
             return
 
         try:
@@ -499,15 +513,24 @@ class AgentRunner:
             logger.exception("Subprocess error for task %s: %s", task_id, exc)
             await self._finish_task(task_id, TaskStatus.failed)
         finally:
-            self._pids.pop(task_id, None)
-            self._master_fds.pop(task_id, None)
-            self._async_procs.pop(task_id, None)
-            self._adapters.pop(task_id, None)
-            self._session_baselines.pop(task_id, None)
+            # Only clean up if this run still owns the resources (not replaced by resume)
+            self._cleanup_run_resources(task_id, run_id)
             # Fallback: if the task is still marked running, mark it failed
             task = app_state.get_task(task_id)
             if task and task.status == TaskStatus.running:
                 await self._finish_task(task_id, TaskStatus.failed)
+
+    def _cleanup_run_resources(self, task_id: str, run_id: str) -> None:
+        """Clean up shared resources only if this run still owns them."""
+        if self._run_ids.get(task_id) != run_id:
+            return
+        # Another run has claimed ownership — don't steal its resources
+        self._run_ids.pop(task_id, None)
+        self._pids.pop(task_id, None)
+        self._master_fds.pop(task_id, None)
+        self._async_procs.pop(task_id, None)
+        self._adapters.pop(task_id, None)
+        self._session_baselines.pop(task_id, None)
 
     # ── PTY mode (cco/ccs) ──────────────────────────────────────────────
 
