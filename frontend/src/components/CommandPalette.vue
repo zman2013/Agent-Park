@@ -289,6 +289,8 @@ const dirListOffset = computed(() => {
 const fullCurrentPath = computed(() => {
   const base = dirCwd.value || props.agentCwd || ''
   if (!currentDirPath.value) return base
+  // If currentDirPath is already absolute (e.g. from symlink target), use it directly
+  if (currentDirPath.value.startsWith('/')) return currentDirPath.value
   return base + '/' + currentDirPath.value
 })
 
@@ -313,6 +315,12 @@ async function loadDir(subPath = '') {
   } finally {
     dirLoading.value = false
   }
+}
+
+// Navigate to a directory given an absolute or relative path string
+async function navigateToDir(dirPath) {
+  currentDirPath.value = dirPath
+  await loadDir(dirPath)
 }
 
 // ── File mode: recursive search ─────────────────────────────────────────────
@@ -580,10 +588,9 @@ function selectFile(file) {
 function selectEntry(entry) {
   if (entry.type === 'dir') {
     const newPath = currentDirPath.value ? currentDirPath.value + '/' + entry.name : entry.name
-    currentDirPath.value = newPath
+    navigateToDir(newPath)
     query.value = ''
     activeIndex.value = 0
-    loadDir(newPath)
   } else {
     const filePath = currentDirPath.value ? currentDirPath.value + '/' + entry.name : entry.name
     store.addRecentFile(props.agentId, filePath)
@@ -595,11 +602,10 @@ function selectEntry(entry) {
 function selectSearchResult(item) {
   if (item.type === 'dir') {
     // Navigate into directory, clear search
-    currentDirPath.value = item.path
+    navigateToDir(item.path)
     query.value = ''
     activeIndex.value = 0
     cancelSearch()
-    loadDir(item.path)
   } else {
     store.addRecentFile(props.agentId, item.path)
     emit('open-file', { agentId: props.agentId, path: item.path, size: item.size || 0 })
@@ -610,11 +616,10 @@ function selectSearchResult(item) {
 function selectResolvedPath(result) {
   if (result.type === 'dir') {
     // Navigate into directory, clear search
-    currentDirPath.value = result.path
+    navigateToDir(result.path)
     query.value = ''
     activeIndex.value = 0
     cancelSearch()
-    loadDir(result.path)
   } else {
     store.addRecentFile(props.agentId, result.path)
     emit('open-file', { agentId: props.agentId, path: result.path, size: result.size || 0 })
