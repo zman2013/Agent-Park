@@ -940,7 +940,8 @@ class AgentRunner:
             for task_id, pid in list(self._pids.items()):
                 # Only poll tasks we don't already own via _run_ids
                 if task_id in self._run_ids:
-                    to_remove.append(task_id)
+                    # Keep PID tracking for live local runs; otherwise stop/kill
+                    # flows can no longer signal the child process.
                     continue
                 try:
                     os.kill(pid, 0)
