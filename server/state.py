@@ -16,6 +16,10 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 AGENTS_FILE = DATA_DIR / "agents.json"
 TASKS_DIR = DATA_DIR / "tasks"
 
+# Extra fields that are valid in task data but not in the Task model,
+# stored as metadata so they round-trip through JSON correctly.
+_VALID_TASK_META_KEYS = ("subprocess_pid",)
+
 
 def _stable_agent_id(name: str) -> str:
     """Derive a deterministic 12-char hex ID from agent name."""
@@ -79,11 +83,24 @@ class AppState:
                         if agent_id not in self.agents:
                             logger.warning("Skipping task %s: agent %s not found", tid, agent_id)
                             continue
-                        if tdata.get("status") in ("running", "waiting"):
-                            tdata["status"] = "failed"
+                        # Extract extra fields (not in Task model) before creation.
+                        # This allows forward-compatibility when new metadata fields
+                        # are added to the persisted JSON.
+                        from server.models import Task
+                        extra: dict = {}
+                        model_fields = set(Task.model_fields.keys())
+                        for k in list(tdata.keys()):
+                            if k not in model_fields:
+                                extra[k] = tdata.pop(k)
+                        # Do NOT reset running/waiting tasks to failed —
+                        # the subprocess may still be alive (e.g. after server restart
+                        # while the user's browser was closed).
                         for msg in tdata.get("messages", []):
                             msg["streaming"] = False
                         task = Task(**tdata)
+                        # Restore extra metadata as dynamic attributes
+                        for k, v in extra.items():
+                            object.__setattr__(task, k, v)
                         self.tasks[tid] = task
                         agent = self.agents[agent_id]
                         if tid not in agent.task_ids:
@@ -108,11 +125,17 @@ class AppState:
         agent = self.agents.get(agent_id)
         if agent is None:
             return
-        agent_tasks = {
-            tid: self.tasks[tid].model_dump()
-            for tid in agent.task_ids
-            if tid in self.tasks
-        }
+        agent_tasks = {}
+        for tid in agent.task_ids:
+            task = self.tasks.get(tid)
+            if task is None:
+                continue
+            dump = task.model_dump()
+            # Persist subprocess PID metadata
+            pid = getattr(task, "subprocess_pid", None)
+            if pid is not None:
+                dump["subprocess_pid"] = pid
+            agent_tasks[tid] = dump
         payload = {"tasks": agent_tasks}
         task_file = TASKS_DIR / f"{agent_id}.json"
         tmp = task_file.with_suffix(".tmp")

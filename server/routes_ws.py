@@ -20,6 +20,7 @@ SEND_TIMEOUT_SECONDS = 2.0
 HEARTBEAT_INTERVAL_SECONDS = 20.0
 _heartbeat_task: asyncio.Task | None = None
 _daily_summary_task: asyncio.Task | None = None
+_restored_orphans: list[str] = []
 
 
 async def broadcast(msg: dict[str, Any]) -> None:
@@ -51,6 +52,22 @@ def _ensure_heartbeat_task() -> None:
     global _heartbeat_task
     if _heartbeat_task is None or _heartbeat_task.done():
         _heartbeat_task = asyncio.create_task(_heartbeat_loop(), name="ws-heartbeat")
+
+
+async def restore_orphans_once() -> None:
+    """Restore orphan tasks on first client connect (runs at most once per server lifetime)."""
+    global _restored_orphans
+    if _restored_orphans:
+        return  # already done
+    from server.agent_runner import runner
+    _restored_orphans = runner.restore_orphan_tasks()
+    # Broadcast the current status of restored orphans so clients see them as running/waiting
+    for task_id in _restored_orphans:
+        task = app_state.get_task(task_id)
+        if task:
+            await broadcast(
+                {"type": "task_status", "task_id": task_id, "status": task.status.value}
+            )
 
 
 async def _heartbeat_loop() -> None:
@@ -179,6 +196,8 @@ async def websocket_endpoint(ws: WebSocket):
 
     clients.add(ws)
     _ensure_heartbeat_task()
+    # Restore orphaned tasks on first client connect
+    await restore_orphans_once()
     logger.info("WS client connected (%d total)", len(clients))
 
     try:

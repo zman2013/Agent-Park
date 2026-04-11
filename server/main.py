@@ -20,6 +20,8 @@ async def lifespan(app: FastAPI):
     from server.routes_ws import ensure_daily_summary_task
     ensure_daily_summary_task()
     yield
+    from server.agent_runner import runner
+    await runner.shutdown()
 
 
 app = FastAPI(title="Agent Park", lifespan=lifespan)
