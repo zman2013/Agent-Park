@@ -51,6 +51,7 @@ def knowledge_config() -> dict:
     """Return the knowledge summary configuration with defaults."""
     cfg = get_config().get("knowledge", {})
     return {
+        "enabled": cfg.get("enabled", True),
         "command": cfg.get("command", "minimax"),
         "errors_max_items": int(cfg.get("errors_max_items", 10)),
         "errors_max_chars": int(cfg.get("errors_max_chars", 2000)),

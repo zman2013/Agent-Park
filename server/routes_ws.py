@@ -21,7 +21,6 @@ HEARTBEAT_INTERVAL_SECONDS = 20.0
 _heartbeat_task: asyncio.Task | None = None
 _daily_summary_task: asyncio.Task | None = None
 _wiki_ingest_task: asyncio.Task | None = None
-_restored_orphans: list[str] = []
 
 
 async def broadcast(msg: dict[str, Any]) -> None:
@@ -55,20 +54,6 @@ def _ensure_heartbeat_task() -> None:
         _heartbeat_task = asyncio.create_task(_heartbeat_loop(), name="ws-heartbeat")
 
 
-async def restore_orphans_once() -> None:
-    """Restore orphan tasks on first client connect (runs at most once per server lifetime)."""
-    global _restored_orphans
-    if _restored_orphans:
-        return  # already done
-    from server.agent_runner import runner
-    _restored_orphans = runner.restore_orphan_tasks()
-    # Broadcast the current status of restored orphans so clients see them as running/waiting
-    for task_id in _restored_orphans:
-        task = app_state.get_task(task_id)
-        if task:
-            await broadcast(
-                {"type": "task_status", "task_id": task_id, "status": task.status.value}
-            )
 
 
 async def _heartbeat_loop() -> None:
@@ -292,8 +277,6 @@ async def websocket_endpoint(ws: WebSocket):
 
     clients.add(ws)
     _ensure_heartbeat_task()
-    # Restore orphaned tasks on first client connect
-    await restore_orphans_once()
     logger.info("WS client connected (%d total)", len(clients))
 
     try:
@@ -360,6 +343,10 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         await broadcast(task_created_message(new_task))
 
     elif msg_type == "generate_summary":
+        from server.config import knowledge_config
+        if not knowledge_config().get("enabled", True):
+            logger.info("generate_summary ignored: knowledge summary is disabled by config")
+            return
         agent_id = data.get("agent_id", "")
         date_range = data.get("date_range", "recent_n")
         if not agent_id or agent_id not in app_state.agents:
