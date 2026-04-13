@@ -11,6 +11,7 @@
     "max_lines": 200
   },
   "knowledge": {
+    "enabled": true,
     "command": "your-knowledge-command",
     "errors_max_items": 10,
     "errors_max_chars": 2000,
