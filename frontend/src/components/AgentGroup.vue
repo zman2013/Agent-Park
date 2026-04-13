@@ -168,7 +168,7 @@
         <input
           v-model="editWiki"
           class="w-full bg-[#111] border border-gray-700 rounded px-2 py-1 text-sm outline-none focus:border-gray-500"
-          placeholder="compiler"
+          :placeholder="agent.name"
         />
       </div>
       <div class="flex gap-2 justify-end">
