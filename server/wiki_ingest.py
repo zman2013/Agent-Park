@@ -436,6 +436,24 @@ async def ingest_task(
     # Step 4: Apply updates
     files = apply_wiki_updates(wiki_dir, plan)
 
+    # Determine which pages are newly created vs updated
+    page_actions: list[dict] = []
+    for update in plan.get("updates", []):
+        action = update.get("action", "create")
+        filepath = update.get("file", "")
+        title = update.get("title", filepath)
+        summary = update.get("summary", "")
+        category = update.get("category", "")
+        content = update.get("content", "")
+        page_actions.append({
+            "action": action,
+            "file": filepath,
+            "title": title,
+            "summary": summary,
+            "category": category,
+            "content": content,
+        })
+
     # Step 5: Record in ingested.json
     ingested = load_ingested(wiki_dir)
     task_id = getattr(task, "id", "unknown")
@@ -446,6 +464,8 @@ async def ingest_task(
     return {
         "updates": len(plan.get("updates", [])),
         "files": files,
+        "page_actions": page_actions,
+        "log_entry": plan.get("log_entry", ""),
     }
 
 
@@ -476,6 +496,11 @@ async def ingest_agent_tasks(
         return {"tasks_processed": 0, "tasks_skipped": 0, "results": [], "reason": "no wiki configured"}
 
     wiki_dir = _wiki_dir(wiki_name, wiki_base)
+
+    # Check if wiki already has content pages before ingest
+    pages_dir = wiki_dir / "pages"
+    had_existing_pages = pages_dir.exists() and any(pages_dir.glob("*.md"))
+
     ensure_wiki_structure(wiki_dir, wiki_name)
 
     # Load ingested tasks
@@ -529,9 +554,17 @@ async def ingest_agent_tasks(
                 "error": "ingest failed",
             })
 
+    # Aggregate page_actions from all task results
+    all_page_actions: list[dict] = []
+    for r in results:
+        for pa in r.get("page_actions", []):
+            all_page_actions.append(pa)
+
     return {
         "wiki": wiki_name,
         "tasks_processed": len(results),
         "tasks_skipped": skipped,
         "results": results,
+        "page_actions": all_page_actions,
+        "is_new_wiki": not had_existing_pages,
     }

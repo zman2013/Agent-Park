@@ -65,9 +65,16 @@ def knowledge_config() -> dict:
 def wiki_ingest_config() -> dict:
     """Return the wiki ingest configuration with defaults."""
     cfg = get_config().get("wiki_ingest", {})
+    feishu_cfg = cfg.get("feishu_notify", {})
     return {
         "command": cfg.get("command", "qwen"),
         "wiki_base": cfg.get("wiki_base", "/data1/common/wiki"),
         "timeout": int(cfg.get("timeout", 300)),
         "max_message_chars": int(cfg.get("max_message_chars", 50000)),
+        "feishu_notify": {
+            "enabled": feishu_cfg.get("enabled", False),
+            "cli_path": feishu_cfg.get("cli_path", ""),
+            "chat_id": feishu_cfg.get("chat_id", ""),
+            "env_file": feishu_cfg.get("env_file", ""),
+        },
     }
