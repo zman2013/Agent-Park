@@ -18,7 +18,7 @@ TASKS_DIR = DATA_DIR / "tasks"
 
 # Extra fields that are valid in task data but not in the Task model,
 # stored as metadata so they round-trip through JSON correctly.
-_VALID_TASK_META_KEYS = ("subprocess_pid",)
+_VALID_TASK_META_KEYS = ("subprocess_pid", "subprocess_start_time")
 
 
 def _stable_agent_id(name: str) -> str:
@@ -131,10 +131,13 @@ class AppState:
             if task is None:
                 continue
             dump = task.model_dump()
-            # Persist subprocess PID metadata
+            # Persist subprocess metadata used by orphan recovery
             pid = getattr(task, "subprocess_pid", None)
             if pid is not None:
                 dump["subprocess_pid"] = pid
+            start_time = getattr(task, "subprocess_start_time", None)
+            if start_time is not None:
+                dump["subprocess_start_time"] = start_time
             agent_tasks[tid] = dump
         payload = {"tasks": agent_tasks}
         task_file = TASKS_DIR / f"{agent_id}.json"

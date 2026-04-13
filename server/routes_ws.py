@@ -169,8 +169,14 @@ async def _wiki_ingest_loop() -> None:
         )
         await asyncio.sleep(sleep_seconds)
 
-        target_date = datetime.now().strftime("%Y-%m-%d")
-        logger.info("Running daily wiki ingest for date %s", target_date)
+        # Ingest the completed day, not "now". For the default midnight run,
+        # this should process yesterday's tasks.
+        target_date = (target - timedelta(days=1)).strftime("%Y-%m-%d")
+        logger.info(
+            "Running daily wiki ingest for date %s (scheduled_at=%s)",
+            target_date,
+            target.strftime("%Y-%m-%d %H:%M:%S"),
+        )
         await _run_daily_wiki_ingest(target_date)
 
 

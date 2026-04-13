@@ -553,6 +553,7 @@ class AgentRunner:
         task = app_state.get_task(task_id)
         if task:
             object.__setattr__(task, "subprocess_pid", None)
+            object.__setattr__(task, "subprocess_start_time", None)
             app_state.save_agent_tasks(task.agent_id)
 
     # ── PTY mode (cco/ccs) ──────────────────────────────────────────────
@@ -592,6 +593,7 @@ class AgentRunner:
             task = app_state.get_task(task_id)
             if task:
                 object.__setattr__(task, "subprocess_pid", pid)
+                object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pid))
                 app_state.save_agent_tasks(task.agent_id)
 
             logger.info("Spawned %s pid=%d for task %s (pty mode)", args[0], pid, task_id)
@@ -905,14 +907,39 @@ class AgentRunner:
             if task.status.value not in ("running", "waiting"):
                 continue
             pid = getattr(task, "subprocess_pid", None)
+            expected_start_time = getattr(task, "subprocess_start_time", None)
             task_id = task.id
             if pid is None:
                 # No PID persisted — the task was started in a previous
                 # server version or never had one.  Mark as failed.
                 task.status = TaskStatus.failed
+                object.__setattr__(task, "subprocess_start_time", None)
                 logger.info(
                     "Orphan task %s has no PID, marking as failed", task_id
                 )
+                app_state.save_agent_tasks(task.agent_id)
+                cleaned.append(task_id)
+                continue
+
+            # Validate PID identity before signaling. PID values can be
+            # recycled after server restarts.
+            actual_start_time = _read_proc_start_time(pid)
+            if (
+                expected_start_time is None
+                or actual_start_time is None
+                or str(actual_start_time) != str(expected_start_time)
+            ):
+                logger.warning(
+                    "Orphan task %s pid identity check failed (pid=%d expected_start=%s actual_start=%s); "
+                    "skip signaling and mark failed",
+                    task_id,
+                    pid,
+                    expected_start_time,
+                    actual_start_time,
+                )
+                task.status = TaskStatus.failed
+                object.__setattr__(task, "subprocess_pid", None)
+                object.__setattr__(task, "subprocess_start_time", None)
                 app_state.save_agent_tasks(task.agent_id)
                 cleaned.append(task_id)
                 continue
@@ -942,6 +969,7 @@ class AgentRunner:
 
             task.status = TaskStatus.failed
             object.__setattr__(task, "subprocess_pid", None)
+            object.__setattr__(task, "subprocess_start_time", None)
             logger.info(
                 "Orphan task %s (pid=%d) terminated and marked as failed",
                 task_id, pid,
@@ -964,6 +992,17 @@ class AgentRunner:
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
+
+def _read_proc_start_time(pid: int) -> int | None:
+    """Read /proc/<pid>/stat field 22 (process start time since boot)."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        parts = stat_text.split()
+        if len(parts) < 22:
+            return None
+        return int(parts[21])
+    except Exception:
+        return None
 
 def _clean_env() -> dict[str, str]:
     """Return a copy of os.environ with virtualenv vars stripped."""
