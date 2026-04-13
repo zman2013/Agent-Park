@@ -1,4 +1,0 @@
-{
-  "summary": "GSDMA Channel 0~3 仅支持本 Tile 访问的硬件约束及 FM Core Dump 排查指南",
-  "overview": "本文档详细说明 GSDMA 硬件远程访问约束：Channel 0~3 只能访问本 Tile SRAM，仅 Channel 4 支持跨 Tile 远程访问。内容涵盖：(1) 硬件约束定义与 same_tile 判定逻辑（FM 和 IPU 实现）；(2) FM 三处检查点分布及 core dump 触发机制（通过空指针写触发 SIGSEGV）；(3) format0/format1/IPU 三种错误日志格式；(4) vit_conv_0 排查实例（根因为 TM 内存布局冲突导致 descriptor 被 output buffer 覆盖）；(5) 系统性排查方法论。适用于编译器开发人员诊断 GSDMA 远程访问错误、FM 仿真器维护者理解 core dump 机制，以及排查 TM 内存布局冲突问题。"
-}
