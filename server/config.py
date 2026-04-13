@@ -73,6 +73,7 @@ def wiki_ingest_config() -> dict:
         "wiki_base": cfg.get("wiki_base", "/data1/common/wiki"),
         "timeout": int(cfg.get("timeout", 300)),
         "max_message_chars": int(cfg.get("max_message_chars", 50000)),
+        "retry_commands": cfg.get("retry_commands", ["glm", "ccs"]),
         "feishu_notify": {
             "enabled": feishu_cfg.get("enabled", False),
             "cli_path": feishu_cfg.get("cli_path", ""),

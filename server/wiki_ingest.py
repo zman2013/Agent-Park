@@ -180,14 +180,21 @@ async def _llm_call(command: str, prompt: str, timeout: int = 300) -> str:
         return ""
 
 
-async def extract_knowledge(conversation: str, command: str, timeout: int = 300) -> list[dict]:
-    """First LLM call: extract knowledge points from conversation.
+RETRY_COMMANDS = ["glm", "ccs"]  # default fallback, overridden by config
 
-    Returns a list of knowledge point dicts, or empty list if nothing worth ingesting.
+
+async def _try_extract_knowledge_with_retry(
+    conversation: str,
+    primary_command: str,
+    timeout: int,
+    retry_commands: list[str] | None = None,
+) -> tuple[list[dict], list[str]]:
+    """Try extract_knowledge with retry fallback across different LLMs.
+
+    First tries primary command, then retries with glm and ccs.
+    Returns (knowledge_points, log_entries).
     """
-    if not conversation.strip():
-        return []
-
+    log_entries: list[str] = []
     prompt = f"""你是一个知识提取器。分析以下 agent 工作对话，提取值得长期沉淀的知识点。
 
 提取标准：
@@ -214,31 +221,56 @@ async def extract_knowledge(conversation: str, command: str, timeout: int = 300)
   "category": "建议的分类"
 }}"""
 
-    result = await _llm_call(command, prompt, timeout=timeout)
-    if not result:
+    retry_commands = retry_commands or RETRY_COMMANDS
+
+    # Build command list: primary + retries, all use same timeout
+    commands = [(primary_command, timeout)] + [(c, timeout) for c in retry_commands]
+
+    for i, (command, to) in enumerate(commands):
+        label = f"primary({command})" if i == 0 else f"retry{i}({command})"
+        result = await _llm_call(command, prompt, timeout=to)
+
+        if not result:
+            log_entries.append(f"  {label}: empty/timeout")
+            continue
+
+        # Try to parse JSON
+        json_str = result.strip()
+        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
+        if m:
+            json_str = m.group(1).strip()
+        else:
+            m2 = re.search(r"\[.*\]", json_str, re.DOTALL)
+            if m2:
+                json_str = m2.group(0)
+
+        try:
+            items = json.loads(json_str, strict=False)
+            if isinstance(items, list):
+                log_entries.append(f"  {label}: {len(items)} item(s)")
+                return items, log_entries
+            log_entries.append(f"  {label}: not a list")
+        except json.JSONDecodeError:
+            log_entries.append(f"  {label}: JSON parse failed")
+
+    log_entries.append("  all attempts failed")
+    return [], log_entries
+
+
+async def extract_knowledge(conversation: str, command: str, timeout: int = 300, retry_commands: list[str] | None = None) -> list[dict]:
+    """First LLM call: extract knowledge points from conversation with retry.
+
+    Returns a list of knowledge point dicts, or empty list if nothing worth ingesting.
+    """
+    if not conversation.strip():
         return []
 
-    # Try to parse JSON from the result
-    # The LLM may wrap the JSON in markdown code blocks or output text before it
-    json_str = result.strip()
-    # Remove markdown code block wrapper if present
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
-    if m:
-        json_str = m.group(1).strip()
-    else:
-        # Try to find JSON array directly in the text
-        m2 = re.search(r"\[.*\]", json_str, re.DOTALL)
-        if m2:
-            json_str = m2.group(0)
-
-    try:
-        items = json.loads(json_str, strict=False)
-        if isinstance(items, list):
-            return items
-        return []
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse knowledge extraction result as JSON")
-        return []
+    items, log_entries = await _try_extract_knowledge_with_retry(
+        conversation, command, timeout, retry_commands=retry_commands,
+    )
+    for entry in log_entries:
+        logger.info("extract_knowledge: %s", entry)
+    return items
 
 
 async def enrich_knowledge_summaries(
@@ -528,10 +560,11 @@ async def ingest_task(
     wiki_base: str = "/data1/common/wiki",
     timeout: int = 300,
     max_message_chars: int = 50000,
+    retry_commands: list[str] | None = None,
 ) -> dict | None:
     """Ingest a single task's knowledge into the specified wiki.
 
-    Returns {"updates": N, "files": [...]} or None if nothing to ingest.
+    Returns {"updates": N, "files": [...], "extract_attempts": [...]} or None if nothing to ingest.
     """
     wiki_dir = _wiki_dir(wiki_name, wiki_base)
     ensure_wiki_structure(wiki_dir, wiki_name)
@@ -541,10 +574,12 @@ async def ingest_task(
     if not conversation.strip():
         return None
 
-    # Step 2: Extract knowledge (LLM call 1)
-    knowledge_points = await extract_knowledge(conversation, command, timeout)
+    # Step 2: Extract knowledge (LLM call 1 with retry)
+    knowledge_points, extract_attempts = await _try_extract_knowledge_with_retry(
+        conversation, command, timeout, retry_commands=retry_commands,
+    )
     if not knowledge_points:
-        return None
+        return {"updates": 0, "files": [], "page_actions": [], "log_entry": "", "extract_attempts": extract_attempts, "extracted": False}
 
     # Step 2.5: Enrich with summaries (LLM call 2)
     knowledge_points = await enrich_knowledge_summaries(knowledge_points, command, timeout)
@@ -585,6 +620,7 @@ async def ingest_task(
         "files": files,
         "page_actions": page_actions,
         "log_entry": plan.get("log_entry", ""),
+        "extract_attempts": extract_attempts,
     }
 
 
@@ -605,6 +641,7 @@ async def ingest_agent_tasks(
     wiki_base = cfg["wiki_base"]
     timeout = cfg["timeout"]
     max_message_chars = cfg["max_message_chars"]
+    retry_commands = cfg.get("retry_commands", RETRY_COMMANDS)
 
     agent = app_state.get_agent(agent_id)
     if not agent:
@@ -659,7 +696,7 @@ async def ingest_agent_tasks(
             )
         try:
             result = await ingest_task(
-                task, wiki_name, command, wiki_base, timeout, max_message_chars
+                task, wiki_name, command, wiki_base, timeout, max_message_chars, retry_commands
             )
             if result:
                 results.append({
@@ -681,6 +718,23 @@ async def ingest_agent_tasks(
         for pa in r.get("page_actions", []):
             all_page_actions.append(pa)
 
+    # Aggregate statistics from extract_attempts
+    extract_total = 0
+    extract_success = 0
+    extract_all_failed = 0
+    extract_retry_used = 0
+    for r in results:
+        attempts = r.get("extract_attempts", [])
+        if attempts:
+            extract_total += 1
+            extracted_flag = r.get("extracted", True)
+            if extracted_flag:
+                extract_success += 1
+                if len(attempts) > 1:
+                    extract_retry_used += 1
+            else:
+                extract_all_failed += 1
+
     return {
         "wiki": wiki_name,
         "tasks_processed": len(results),
@@ -688,4 +742,10 @@ async def ingest_agent_tasks(
         "results": results,
         "page_actions": all_page_actions,
         "is_new_wiki": not had_existing_pages,
+        "stats": {
+            "extract_total": extract_total,
+            "extract_success": extract_success,
+            "extract_all_failed": extract_all_failed,
+            "extract_retry_used": extract_retry_used,
+        },
     }

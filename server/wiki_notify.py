@@ -45,6 +45,10 @@ def format_update_summary(results: list[dict], date: str) -> str:
     total_processed = 0
     total_skipped = 0
     total_errors = 0
+    # Aggregate stats across all wikis
+    total_extract_success = 0
+    total_extract_all_failed = 0
+    total_extract_retry_used = 0
 
     for result in results:
         wiki = result.get("wiki", "unknown")
@@ -52,6 +56,12 @@ def format_update_summary(results: list[dict], date: str) -> str:
         skipped = result.get("tasks_skipped", 0)
         total_processed += processed
         total_skipped += skipped
+
+        # Collect per-agent stats
+        stats = result.get("stats", {})
+        total_extract_success += stats.get("extract_success", 0)
+        total_extract_all_failed += stats.get("extract_all_failed", 0)
+        total_extract_retry_used += stats.get("extract_retry_used", 0)
 
         if "error" in result:
             total_errors += 1
@@ -107,6 +117,12 @@ def format_update_summary(results: list[dict], date: str) -> str:
                     lines.append(line)
 
         lines.append("")  # blank line between wikis
+
+    # Stats line
+    if total_extract_all_failed or total_extract_retry_used:
+        total_extracted = total_extract_success + total_extract_all_failed
+        lines.append(f"**提取统计**: {total_extracted} 个任务，成功 {total_extract_success}，失败 {total_extract_all_failed}，重试 {total_extract_retry_used} 次")
+    lines.append("")  # blank line before summary
 
     lines.append(f"**汇总**: {total_processed} processed, {total_skipped} skipped, {total_errors} errors")
 
