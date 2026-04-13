@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import re
+import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -118,7 +119,9 @@ def ensure_wiki_structure(wiki_dir: Path, wiki_name: str) -> None:
             "```\n\n"
             "## 2 页面约定\n\n"
             "- 文件名使用 kebab-case\n"
-            "- 每个页面有 YAML frontmatter（title, tags, sources, created, updated）\n"
+            "- 每个页面有 YAML frontmatter（title, summary, overview, tags, sources, created, updated）\n"
+            "- summary: 一句话摘要（≤50字），用于快速判断页面是否相关\n"
+            "- overview: 结构化概览（200-500字），描述页面的覆盖范围和适用场景\n"
             "- LLM 维护 index.md 和 log.md\n\n",
             encoding="utf-8",
         )
@@ -177,14 +180,21 @@ async def _llm_call(command: str, prompt: str, timeout: int = 300) -> str:
         return ""
 
 
-async def extract_knowledge(conversation: str, command: str, timeout: int = 300) -> list[dict]:
-    """First LLM call: extract knowledge points from conversation.
+RETRY_COMMANDS = ["glm", "ccs"]  # default fallback, overridden by config
 
-    Returns a list of knowledge point dicts, or empty list if nothing worth ingesting.
+
+async def _try_extract_knowledge_with_retry(
+    conversation: str,
+    primary_command: str,
+    timeout: int,
+    retry_commands: list[str] | None = None,
+) -> tuple[list[dict], list[str]]:
+    """Try extract_knowledge with retry fallback across different LLMs.
+
+    First tries primary command, then retries with glm and ccs.
+    Returns (knowledge_points, log_entries).
     """
-    if not conversation.strip():
-        return []
-
+    log_entries: list[str] = []
     prompt = f"""你是一个知识提取器。分析以下 agent 工作对话，提取值得长期沉淀的知识点。
 
 提取标准：
@@ -211,31 +221,114 @@ async def extract_knowledge(conversation: str, command: str, timeout: int = 300)
   "category": "建议的分类"
 }}"""
 
-    result = await _llm_call(command, prompt, timeout=timeout)
-    if not result:
+    retry_commands = retry_commands or RETRY_COMMANDS
+
+    # Build command list: primary + retries, all use same timeout
+    commands = [(primary_command, timeout)] + [(c, timeout) for c in retry_commands]
+
+    for i, (command, to) in enumerate(commands):
+        label = f"primary({command})" if i == 0 else f"retry{i}({command})"
+        result = await _llm_call(command, prompt, timeout=to)
+
+        if not result:
+            log_entries.append(f"  {label}: empty/timeout")
+            continue
+
+        # Try to parse JSON
+        json_str = result.strip()
+        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
+        if m:
+            json_str = m.group(1).strip()
+        else:
+            m2 = re.search(r"\[.*\]", json_str, re.DOTALL)
+            if m2:
+                json_str = m2.group(0)
+
+        try:
+            items = json.loads(json_str, strict=False)
+            if isinstance(items, list):
+                log_entries.append(f"  {label}: {len(items)} item(s)")
+                return items, log_entries
+            log_entries.append(f"  {label}: not a list")
+        except json.JSONDecodeError:
+            log_entries.append(f"  {label}: JSON parse failed")
+
+    log_entries.append("  all attempts failed")
+    return [], log_entries
+
+
+async def extract_knowledge(conversation: str, command: str, timeout: int = 300, retry_commands: list[str] | None = None) -> list[dict]:
+    """First LLM call: extract knowledge points from conversation with retry.
+
+    Returns a list of knowledge point dicts, or empty list if nothing worth ingesting.
+    """
+    if not conversation.strip():
         return []
 
-    # Try to parse JSON from the result
-    # The LLM may wrap the JSON in markdown code blocks or output text before it
+    items, log_entries = await _try_extract_knowledge_with_retry(
+        conversation, command, timeout, retry_commands=retry_commands,
+    )
+    for entry in log_entries:
+        logger.info("extract_knowledge: %s", entry)
+    return items
+
+
+async def enrich_knowledge_summaries(
+    knowledge_points: list[dict],
+    command: str,
+    timeout: int = 300,
+) -> list[dict]:
+    """Add summary and overview to each knowledge point.
+
+    Separate LLM call to keep extract_knowledge fast and reliable.
+    Returns the enriched list (same objects with summary/overview added).
+    """
+    if not knowledge_points:
+        return knowledge_points
+
+    kp_json = json.dumps(knowledge_points, ensure_ascii=False, indent=2)
+
+    prompt = f"""你是一个技术文档编辑。为以下每个知识点生成 summary 和 overview。
+
+要求：
+- summary：一句话摘要，≤50字，用于快速判断内容是否相关
+- overview：结构化概览，200-500字，描述知识点的覆盖范围和适用场景
+
+## 知识点
+{kp_json}
+
+只输出 JSON 数组，不要输出其他内容。数组长度必须与输入一致。每个元素格式：
+{{
+  "summary": "...",
+  "overview": "..."
+}}"""
+
+    result = await _llm_call(command, prompt, timeout=timeout)
+    if not result:
+        logger.warning("Failed to generate summaries for knowledge points")
+        return knowledge_points
+
     json_str = result.strip()
-    # Remove markdown code block wrapper if present
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
     if m:
         json_str = m.group(1).strip()
     else:
-        # Try to find JSON array directly in the text
         m2 = re.search(r"\[.*\]", json_str, re.DOTALL)
         if m2:
             json_str = m2.group(0)
 
     try:
         items = json.loads(json_str, strict=False)
-        if isinstance(items, list):
-            return items
-        return []
+        if isinstance(items, list) and len(items) == len(knowledge_points):
+            for kp, summary in zip(knowledge_points, items):
+                if isinstance(summary, dict):
+                    kp["summary"] = summary.get("summary", "")
+                    kp["overview"] = summary.get("overview", "")
+            return knowledge_points
     except json.JSONDecodeError:
-        logger.warning("Failed to parse knowledge extraction result as JSON")
-        return []
+        logger.warning("Failed to parse summary enrichment result as JSON")
+
+    return knowledge_points
 
 
 async def ingest_to_wiki(
@@ -255,25 +348,46 @@ async def ingest_to_wiki(
     if index_path.exists():
         index_content = index_path.read_text(encoding="utf-8")
 
-    # Read existing page list for context
+    # Read existing page list for context (with L0/L1 info)
     pages_dir = wiki_dir / "pages"
     existing_pages = []
     if pages_dir.exists():
         for p in sorted(pages_dir.glob("*.md")):
-            # Read title from frontmatter if possible
             title = p.stem
+            summary = ""
+            overview = ""
             try:
                 text = p.read_text(encoding="utf-8")
-                m = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
-                if m:
-                    title = m.group(1).strip()
+                m_title = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
+                if m_title:
+                    title = m_title.group(1).strip()
+                m_summary = re.search(r'^summary:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
+                if m_summary:
+                    summary = m_summary.group(1).strip()
+                m_overview = re.search(r'^overview:\s*\|?\s*\n((?:  .+\n)+)', text, re.MULTILINE)
+                if m_overview:
+                    overview = textwrap.dedent(m_overview.group(1)).strip()
             except Exception:
                 pass
-            existing_pages.append({"file": f"pages/{p.name}", "title": title})
+            existing_pages.append({
+                "file": f"pages/{p.name}",
+                "title": title,
+                "summary": summary,
+                "overview": overview,
+            })
 
-    existing_pages_str = "\n".join(
-        f"- {p['file']}: {p['title']}" for p in existing_pages
-    ) if existing_pages else "（暂无页面）"
+    if existing_pages:
+        parts = []
+        for p in existing_pages:
+            line = f"- {p['file']}: {p['title']}"
+            if p['summary']:
+                line += f"\n  L0: {p['summary']}"
+            if p['overview']:
+                line += f"\n  L1: {p['overview'][:300]}"
+            parts.append(line)
+        existing_pages_str = "\n".join(parts)
+    else:
+        existing_pages_str = "（暂无页面）"
 
     knowledge_json = json.dumps(knowledge_points, ensure_ascii=False, indent=2)
 
@@ -292,10 +406,12 @@ async def ingest_to_wiki(
 1. 优先合并到已有页面（如果主题匹配）
 2. 只有全新主题才创建新页面
 3. 文件名用 kebab-case
-4. 每个页面必须有 YAML frontmatter（title, tags, sources, created, updated）
-5. 标签从已有标签中选择，确需新标签时说明
-6. 更新 index.md：已有页面只更新摘要，新页面追加到合适分类
-7. 如果已有页面需要更新，输出完整的页面 Markdown 内容（含更新后的 frontmatter）
+4. 每个页面必须有 YAML frontmatter（title, summary, overview, tags, sources, created, updated）
+5. summary 是一句话摘要（≤50字），用于快速判断页面是否相关
+6. overview 是结构化概览（200-500字），描述页面的覆盖范围和适用场景
+7. 标签从已有标签中选择，确需新标签时说明
+8. 更新 index.md：已有页面只更新摘要，新页面追加到合适分类
+9. 如果已有页面需要更新，输出完整的页面 Markdown 内容（含更新后的 frontmatter）
 
 只输出 JSON，不要输出其他内容。格式：
 {{
@@ -304,8 +420,9 @@ async def ingest_to_wiki(
       "action": "update" | "create",
       "file": "pages/xxx.md",
       "title": "页面标题",
+      "summary": "一句话摘要（≤50字）",
+      "overview": "结构化概览（200-500字）",
       "content": "完整的页面 Markdown 内容（含 frontmatter）",
-      "summary": "一句话摘要（用于 index.md）",
       "tags": ["tag1", "tag2"],
       "category": "分类名称"
     }}
@@ -378,6 +495,14 @@ def apply_wiki_updates(wiki_dir: Path, plan: dict) -> list[str]:
                     logger.info("Skipping create for %s: content is not a full page", filepath)
                     continue
 
+        # Defensive backfill: ensure summary/overview in frontmatter from plan fields
+        summary = update.get("summary", "")
+        overview = update.get("overview", "")
+        if summary and "summary:" not in content:
+            content = content.replace("---\n", f'---\nsummary: "{summary}"\n', 1)
+        if overview and "overview:" not in content:
+            content = content.replace("---\n", f"---\noverview: |\n  {overview}\n", 1)
+
         # Ensure frontmatter has updated date
         if f"updated:" in content:
             content = re.sub(r"updated:.*$", f"updated: {today}", content, flags=re.MULTILINE)
@@ -435,10 +560,11 @@ async def ingest_task(
     wiki_base: str = "/data1/common/wiki",
     timeout: int = 300,
     max_message_chars: int = 50000,
+    retry_commands: list[str] | None = None,
 ) -> dict | None:
     """Ingest a single task's knowledge into the specified wiki.
 
-    Returns {"updates": N, "files": [...]} or None if nothing to ingest.
+    Returns {"updates": N, "files": [...], "extract_attempts": [...]} or None if nothing to ingest.
     """
     wiki_dir = _wiki_dir(wiki_name, wiki_base)
     ensure_wiki_structure(wiki_dir, wiki_name)
@@ -448,12 +574,17 @@ async def ingest_task(
     if not conversation.strip():
         return None
 
-    # Step 2: Extract knowledge (LLM call 1)
-    knowledge_points = await extract_knowledge(conversation, command, timeout)
+    # Step 2: Extract knowledge (LLM call 1 with retry)
+    knowledge_points, extract_attempts = await _try_extract_knowledge_with_retry(
+        conversation, command, timeout, retry_commands=retry_commands,
+    )
     if not knowledge_points:
-        return None
+        return {"updates": 0, "files": [], "page_actions": [], "log_entry": "", "extract_attempts": extract_attempts, "extracted": False}
 
-    # Step 3: Ingest into wiki (LLM call 2)
+    # Step 2.5: Enrich with summaries (LLM call 2)
+    knowledge_points = await enrich_knowledge_summaries(knowledge_points, command, timeout)
+
+    # Step 3: Ingest into wiki (LLM call 3)
     plan = await ingest_to_wiki(knowledge_points, wiki_dir, wiki_name, command, timeout)
 
     # Step 4: Apply updates
@@ -489,6 +620,7 @@ async def ingest_task(
         "files": files,
         "page_actions": page_actions,
         "log_entry": plan.get("log_entry", ""),
+        "extract_attempts": extract_attempts,
     }
 
 
@@ -509,6 +641,7 @@ async def ingest_agent_tasks(
     wiki_base = cfg["wiki_base"]
     timeout = cfg["timeout"]
     max_message_chars = cfg["max_message_chars"]
+    retry_commands = cfg.get("retry_commands", RETRY_COMMANDS)
 
     agent = app_state.get_agent(agent_id)
     if not agent:
@@ -563,7 +696,7 @@ async def ingest_agent_tasks(
             )
         try:
             result = await ingest_task(
-                task, wiki_name, command, wiki_base, timeout, max_message_chars
+                task, wiki_name, command, wiki_base, timeout, max_message_chars, retry_commands
             )
             if result:
                 results.append({
@@ -585,6 +718,23 @@ async def ingest_agent_tasks(
         for pa in r.get("page_actions", []):
             all_page_actions.append(pa)
 
+    # Aggregate statistics from extract_attempts
+    extract_total = 0
+    extract_success = 0
+    extract_all_failed = 0
+    extract_retry_used = 0
+    for r in results:
+        attempts = r.get("extract_attempts", [])
+        if attempts:
+            extract_total += 1
+            extracted_flag = r.get("extracted", True)
+            if extracted_flag:
+                extract_success += 1
+                if len(attempts) > 1:
+                    extract_retry_used += 1
+            else:
+                extract_all_failed += 1
+
     return {
         "wiki": wiki_name,
         "tasks_processed": len(results),
@@ -592,4 +742,10 @@ async def ingest_agent_tasks(
         "results": results,
         "page_actions": all_page_actions,
         "is_new_wiki": not had_existing_pages,
+        "stats": {
+            "extract_total": extract_total,
+            "extract_success": extract_success,
+            "extract_all_failed": extract_all_failed,
+            "extract_retry_used": extract_retry_used,
+        },
     }
