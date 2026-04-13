@@ -521,9 +521,9 @@ class AgentRunner:
 
         try:
             if adapter.needs_pty():
-                await self._run_pty_mode(task_id, args, agent_cwd, adapter, ctx)
+                await self._run_pty_mode(task_id, args, agent_cwd, adapter, ctx, run_id)
             else:
-                await self._run_pipe_mode(task_id, args, agent_cwd, adapter, ctx)
+                await self._run_pipe_mode(task_id, args, agent_cwd, adapter, ctx, run_id)
 
         except FileNotFoundError:
             logger.warning("Command %r not found, using mock mode for task %s", command, task_id)
@@ -534,10 +534,11 @@ class AgentRunner:
         finally:
             # Only clean up if this run still owns the resources (not replaced by resume)
             self._cleanup_run_resources(task_id, run_id)
-            # Fallback: if the task is still marked running, mark it failed
-            task = app_state.get_task(task_id)
-            if task and task.status == TaskStatus.running:
-                await self._finish_task(task_id, TaskStatus.failed)
+            # Fallback: if the task is still marked running AND this run still owns it, mark failed
+            if self._run_ids.get(task_id) in (run_id, None):
+                task = app_state.get_task(task_id)
+                if task and task.status == TaskStatus.running:
+                    await self._finish_task(task_id, TaskStatus.failed)
 
     def _cleanup_run_resources(self, task_id: str, run_id: str) -> None:
         """Clean up shared resources only if this run still owns them."""
@@ -565,6 +566,7 @@ class AgentRunner:
         agent_cwd: str,
         adapter: BaseAdapter,
         ctx: _RunContext,
+        run_id: str = "",
     ) -> None:
         master_fd, slave_fd = pty.openpty()
 
@@ -621,6 +623,9 @@ class AgentRunner:
                 read_transport.close()
                 rc = fut.result() if not fut.cancelled() else -1
                 status = TaskStatus.success if rc == 0 else TaskStatus.failed
+                # Skip if this run no longer owns the task (replaced by auto-resume)
+                if self._run_ids.get(task_id) != run_id:
+                    return
                 agent_task = app_state.get_task(task_id)
                 if agent_task and agent_task.status == TaskStatus.running:
                     asyncio.ensure_future(self._finish_task(task_id, status))
@@ -632,10 +637,12 @@ class AgentRunner:
             returncode = await wait_future
             logger.info("%s pid=%d exited with code %d", args[0], pid, returncode)
 
-            await self._finish_task(
-                task_id,
-                TaskStatus.success if returncode == 0 else TaskStatus.failed,
-            )
+            # Skip if this run no longer owns the task (replaced by auto-resume)
+            if self._run_ids.get(task_id) == run_id:
+                await self._finish_task(
+                    task_id,
+                    TaskStatus.success if returncode == 0 else TaskStatus.failed,
+                )
 
     # ── Pipe mode (codex) ───────────────────────────────────────────────
 
@@ -646,6 +653,7 @@ class AgentRunner:
         agent_cwd: str,
         adapter: BaseAdapter,
         ctx: _RunContext,
+        run_id: str = "",
     ) -> None:
         env = _clean_env()
 
@@ -688,10 +696,12 @@ class AgentRunner:
         returncode = await proc.wait()
         logger.info("%s pid=%d exited with code %d", args[0], proc.pid, returncode)
 
-        await self._finish_task(
-            task_id,
-            TaskStatus.success if returncode == 0 else TaskStatus.failed,
-        )
+        # Skip if this run no longer owns the task (replaced by auto-resume)
+        if self._run_ids.get(task_id) == run_id:
+            await self._finish_task(
+                task_id,
+                TaskStatus.success if returncode == 0 else TaskStatus.failed,
+            )
 
     # ── shared JSON line reader ─────────────────────────────────────────
 
