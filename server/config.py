@@ -60,3 +60,14 @@ def knowledge_config() -> dict:
         "hotfiles_recent_days": int(cfg.get("hotfiles_recent_days", 7)),
         "default_task_count": int(cfg.get("default_task_count", 5)),
     }
+
+
+def wiki_ingest_config() -> dict:
+    """Return the wiki ingest configuration with defaults."""
+    cfg = get_config().get("wiki_ingest", {})
+    return {
+        "command": cfg.get("command", "qwen"),
+        "wiki_base": cfg.get("wiki_base", "/data1/common/wiki"),
+        "timeout": int(cfg.get("timeout", 300)),
+        "max_message_chars": int(cfg.get("max_message_chars", 50000)),
+    }
