@@ -151,6 +151,14 @@ def _wiki_is_new(result: dict) -> bool:
     return result.get("is_new_wiki", False)
 
 
+def _has_creatable_new_pages(result: dict) -> bool:
+    """Return True when a new wiki result can produce at least one page card."""
+    for page in result.get("page_actions", []):
+        if page.get("action") == "create" and page.get("content"):
+            return True
+    return False
+
+
 # ── Sending ────────────────────────────────────────────────────────────────────
 
 async def send_feishu_card(feishu_cfg: dict, message: str) -> bool:
@@ -239,7 +247,10 @@ async def send_wiki_digest(feishu_cfg: dict, results: list[dict], date: str) -> 
             existing_wiki_results.append(result)
             continue
 
-        if _wiki_is_new(result):
+        # New-wiki results only go down the per-page path when they can
+        # actually generate at least one page card. Otherwise they must be
+        # summarized so failures are still surfaced to operators.
+        if _wiki_is_new(result) and _has_creatable_new_pages(result):
             new_wiki_results.append(result)
         else:
             existing_wiki_results.append(result)
