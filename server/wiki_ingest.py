@@ -54,7 +54,24 @@ def extract_conversation_summary(task, max_message_chars: int = 50000) -> str:
 # ── Wiki structure helpers ─────────────────────────────────────────────────────
 
 def _wiki_dir(wiki_name: str, wiki_base: str) -> Path:
-    return Path(wiki_base) / wiki_name
+    base_path = Path(wiki_base).resolve()
+    candidate = (base_path / wiki_name).resolve()
+    try:
+        candidate.relative_to(base_path)
+    except ValueError as exc:
+        raise ValueError(f"Invalid wiki_name '{wiki_name}': path escapes wiki_base") from exc
+    return candidate
+
+
+def _safe_wiki_path(base_dir: Path, unsafe_path: str) -> Path:
+    """Resolve and validate a path so it always stays under base_dir."""
+    base_resolved = base_dir.resolve()
+    candidate = (base_resolved / unsafe_path).resolve()
+    try:
+        candidate.relative_to(base_resolved)
+    except ValueError as exc:
+        raise ValueError(f"Invalid wiki file path '{unsafe_path}': path escapes wiki dir") from exc
+    return candidate
 
 
 def _ingested_path(wiki_dir: Path) -> Path:
@@ -342,8 +359,14 @@ def apply_wiki_updates(wiki_dir: Path, plan: dict) -> list[str]:
         if f"updated:" in content:
             content = re.sub(r"updated:.*$", f"updated: {today}", content, flags=re.MULTILINE)
 
+        # Resolve and validate target path to prevent traversal/absolute-path writes
+        try:
+            full_path = _safe_wiki_path(wiki_dir, filepath)
+        except ValueError:
+            logger.warning("Skip unsafe wiki update path: %s", filepath)
+            continue
+
         # For update action, check that the page exists
-        full_path = wiki_dir / filepath
         if action == "update" and not full_path.exists():
             # Page doesn't exist yet, treat as create
             action = "create"
