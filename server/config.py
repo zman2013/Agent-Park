@@ -66,6 +66,7 @@ def wiki_ingest_config() -> dict:
     """Return the wiki ingest configuration with defaults."""
     cfg = get_config().get("wiki_ingest", {})
     feishu_cfg = cfg.get("feishu_notify", {})
+    schedule_cfg = cfg.get("schedule", {})
     return {
         "command": cfg.get("command", "qwen"),
         "wiki_base": cfg.get("wiki_base", "/data1/common/wiki"),
@@ -76,5 +77,10 @@ def wiki_ingest_config() -> dict:
             "cli_path": feishu_cfg.get("cli_path", ""),
             "chat_id": feishu_cfg.get("chat_id", ""),
             "env_file": feishu_cfg.get("env_file", ""),
+        },
+        "schedule": {
+            "enabled": schedule_cfg.get("enabled", True),
+            "hour": int(schedule_cfg.get("hour", 0)),
+            "minute": int(schedule_cfg.get("minute", 0)),
         },
     }

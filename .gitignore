@@ -21,5 +21,3 @@ config.json
 # Beads issue tracker (contains personal/company info)
 .beads/
 
-# Wiki knowledge base (generated content)
-docs/wiki/
