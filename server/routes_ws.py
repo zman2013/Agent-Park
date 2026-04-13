@@ -20,6 +20,7 @@ SEND_TIMEOUT_SECONDS = 2.0
 HEARTBEAT_INTERVAL_SECONDS = 20.0
 _heartbeat_task: asyncio.Task | None = None
 _daily_summary_task: asyncio.Task | None = None
+_wiki_ingest_task: asyncio.Task | None = None
 
 
 async def broadcast(msg: dict[str, Any]) -> None:
@@ -124,6 +125,107 @@ async def _run_daily_summary(agent_id: str, date: str) -> None:
         result.get("files_updated"),
         result.get("memory_entries", 0),
     )
+
+
+# ── Daily Wiki Ingest ───────────────────────────────────────────────────────────────
+
+
+def ensure_wiki_ingest_task() -> None:
+    """Start the daily wiki ingest background loop if not already running."""
+    global _wiki_ingest_task
+    if _wiki_ingest_task is None or _wiki_ingest_task.done():
+        _wiki_ingest_task = asyncio.create_task(
+            _wiki_ingest_loop(), name="wiki-ingest"
+        )
+
+
+async def _wiki_ingest_loop() -> None:
+    """Sleep until configured time (default midnight local), then run wiki ingest for all agents."""
+    from datetime import datetime, timedelta
+    from server.config import wiki_ingest_config
+
+    while True:
+        cfg = wiki_ingest_config()
+        schedule = cfg.get("schedule", {})
+        if not schedule.get("enabled", True):
+            # Sleep 1 hour then re-check in case config changed
+            await asyncio.sleep(3600)
+            continue
+
+        target_hour = schedule.get("hour", 0)
+        target_minute = schedule.get("minute", 0)
+
+        now = datetime.now()
+        target = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+        if target <= now:
+            # Already passed today, schedule for tomorrow
+            target = target + timedelta(days=1)
+
+        sleep_seconds = (target - now).total_seconds()
+        logger.info(
+            "Wiki ingest scheduled in %.0f s (at %s)",
+            sleep_seconds,
+            target.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        await asyncio.sleep(sleep_seconds)
+
+        # Ingest the completed day, not "now". For the default midnight run,
+        # this should process yesterday's tasks.
+        target_date = (target - timedelta(days=1)).strftime("%Y-%m-%d")
+        logger.info(
+            "Running daily wiki ingest for date %s (scheduled_at=%s)",
+            target_date,
+            target.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        await _run_daily_wiki_ingest(target_date)
+
+
+async def _run_daily_wiki_ingest(date: str) -> None:
+    """Run wiki ingest for all agents that have a wiki configured."""
+    from server.wiki_ingest import ingest_agent_tasks
+    from server.wiki_notify import send_wiki_digest
+    from server.config import wiki_ingest_config
+
+    cfg = wiki_ingest_config()
+    feishu_cfg = cfg.get("feishu_notify", {})
+
+    all_results: list[dict] = []
+
+    for agent_id in list(app_state.agents.keys()):
+        agent = app_state.get_agent(agent_id)
+        if not agent:
+            continue
+        wiki_name = getattr(agent, "wiki", None)
+        if not wiki_name:
+            logger.info("Agent %s has no wiki configured, skipping ingest", agent_id)
+            continue
+
+        logger.info("Wiki ingest: agent=%s wiki=%s date=%s", agent_id, wiki_name, date)
+        try:
+            result = await ingest_agent_tasks(agent_id, target_date=date)
+            result["agent_id"] = agent_id
+            all_results.append(result)
+            logger.info(
+                "Wiki ingest done: agent=%s wiki=%s processed=%d skipped=%d",
+                agent_id,
+                wiki_name,
+                result.get("tasks_processed", 0),
+                result.get("tasks_skipped", 0),
+            )
+        except Exception:
+            logger.exception("Wiki ingest failed for agent %s", agent_id)
+            all_results.append({
+                "agent_id": agent_id,
+                "wiki": wiki_name,
+                "error": str(Exception),
+            })
+
+    if all_results:
+        # Send feishu digest notification
+        try:
+            await send_wiki_digest(feishu_cfg, all_results, date)
+        except Exception:
+            logger.exception("Wiki digest notification failed")
 
 
 def task_created_message(task) -> dict[str, Any]:

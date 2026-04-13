@@ -395,8 +395,6 @@ class AgentRunner:
         # Track which run owns shared resources (_adapters, _session_baselines)
         # to prevent a finishing run from cleaning up a resumed run's state.
         self._run_ids: dict[str, str] = {}  # task_id -> unique run id
-        # Orphan tasks — running/waiting tasks from disk whose subprocess outlived the server.
-        self._orphan_poller: asyncio.Task | None = None
 
     def _load_sessions(self) -> dict[str, str]:
         """Load session IDs from disk."""
@@ -555,6 +553,7 @@ class AgentRunner:
         task = app_state.get_task(task_id)
         if task:
             object.__setattr__(task, "subprocess_pid", None)
+            object.__setattr__(task, "subprocess_start_time", None)
             app_state.save_agent_tasks(task.agent_id)
 
     # ── PTY mode (cco/ccs) ──────────────────────────────────────────────
@@ -594,6 +593,7 @@ class AgentRunner:
             task = app_state.get_task(task_id)
             if task:
                 object.__setattr__(task, "subprocess_pid", pid)
+                object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pid))
                 app_state.save_agent_tasks(task.agent_id)
 
             logger.info("Spawned %s pid=%d for task %s (pty mode)", args[0], pid, task_id)
@@ -892,98 +892,117 @@ class AgentRunner:
     # ── orphan task restore ─────────────────────────────────────────────
 
     def restore_orphan_tasks(self) -> list[str]:
-        """Re-adopt running/waiting tasks whose subprocess outlived the server.
+        """Terminate orphan tasks whose subprocess outlived the server.
+
+        After a server restart, the PTY master fd is lost — we cannot recover
+        the I/O channel to read agent output or detect actual task state.
+        The only safe action is to kill the surviving process and mark the
+        task as failed so the user can retry.
 
         Called once during startup (after lifespan).  Returns the list of
-        task_ids that were restored so the caller can broadcast status.
+        task_ids that were cleaned up so the caller can broadcast status.
         """
-        restored: list[str] = []
-        for task in app_state.tasks.values():
-            if str(task.status) not in ("running", "waiting"):
+        cleaned: list[str] = []
+        for task in list(app_state.tasks.values()):
+            if task.status.value not in ("running", "waiting"):
                 continue
             pid = getattr(task, "subprocess_pid", None)
+            expected_start_time = getattr(task, "subprocess_start_time", None)
+            task_id = task.id
             if pid is None:
                 # No PID persisted — the task was started in a previous
                 # server version or never had one.  Mark as failed.
                 task.status = TaskStatus.failed
+                object.__setattr__(task, "subprocess_start_time", None)
                 logger.info(
-                    "Orphan task %s has no PID, marking as failed", task.id
-                )
-                continue
-            # Check if the process is still alive
-            try:
-                os.kill(pid, 0)  # signal 0 = check existence
-                alive = True
-            except ProcessLookupError:
-                alive = False
-            except PermissionError:
-                alive = True  # process exists but we can't signal it
-            except Exception:
-                alive = False
-
-            if alive:
-                # Re-register in our tracking dicts so _finish_task etc work.
-                self._pids[task.id] = pid
-                logger.info(
-                    "Restored orphan task %s (pid=%d, status=%s)",
-                    task.id, pid, task.status,
-                )
-                restored.append(task.id)
-                # Start a background poller that waits for the process to exit
-                if self._orphan_poller is None or self._orphan_poller.done():
-                    self._orphan_poller = asyncio.create_task(
-                        self._poll_orphans(), name="orphan-poller"
-                    )
-            else:
-                task.status = TaskStatus.failed
-                logger.info(
-                    "Orphan task %s (pid=%d) already dead, marking as failed",
-                    task.id, pid,
+                    "Orphan task %s has no PID, marking as failed", task_id
                 )
                 app_state.save_agent_tasks(task.agent_id)
-        return restored
+                cleaned.append(task_id)
+                continue
 
-    async def _poll_orphans(self) -> None:
-        """Poll restored orphan PIDs until they exit, then clean up."""
-        while self._pids:
-            to_remove: list[str] = []
-            for task_id, pid in list(self._pids.items()):
-                # Only poll tasks we don't already own via _run_ids
-                if task_id in self._run_ids:
-                    # Keep PID tracking for live local runs; otherwise stop/kill
-                    # flows can no longer signal the child process.
-                    continue
+            # Validate PID identity before signaling. PID values can be
+            # recycled after server restarts.
+            actual_start_time = _read_proc_start_time(pid)
+            if (
+                expected_start_time is None
+                or actual_start_time is None
+                or str(actual_start_time) != str(expected_start_time)
+            ):
+                logger.warning(
+                    "Orphan task %s pid identity check failed (pid=%d expected_start=%s actual_start=%s); "
+                    "skip signaling and mark failed",
+                    task_id,
+                    pid,
+                    expected_start_time,
+                    actual_start_time,
+                )
+                task.status = TaskStatus.failed
+                object.__setattr__(task, "subprocess_pid", None)
+                object.__setattr__(task, "subprocess_start_time", None)
+                app_state.save_agent_tasks(task.agent_id)
+                cleaned.append(task_id)
+                continue
+
+            # Kill the surviving process — we've lost the PTY fd and
+            # cannot recover the I/O channel.
+            try:
+                os.killpg(pid, signal.SIGTERM)
+                logger.info("Sent SIGTERM to orphan pid %d (task %s)", pid, task_id)
+            except ProcessLookupError:
+                pass
+            except Exception:
                 try:
-                    os.kill(pid, 0)
+                    os.kill(pid, signal.SIGTERM)
                 except ProcessLookupError:
-                    # Process exited — finish the task
-                    task = app_state.get_task(task_id)
-                    if task and task.status == TaskStatus.running:
-                        task.status = TaskStatus.success
-                        app_state.save_agent_tasks(task.agent_id)
-                        logger.info(
-                            "Orphan task %s (pid=%d) exited naturally",
-                            task_id, pid,
-                        )
-                    to_remove.append(task_id)
+                    pass
                 except Exception:
-                    to_remove.append(task_id)
-            for tid in to_remove:
-                self._pids.pop(tid, None)
-            if self._pids:
-                await asyncio.sleep(5)
+                    pass
+
+            # Also reap zombie children
+            try:
+                os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            except Exception:
+                pass
+
+            task.status = TaskStatus.failed
+            object.__setattr__(task, "subprocess_pid", None)
+            object.__setattr__(task, "subprocess_start_time", None)
+            logger.info(
+                "Orphan task %s (pid=%d) terminated and marked as failed",
+                task_id, pid,
+            )
+            app_state.save_agent_tasks(task.agent_id)
+            cleaned.append(task_id)
+        return cleaned
+
 
     async def shutdown(self) -> None:
-        """Graceful shutdown: cancel the orphan poller."""
-        if self._orphan_poller and not self._orphan_poller.done():
-            self._orphan_poller.cancel()
+        """Graceful shutdown: kill any tracked subprocesses."""
+        for task_id, pid in list(self._pids.items()):
             try:
-                await self._orphan_poller
-            except asyncio.CancelledError:
-                pass
+                os.killpg(pid, signal.SIGTERM)
+            except Exception:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except Exception:
+                    pass
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
+
+def _read_proc_start_time(pid: int) -> int | None:
+    """Read /proc/<pid>/stat field 22 (process start time since boot)."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        parts = stat_text.split()
+        if len(parts) < 22:
+            return None
+        return int(parts[21])
+    except Exception:
+        return None
 
 def _clean_env() -> dict[str, str]:
     """Return a copy of os.environ with virtualenv vars stripped."""

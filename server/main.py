@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    from server.routes_ws import ensure_daily_summary_task
+    from server.routes_ws import ensure_daily_summary_task, ensure_wiki_ingest_task
     from server.agent_runner import runner
 
     # Clean up orphan tasks immediately at startup — kill surviving
@@ -34,6 +34,8 @@ async def lifespan(app: FastAPI):
         ensure_daily_summary_task()
     else:
         logging.getLogger(__name__).info("Daily knowledge summary is disabled by config")
+
+    ensure_wiki_ingest_task()
     yield
     await runner.shutdown()
 
