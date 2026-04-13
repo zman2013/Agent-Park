@@ -163,6 +163,14 @@
           >{{ a.name }}</option>
         </select>
       </div>
+      <div>
+        <label class="text-xs text-gray-500 block mb-1">Wiki</label>
+        <input
+          v-model="editWiki"
+          class="w-full bg-[#111] border border-gray-700 rounded px-2 py-1 text-sm outline-none focus:border-gray-500"
+          placeholder="compiler"
+        />
+      </div>
       <div class="flex gap-2 justify-end">
         <button
           class="text-xs text-gray-500 hover:text-gray-300 px-2 py-1"
@@ -229,6 +237,7 @@ const editName = ref('')
 const editCwd = ref('')
 const editCommand = ref('')
 const editSharedMemoryAgentId = ref('')
+const editWiki = ref('')
 const showAllTasks = ref(false)
 const showNewTaskModal = ref(false)
 const newTaskName = ref('')
@@ -278,6 +287,7 @@ watch(showEdit, (v) => {
     editCwd.value = props.agent.cwd || ''
     editCommand.value = props.agent.command || 'cco'
     editSharedMemoryAgentId.value = props.agent.shared_memory_agent_id || ''
+    editWiki.value = props.agent.wiki || ''
   }
 })
 
@@ -296,6 +306,7 @@ async function saveEdit() {
   if (editName.value !== props.agent.name) body.name = editName.value
   if (editCwd.value !== props.agent.cwd) body.cwd = editCwd.value
   if (editCommand.value !== props.agent.command) body.command = editCommand.value
+  if (editWiki.value !== (props.agent.wiki || '')) body.wiki = editWiki.value
 
   const currentShared = props.agent.shared_memory_agent_id || ''
   if (editSharedMemoryAgentId.value !== currentShared) {

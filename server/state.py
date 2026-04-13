@@ -55,7 +55,7 @@ class AppState:
             # Load persisted agents; update existing (default) agents with saved fields
             for aid, adata in raw.get("agents", {}).items():
                 if aid in self.agents:
-                    for field in ("name", "command", "cwd", "shared_memory_agent_id", "pinned", "archived"):
+                    for field in ("name", "command", "cwd", "wiki", "shared_memory_agent_id", "pinned", "archived"):
                         if field in adata:
                             setattr(self.agents[aid], field, adata[field])
                 else:

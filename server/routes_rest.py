@@ -27,6 +27,7 @@ class CreateAgentBody(BaseModel):
     name: str
     command: str = "cco"
     cwd: str = ""
+    wiki: str = ""
     shared_memory_agent_id: str | None = None
 
 
@@ -34,6 +35,9 @@ class CreateAgentBody(BaseModel):
 async def create_agent(body: CreateAgentBody):
     try:
         agent = app_state.create_agent(body.name, body.command, body.cwd, body.shared_memory_agent_id)
+        if body.wiki:
+            agent.wiki = body.wiki
+            app_state.save_agents()
     except ValueError as e:
         raise HTTPException(409, str(e))
     from server.routes_ws import broadcast, agent_created_message
@@ -84,6 +88,7 @@ class UpdateAgentBody(BaseModel):
     name: str | None = None
     cwd: str | None = None
     command: str | None = None
+    wiki: str | None = None
     shared_memory_agent_id: str | None = None
     clear_shared_memory: bool = False
     archived: bool | None = None
@@ -104,6 +109,9 @@ async def update_agent(agent_id: str, body: UpdateAgentBody):
     if body.command is not None:
         agent.command = body.command
         changed["command"] = agent.command
+    if body.wiki is not None:
+        agent.wiki = body.wiki
+        changed["wiki"] = agent.wiki
     if body.shared_memory_agent_id is not None:
         agent.shared_memory_agent_id = body.shared_memory_agent_id
         changed["shared_memory_agent_id"] = agent.shared_memory_agent_id
