@@ -51,6 +51,7 @@ async def run(date: str | None = None) -> None:
     total_processed = 0
     total_skipped = 0
     total_errors = 0
+    all_results: list[dict] = []
 
     for agent in agents_with_wiki:
         print(f"\n{'='*60}")
@@ -60,6 +61,8 @@ async def run(date: str | None = None) -> None:
         from server.wiki_ingest import ingest_agent_tasks
 
         result = await ingest_agent_tasks(agent.id, target_date=date)
+
+        all_results.append(result)
 
         if "error" in result:
             print(f"  ERROR: {result['error']}")
@@ -92,6 +95,22 @@ async def run(date: str | None = None) -> None:
 
     print(f"\n{'='*60}")
     print(f"Summary: {total_processed} tasks processed, {total_skipped} skipped, {total_errors} errors")
+
+    # Send Feishu notification
+    feishu_cfg = cfg.get("feishu_notify", {})
+    if feishu_cfg.get("enabled", False):
+        from datetime import datetime
+        from server.wiki_notify import send_wiki_digest
+
+        digest_date = date or datetime.now().strftime("%Y-%m-%d")
+        print(f"\nSending Feishu notification for {digest_date}...")
+        success = await send_wiki_digest(feishu_cfg, all_results, digest_date)
+        if success:
+            print("Feishu notification sent.")
+        else:
+            print("Feishu notification failed (see logs for details).")
+    else:
+        print("\nFeishu notification disabled.")
 
 
 def main():
