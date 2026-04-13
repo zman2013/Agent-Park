@@ -203,9 +203,7 @@ async def extract_knowledge(conversation: str, command: str, timeout: int = 300)
 ## 对话内容
 {conversation}
 
-## 输出要求
-如果没有值得沉淀的知识，输出空字符串。
-如果有，输出 JSON 数组，每个元素：
+只输出 JSON 数组，不要输出其他内容。如果无值得沉淀的知识，输出 []。每个元素格式：
 {{
   "title": "知识点标题",
   "content": "详细内容（Markdown 格式）",
@@ -218,15 +216,20 @@ async def extract_knowledge(conversation: str, command: str, timeout: int = 300)
         return []
 
     # Try to parse JSON from the result
-    # The LLM may wrap the JSON in markdown code blocks
+    # The LLM may wrap the JSON in markdown code blocks or output text before it
     json_str = result.strip()
     # Remove markdown code block wrapper if present
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
     if m:
         json_str = m.group(1).strip()
+    else:
+        # Try to find JSON array directly in the text
+        m2 = re.search(r"\[.*\]", json_str, re.DOTALL)
+        if m2:
+            json_str = m2.group(0)
 
     try:
-        items = json.loads(json_str)
+        items = json.loads(json_str, strict=False)
         if isinstance(items, list):
             return items
         return []
@@ -294,7 +297,7 @@ async def ingest_to_wiki(
 6. 更新 index.md：已有页面只更新摘要，新页面追加到合适分类
 7. 如果已有页面需要更新，输出完整的页面 Markdown 内容（含更新后的 frontmatter）
 
-## 输出 JSON
+只输出 JSON，不要输出其他内容。格式：
 {{
   "updates": [
     {{
@@ -320,9 +323,14 @@ async def ingest_to_wiki(
     m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
     if m:
         json_str = m.group(1).strip()
+    else:
+        # Try to find JSON object directly in the text
+        m2 = re.search(r"\{.*\}", json_str, re.DOTALL)
+        if m2:
+            json_str = m2.group(0)
 
     try:
-        plan = json.loads(json_str)
+        plan = json.loads(json_str, strict=False)
         if isinstance(plan, dict):
             return plan
     except json.JSONDecodeError:
@@ -354,6 +362,21 @@ def apply_wiki_updates(wiki_dir: Path, plan: dict) -> list[str]:
 
         if not filepath or not content:
             continue
+
+        # Skip if content doesn't look like proper page content (not starting with --- or #)
+        stripped_content = content.strip()
+        if not stripped_content.startswith("---") and not stripped_content.startswith("#"):
+            # The LLM sometimes outputs a diff or description instead of full page content
+            # For "update" actions, we need to skip these since we can't apply them
+            if action == "update":
+                existing_path = wiki_dir / filepath
+                if existing_path.exists():
+                    logger.info("Skipping update for %s: content is not a full page, keeping existing", filepath)
+                    continue
+                else:
+                    # No existing page, can't create from a diff - skip
+                    logger.info("Skipping create for %s: content is not a full page", filepath)
+                    continue
 
         # Ensure frontmatter has updated date
         if f"updated:" in content:
@@ -513,7 +536,9 @@ async def ingest_agent_tasks(
         task = app_state.get_task(tid)
         if not task:
             continue
-        status = str(getattr(task, "status", ""))
+        status = getattr(task, "status", None)
+        if status is not None:
+            status = status.value if hasattr(status, "value") else str(status)
         if status != "success":
             skipped += 1
             continue
