@@ -36,95 +36,126 @@ def _truncate(text: str, max_chars: int = 3000) -> str:
 # ── Message formatters ─────────────────────────────────────────────────────────
 
 def format_update_summary(results: list[dict], date: str) -> str:
-    """Format a change-summary card for existing wiki updates.
+    """Format a change-summary card for wiki ingest digest.
 
-    Used when a wiki already had pages and only received updates.
+    Groups tasks by agent (not wiki), lists all date-matching tasks with status,
+    and attaches page summaries inline under each task.
     """
-    lines = [f"**📋 Wiki Digest — {date}**\n"]
+    lines = [f"📋 wiki digest - {date}\n"]
 
     total_processed = 0
-    total_skipped = 0
+    total_skipped_incomplete = 0
+    total_skipped_already_ingested = 0
     total_errors = 0
-    # Aggregate stats across all wikis
     total_extract_success = 0
     total_extract_all_failed = 0
     total_extract_retry_used = 0
+    total_date_tasks = 0  # all tasks matching the date (including ineligible)
 
+    # ── Per-agent grouped display ─────────────────────────────────────────
     for result in results:
-        wiki = result.get("wiki", "unknown")
-        processed = result.get("tasks_processed", 0)
-        skipped = result.get("tasks_skipped", 0)
-        total_processed += processed
-        total_skipped += skipped
+        agent_id = result.get("agent_id", "")
+        agent_name = result.get("agent_name", agent_id)
 
-        # Collect per-agent stats
+        if "error" in result:
+            total_errors += 1
+            lines.append(f"**{agent_name}** ❌ {result['error']}\n")
+            continue
+
+        if result.get("reason"):
+            lines.append(f"**{agent_name}** — {result['reason']}\n")
+            continue
+
+        all_date_tasks = result.get("all_date_tasks", [])
+        task_results = result.get("results", [])
+        page_actions = result.get("page_actions", [])
+
+        # Build a lookup: task_id -> result entry
+        result_map = {}
+        for r in task_results:
+            result_map[r.get("task_id", "")] = r
+
+        # Count total date-matching tasks for this agent
+        n_date_tasks = len(all_date_tasks)
+        if n_date_tasks == 0:
+            # Skip agents with no date-matching tasks at all
+            continue
+
+        total_date_tasks += n_date_tasks
+
+        # Aggregate per-agent stats
+        processed = result.get("tasks_processed", 0)
+        total_processed += processed
+        total_skipped_incomplete += result.get("tasks_skipped_incomplete", 0)
+        total_skipped_already_ingested += result.get("tasks_skipped_already_ingested", 0)
+
         stats = result.get("stats", {})
         total_extract_success += stats.get("extract_success", 0)
         total_extract_all_failed += stats.get("extract_all_failed", 0)
         total_extract_retry_used += stats.get("extract_retry_used", 0)
 
-        if "error" in result:
-            total_errors += 1
-            lines.append(f"**{wiki}** ❌ {result['error']}\n")
-            continue
+        lines.append(f"**{agent_name}**（{n_date_tasks} 个任务）")
 
-        if result.get("reason"):
-            lines.append(f"**{wiki}** — {result['reason']}\n")
-            continue
+        for dt in all_date_tasks:
+            tid = dt.get("task_id", "")
+            name = dt.get("task_name", tid or "?")
+            r = result_map.get(tid)
 
-        if processed == 0:
-            lines.append(f"**{wiki}** — 无新任务\n")
-            continue
+            if r is None:
+                if dt.get("already_ingested"):
+                    lines.append(f"  - {name}: 已提取过")
+                else:
+                    status = dt.get("status", "unknown")
+                    lines.append(f"  - {name}: {status}")
+                continue
 
-        lines.append(f"**{wiki}** ({processed} task{'s' if processed != 1 else ''})")
-
-        for r in result.get("results", []):
-            name = r.get("task_name", r.get("task_id", "?"))
+            # This task was actually processed
+            error = r.get("error")
             updates = r.get("updates", 0)
             files = r.get("files", [])
-            error = r.get("error")
             if error:
                 total_errors += 1
-                lines.append(f"  - ✗ {name}: {error}")
+                lines.append(f"  - {name}: {error}")
             elif updates > 0:
                 file_names = [Path(f).stem for f in files]
-                lines.append(f"  - ✓ {name}: {updates} update(s) ({', '.join(file_names)})")
+                lines.append(f"  - {name}: {updates} 项更新（{', '.join(file_names)}）")
             else:
-                lines.append(f"  - ○ {name}: no knowledge extracted")
+                lines.append(f"  - {name}: 未提取到有用知识")
 
-        # List created / updated pages with summaries
-        page_actions = result.get("page_actions", [])
-        if page_actions:
-            created = [p for p in page_actions if p.get("action") == "create"]
-            updated = [p for p in page_actions if p.get("action") == "update"]
-            if created:
-                lines.append("  新增页面:")
-                for p in created:
-                    title = p.get("title", Path(p.get("file", "")).stem)
-                    summary = p.get("summary", "")
-                    line = f"    + {title}"
-                    if summary:
-                        line += f" — {summary}"
-                    lines.append(line)
-            if updated:
-                lines.append("  更新页面:")
-                for p in updated:
-                    title = p.get("title", Path(p.get("file", "")).stem)
-                    summary = p.get("summary", "")
-                    line = f"    ~ {title}"
-                    if summary:
-                        line += f" — {summary}"
-                    lines.append(line)
+            # Inline page summaries for this task
+            task_pages = r.get("page_actions", [])
+            for p in task_pages:
+                title = p.get("title", Path(p.get("file", "")).stem)
+                summary = p.get("summary", "")
+                line = f"    + {title}"
+                if summary:
+                    line += f" — {summary}"
+                lines.append(line)
 
-        lines.append("")  # blank line between wikis
+        lines.append("")  # blank line between agents
 
-    # Stats line
-    if total_extract_all_failed or total_extract_retry_used:
-        total_extracted = total_extract_success + total_extract_all_failed
-        lines.append(f"**提取统计**: {total_extracted} 个任务，成功 {total_extract_success}，失败 {total_extract_all_failed}，重试 {total_extract_retry_used} 次")
-    lines.append("")  # blank line before summary
+    # ── Statistics ──────────────────────────────────────────────────────
+    extract_total = total_extract_success + total_extract_all_failed
+    if extract_total > 0:
+        lines.append(
+            f"提取统计：共提取 {extract_total} 个任务，提取到知识 {total_extract_success}，"
+            f"未提取到知识 {total_extract_all_failed}，重试 {total_extract_retry_used} 次"
+        )
+        lines.append("")
 
-    lines.append(f"**汇总**: {total_processed} processed, {total_skipped} skipped, {total_errors} errors")
+    # Summary line
+    date_scope = total_date_tasks
+    reason_parts = []
+    if total_skipped_incomplete:
+        reason_parts.append(f"{total_skipped_incomplete} 个未启动状态")
+    if total_skipped_already_ingested:
+        reason_parts.append(f"{total_skipped_already_ingested} 个已提取过")
+    reason_str = "，".join(reason_parts) if reason_parts else "0"
+    lines.append(
+        f"汇总：本轮扫描 {date_scope} 个任务（{date} 范围），处理 {total_processed} 个"
+        f"（提取成功 {total_extract_success}，未提取到知识 {total_extract_all_failed}），"
+        f"跳过 {date_scope - total_processed} 个（{reason_str}）"
+    )
 
     return "\n".join(lines)
 
@@ -253,33 +284,18 @@ async def send_wiki_digest(feishu_cfg: dict, results: list[dict], date: str) -> 
 
     all_ok = True
 
-    # Separate results into new-wiki and existing-wiki groups
-    existing_wiki_results: list[dict] = []
-    new_wiki_results: list[dict] = []
+    # All results go through the unified summary
+    summary_msg = format_update_summary(results, date)
+    all_ok = await send_feishu_card(feishu_cfg, summary_msg)
+    if not all_ok:
+        return False
 
+    # Additionally, send per-page cards for new wikis with content
     for result in results:
-        if "error" in result or result.get("reason") or result.get("tasks_processed", 0) == 0:
-            # Errors/skips/empty go into summary
-            existing_wiki_results.append(result)
+        if "error" in result or result.get("reason"):
             continue
-
-        # New-wiki results only go down the per-page path when they can
-        # actually generate at least one page card. Otherwise they must be
-        # summarized so failures are still surfaced to operators.
-        if _wiki_is_new(result) and _has_creatable_new_pages(result):
-            new_wiki_results.append(result)
-        else:
-            existing_wiki_results.append(result)
-
-    # Send update summary for existing wikis (one card)
-    if existing_wiki_results:
-        summary_msg = format_update_summary(existing_wiki_results, date)
-        ok = await send_feishu_card(feishu_cfg, summary_msg)
-        if not ok:
-            all_ok = False
-
-    # Send one card per new page for new wikis
-    for result in new_wiki_results:
+        if not _wiki_is_new(result) or not _has_creatable_new_pages(result):
+            continue
         wiki_name = result.get("wiki", "unknown")
         page_actions = result.get("page_actions", [])
         cards = format_new_wiki_pages(wiki_name, page_actions, date)

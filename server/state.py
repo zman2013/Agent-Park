@@ -270,7 +270,13 @@ class AppState:
         self.save_agents()
 
     def ordered_agent_ids(self) -> list[str]:
-        return [aid for aid in self._agent_order if aid in self.agents]
+        seen: set[str] = set()
+        result: list[str] = []
+        for aid in self._agent_order:
+            if aid in self.agents and aid not in seen:
+                seen.add(aid)
+                result.append(aid)
+        return result
 
     def snapshot(self, sessions: dict[str, str] | None = None) -> dict:
         ordered = [self.agents[aid] for aid in self.ordered_agent_ids()]
