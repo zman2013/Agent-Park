@@ -203,7 +203,6 @@ async def _run_daily_wiki_ingest(date: str) -> None:
         logger.info("Wiki ingest: agent=%s wiki=%s date=%s", agent_id, wiki_name, date)
         try:
             result = await ingest_agent_tasks(agent_id, target_date=date)
-            result["agent_id"] = agent_id
             all_results.append(result)
             logger.info(
                 "Wiki ingest done: agent=%s wiki=%s processed=%d skipped=%d",

@@ -155,6 +155,30 @@ def ensure_wiki_structure(wiki_dir: Path, wiki_name: str) -> None:
 
 # ── LLM calls ──────────────────────────────────────────────────────────────────
 
+
+def _fix_json_newlines(json_str: str) -> str:
+    """Fix unescaped newlines inside JSON string values.
+
+    LLMs often output real newlines inside JSON strings instead of \n.
+    This function uses a state-machine approach: scan for string values
+    (between quotes) and replace real newlines with literal \n.
+    """
+    result = []
+    i = 0
+    in_string = False
+    while i < len(json_str):
+        ch = json_str[i]
+        if ch == '"' and (i == 0 or json_str[i - 1] != '\\'):
+            in_string = not in_string
+            result.append(ch)
+        elif ch == '\n' and in_string:
+            result.append('\\n')
+        else:
+            result.append(ch)
+        i += 1
+    return "".join(result)
+
+
 async def _llm_call(command: str, prompt: str, timeout: int = 300) -> str:
     """Call an LLM command with -p flag, return result text."""
     try:
@@ -216,10 +240,12 @@ async def _try_extract_knowledge_with_retry(
 只输出 JSON 数组，不要输出其他内容。如果无值得沉淀的知识，输出 []。每个元素格式：
 {{
   "title": "知识点标题",
-  "content": "详细内容（Markdown 格式）",
+  "content": "详细内容（Markdown 格式，用 \\n 换行，不要出现真实换行符）",
   "tags": ["建议的标签"],
   "category": "建议的分类"
-}}"""
+}}
+
+重要：content 字段必须为单行字符串，用 \\n 表示换行，不要出现真实换行符。"""
 
     retry_commands = retry_commands or RETRY_COMMANDS
 
@@ -234,24 +260,50 @@ async def _try_extract_knowledge_with_retry(
             log_entries.append(f"  {label}: empty/timeout")
             continue
 
-        # Try to parse JSON
+        # Try to parse JSON — use robust extraction
         json_str = result.strip()
-        m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
+
+        # 1. Try to extract from markdown code block
+        #    Use first ``` marker + last ``` marker to handle nested code fences
+        m = re.search(r"```(?:json)?\s*\n", json_str)
         if m:
-            json_str = m.group(1).strip()
+            start = m.end()
+            # Find closing ``` by scanning from end of string (handles nested fences)
+            end = json_str.rfind("```", start)
+            # Check if found ``` is on its own line (proper closing fence)
+            while end > start:
+                # Check if line before ``` is empty or whitespace only
+                before = json_str[start:end].rstrip()
+                line_before = before.rsplit("\n", 1)[-1]
+                if line_before.strip() == "" or not line_before.strip().startswith("```"):
+                    break  # proper closing
+                end = json_str.rfind("```", start, end)
+            if end > start:
+                json_str = json_str[start:end].strip()
+            else:
+                json_str = json_str[start:].strip()
+
+        # 2. Fix unescaped newlines in string values
+        json_str = _fix_json_newlines(json_str)
+
+        # 3. Try to find JSON object or array
+        if json_str.startswith("["):
+            m2 = re.search(r"\[[\s\S]*\]", json_str)
+            candidate = m2.group(0) if m2 else json_str
+        elif json_str.startswith("{"):
+            m2 = re.search(r"\{[\s\S]*\}", json_str)
+            candidate = m2.group(0) if m2 else json_str
         else:
-            m2 = re.search(r"\[.*\]", json_str, re.DOTALL)
-            if m2:
-                json_str = m2.group(0)
+            candidate = json_str
 
         try:
-            items = json.loads(json_str, strict=False)
+            items = json.loads(candidate, strict=False)
             if isinstance(items, list):
                 log_entries.append(f"  {label}: {len(items)} item(s)")
                 return items, log_entries
             log_entries.append(f"  {label}: not a list")
-        except json.JSONDecodeError:
-            log_entries.append(f"  {label}: JSON parse failed")
+        except json.JSONDecodeError as e:
+            log_entries.append(f"  {label}: JSON parse failed (pos {e.pos}: {e.msg})")
 
     log_entries.append("  all attempts failed")
     return [], log_entries
@@ -301,7 +353,9 @@ async def enrich_knowledge_summaries(
 {{
   "summary": "...",
   "overview": "..."
-}}"""
+}}
+
+重要：summary 和 overview 字段必须为单行字符串，用 \\n 表示换行，不要出现真实换行符。"""
 
     result = await _llm_call(command, prompt, timeout=timeout)
     if not result:
@@ -317,15 +371,14 @@ async def enrich_knowledge_summaries(
         if m2:
             json_str = m2.group(0)
 
-    try:
-        items = json.loads(json_str, strict=False)
-        if isinstance(items, list) and len(items) == len(knowledge_points):
-            for kp, summary in zip(knowledge_points, items):
-                if isinstance(summary, dict):
-                    kp["summary"] = summary.get("summary", "")
-                    kp["overview"] = summary.get("overview", "")
-            return knowledge_points
-    except json.JSONDecodeError:
+    items = _parse_json_from_llm_output(result)
+    if isinstance(items, list) and len(items) == len(knowledge_points):
+        for kp, summary in zip(knowledge_points, items):
+            if isinstance(summary, dict):
+                kp["summary"] = summary.get("summary", "")
+                kp["overview"] = summary.get("overview", "")
+        return knowledge_points
+    if not isinstance(items, list):
         logger.warning("Failed to parse summary enrichment result as JSON")
 
     return knowledge_points
@@ -340,7 +393,9 @@ async def ingest_to_wiki(
 ) -> dict:
     """Second LLM call: merge knowledge points into wiki.
 
-    Returns the LLM's plan dict with updates and log_entry.
+    Split into two phases for reliability:
+    1. Decision phase: lightweight JSON — which files to create/update + metadata
+    2. Content generation phase: one LLM call per new/updated page
     """
     # Read current index
     index_path = wiki_dir / "index.md"
@@ -391,7 +446,9 @@ async def ingest_to_wiki(
 
     knowledge_json = json.dumps(knowledge_points, ensure_ascii=False, indent=2)
 
-    prompt = f"""你是一个 wiki 维护者。将以下知识点合并到 wiki 中。
+    # ── Phase 1: Decision — lightweight plan (no page content) ──
+    decision_prompt = f"""你是一个 JSON-only 输出引擎。将以下知识点合并到 wiki 中。**禁止输出任何解释性文字、表格、Markdown 格式。**
+只输出合法的 JSON 对象，不要输出其他任何内容。
 
 ## 当前 wiki 页面索引
 {index_content}
@@ -406,54 +463,292 @@ async def ingest_to_wiki(
 1. 优先合并到已有页面（如果主题匹配）
 2. 只有全新主题才创建新页面
 3. 文件名用 kebab-case
-4. 每个页面必须有 YAML frontmatter（title, summary, overview, tags, sources, created, updated）
-5. summary 是一句话摘要（≤50字），用于快速判断页面是否相关
-6. overview 是结构化概览（200-500字），描述页面的覆盖范围和适用场景
-7. 标签从已有标签中选择，确需新标签时说明
-8. 更新 index.md：已有页面只更新摘要，新页面追加到合适分类
-9. 如果已有页面需要更新，输出完整的页面 Markdown 内容（含更新后的 frontmatter）
+4. summary 是一句话摘要（≤50字）
+5. overview 是结构化概览（200-500字）
 
-只输出 JSON，不要输出其他内容。格式：
+输出格式：
 {{
-  "updates": [
+  "plan": [
     {{
       "action": "update" | "create",
       "file": "pages/xxx.md",
       "title": "页面标题",
-      "summary": "一句话摘要（≤50字）",
-      "overview": "结构化概览（200-500字）",
-      "content": "完整的页面 Markdown 内容（含 frontmatter）",
+      "summary": "一句话摘要",
+      "overview": "结构化概览",
       "tags": ["tag1", "tag2"],
       "category": "分类名称"
     }}
   ],
-  "index_md": "完整的 index.md 内容（更新后）",
   "log_entry": "log.md 追加内容"
-}}"""
+}}
 
-    result = await _llm_call(command, prompt, timeout=timeout)
+重要：所有字符串必须为单行，用 \\n 表示换行，不要出现真实换行符。"""
+
+    result = await _llm_call(command, prompt=decision_prompt, timeout=timeout)
     if not result:
         return {"updates": [], "log_entry": ""}
 
-    # Parse JSON from result
-    json_str = result.strip()
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
+    # Parse decision JSON
+    plan_data = _parse_json_from_llm_output(result)
+    if not plan_data or not isinstance(plan_data, dict):
+        logger.warning("Failed to parse wiki ingest decision plan as JSON")
+        return {"updates": [], "log_entry": ""}
+
+    plan_items = plan_data.get("plan", [])
+    log_entry = plan_data.get("log_entry", "")
+    if not isinstance(plan_items, list):
+        return {"updates": [], "log_entry": ""}
+
+    # ── Phase 2: Generate content for each page ──
+    updates = []
+    for item in plan_items:
+        filepath = item.get("file", "")
+        action = item.get("action", "create")
+        title = item.get("title", "")
+        summary = item.get("summary", "")
+        overview = item.get("overview", "")
+        tags = item.get("tags", [])
+        category = item.get("category", "")
+
+        if not filepath or not title:
+            continue
+
+        # Read existing page content for update
+        existing_content = ""
+        if action == "update":
+            try:
+                existing_path = _safe_wiki_path(wiki_dir, filepath)
+                if existing_path.exists():
+                    existing_content = existing_path.read_text(encoding="utf-8")
+            except Exception:
+                pass
+
+        # Generate page content
+        content = await _generate_page_content(
+            knowledge_points=knowledge_points,
+            item=item,
+            existing_content=existing_content,
+            command=command,
+            timeout=timeout,
+        )
+
+        if content:
+            updates.append({
+                "action": action,
+                "file": filepath,
+                "title": title,
+                "summary": summary,
+                "overview": overview,
+                "content": content,
+                "tags": tags,
+                "category": category,
+            })
+
+    # ── Phase 3: Generate updated index.md ──
+    index_md = await _generate_index(
+        wiki_dir=wiki_dir,
+        wiki_name=wiki_name,
+        updates=updates,
+        command=command,
+        timeout=timeout,
+    )
+
+    return {"updates": updates, "index_md": index_md, "log_entry": log_entry}
+
+
+def _parse_json_from_llm_output(text: str) -> dict | list | None:
+    """Robust JSON extraction from LLM output."""
+    json_str = text.strip()
+
+    # 1. Try markdown code block — use the full match to include ``` fences
+    m = re.search(r"```(?:json)?\s*\n?", json_str)
     if m:
-        json_str = m.group(1).strip()
-    else:
-        # Try to find JSON object directly in the text
-        m2 = re.search(r"\{.*\}", json_str, re.DOTALL)
+        # Find the content after ```json... marker, then find the last ```
+        start = m.end()
+        end = json_str.rfind("```", start)
+        if end > start:
+            json_str = json_str[start:end].strip()
+        else:
+            json_str = json_str[start:].strip()
+
+    # 2. Fix unescaped newlines in string values
+    json_str = _fix_json_newlines(json_str)
+
+    # 3. Try to find JSON object or array
+    if json_str.startswith("{"):
+        m2 = re.search(r"\{[\s\S]*\}", json_str)
         if m2:
-            json_str = m2.group(0)
+            try:
+                return json.loads(m2.group(0), strict=False)
+            except json.JSONDecodeError:
+                pass
+    elif json_str.startswith("["):
+        m2 = re.search(r"\[[\s\S]*\]", json_str)
+        if m2:
+            try:
+                return json.loads(m2.group(0), strict=False)
+            except json.JSONDecodeError:
+                pass
+    else:
+        # Try both patterns
+        m2 = re.search(r"\{[\s\S]*\}", json_str)
+        if not m2:
+            m2 = re.search(r"\[[\s\S]*\]", json_str)
+        if m2:
+            try:
+                return json.loads(m2.group(0), strict=False)
+            except json.JSONDecodeError:
+                pass
 
-    try:
-        plan = json.loads(json_str, strict=False)
-        if isinstance(plan, dict):
-            return plan
-    except json.JSONDecodeError:
-        logger.warning("Failed to parse wiki ingest plan as JSON")
+    return None
 
-    return {"updates": [], "log_entry": ""}
+
+async def _generate_page_content(
+    knowledge_points: list[dict],
+    item: dict,
+    existing_content: str,
+    command: str,
+    timeout: int,
+) -> str:
+    """Generate full markdown content for a single wiki page."""
+    action = item.get("action", "create")
+    filepath = item.get("file", "")
+    title = item.get("title", "")
+    summary = item.get("summary", "")
+    overview = item.get("overview", "")
+    tags = item.get("tags", [])
+
+    kp_json = json.dumps(knowledge_points, ensure_ascii=False, indent=2)
+
+    if action == "update" and existing_content:
+        prompt = f"""你是一个 wiki 页面维护者。更新已有页面，合并新知识点。
+
+## 待合并的知识点
+{kp_json}
+
+## 当前页面内容
+{existing_content}
+
+## 要求
+1. 保留已有内容中有价值的部分
+2. 将相关知识点自然地融入页面
+3. 更新 frontmatter 中的 summary 和 overview
+4. 输出完整的更新后页面（不只是 diff）
+
+只输出完整的页面 Markdown 内容，不要其他内容。**直接以 --- 开头（YAML frontmatter），不要有任何前导文字。**"""
+    else:
+        prompt = f"""你是一个 wiki 页面创建者。根据以下知识点创建一个新页面。
+
+## 知识点
+{kp_json}
+
+## 页面元信息
+- 标题: {title}
+- 文件: {filepath}
+- 摘要: {summary}
+- 概览: {overview}
+- 标签: {", ".join(tags)}
+
+## 要求
+1. 创建完整的 Markdown 页面
+2. 必须有 YAML frontmatter（title, summary, overview, tags, sources, created, updated）
+3. 正文内容要结构清晰
+
+只输出页面 Markdown 内容，不要其他内容。以 --- 开头（YAML frontmatter）。"""
+
+    result = await _llm_call(command, prompt=prompt, timeout=timeout)
+    if not result:
+        return ""
+
+    # Strip leading conversational text — LLMs often add analysis before the actual content.
+    # Find the first line starting with "---" (frontmatter) or "#" (heading).
+    stripped = result.strip()
+    for line in stripped.split("\n"):
+        if line.startswith("---") or line.startswith("#"):
+            stripped = stripped[stripped.index(line):]
+            break
+    else:
+        # No valid markdown start found
+        logger.warning("Page content for %s doesn't look like markdown", filepath)
+        return ""
+
+    if not stripped.startswith("---") and not stripped.startswith("#"):
+        logger.warning("Page content for %s doesn't look like markdown", filepath)
+        return ""
+
+    return stripped
+
+
+async def _generate_index(
+    wiki_dir: Path,
+    wiki_name: str,
+    updates: list[dict],
+    command: str,
+    timeout: int,
+) -> str:
+    """Generate updated index.md content."""
+    # Build list of all pages for context
+    pages_dir = wiki_dir / "pages"
+    page_list = []
+
+    # Pages from updates (with their new summaries)
+    for u in updates:
+        page_list.append({
+            "file": u["file"],
+            "title": u.get("title", ""),
+            "summary": u.get("summary", ""),
+            "category": u.get("category", ""),
+        })
+
+    # Existing pages not in updates
+    updated_files = {u["file"] for u in updates}
+    if pages_dir.exists():
+        for p in sorted(pages_dir.glob("*.md")):
+            fpath = f"pages/{p.name}"
+            if fpath not in updated_files:
+                title = p.stem
+                summary = ""
+                try:
+                    text = p.read_text(encoding="utf-8")
+                    m_title = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
+                    if m_title:
+                        title = m_title.group(1).strip()
+                    m_summary = re.search(r'^summary:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
+                    if m_summary:
+                        summary = m_summary.group(1).strip()
+                except Exception:
+                    pass
+                page_list.append({
+                    "file": fpath,
+                    "title": title,
+                    "summary": summary,
+                    "category": "",
+                })
+
+    if not page_list:
+        return ""
+
+    page_json = json.dumps(page_list, ensure_ascii=False, indent=2)
+
+    prompt = f"""你是 wiki 索引维护者。根据以下页面列表生成 index.md。
+
+## 页面列表
+{page_json}
+
+## 要求
+1. 按分类组织页面
+2. 每个条目包含：文件名、标题、一句话摘要
+3. 输出完整的 index.md Markdown 内容
+
+只输出 index.md 内容，不要其他内容。"""
+
+    result = await _llm_call(command, prompt=prompt, timeout=timeout)
+    if not result:
+        return ""
+
+    stripped = result.strip()
+    # Return whatever the LLM gives us for index (less strict validation)
+    return stripped if stripped else ""
 
 
 # ── File writing ────────────────────────────────────────────────────────────────
@@ -662,9 +957,12 @@ async def ingest_agent_tasks(
     # Load ingested tasks
     ingested = load_ingested(wiki_dir)
 
-    # Collect eligible tasks
+    # Collect all date-matching tasks with their status for the digest
+    all_date_tasks: list[dict] = []
     eligible_tasks = []
-    skipped = 0
+    skipped_incomplete = 0  # idle/running/waiting — not yet finished
+    skipped_already_ingested = 0
+    skipped_date_mismatch = 0
     for tid in agent.task_ids:
         task = app_state.get_task(tid)
         if not task:
@@ -672,19 +970,22 @@ async def ingest_agent_tasks(
         status = getattr(task, "status", None)
         if status is not None:
             status = status.value if hasattr(status, "value") else str(status)
-        if status != "success":
-            skipped += 1
+        # Filter by date first so all counters are date-scoped
+        updated_at = getattr(task, "updated_at", "")
+        if target_date and not updated_at.startswith(target_date):
+            skipped_date_mismatch += 1
+            continue
+        # Record task status for digest
+        if status not in ("success", "failed"):
+            skipped_incomplete += 1
+            all_date_tasks.append({"task_id": tid, "task_name": getattr(task, "name", ""), "status": status})
             continue
         # Skip already ingested
         if tid in ingested:
-            skipped += 1
+            skipped_already_ingested += 1
+            all_date_tasks.append({"task_id": tid, "task_name": getattr(task, "name", ""), "status": status, "already_ingested": True})
             continue
-        # Filter by date if specified
-        if target_date:
-            updated_at = getattr(task, "updated_at", "")
-            if not updated_at.startswith(target_date):
-                skipped += 1
-                continue
+        all_date_tasks.append({"task_id": tid, "task_name": getattr(task, "name", ""), "status": status})
         eligible_tasks.append(task)
 
     results = []
@@ -719,14 +1020,12 @@ async def ingest_agent_tasks(
             all_page_actions.append(pa)
 
     # Aggregate statistics from extract_attempts
-    extract_total = 0
     extract_success = 0
     extract_all_failed = 0
     extract_retry_used = 0
     for r in results:
         attempts = r.get("extract_attempts", [])
         if attempts:
-            extract_total += 1
             extracted_flag = r.get("extracted", True)
             if extracted_flag:
                 extract_success += 1
@@ -734,11 +1033,17 @@ async def ingest_agent_tasks(
                     extract_retry_used += 1
             else:
                 extract_all_failed += 1
+    extract_total = extract_success + extract_all_failed
 
     return {
         "wiki": wiki_name,
+        "agent_id": agent_id,
+        "agent_name": getattr(agent, "name", agent_id),
         "tasks_processed": len(results),
-        "tasks_skipped": skipped,
+        "tasks_skipped_incomplete": skipped_incomplete,  # idle/running/waiting
+        "tasks_skipped_already_ingested": skipped_already_ingested,
+        "tasks_skipped_date_mismatch": skipped_date_mismatch,
+        "all_date_tasks": all_date_tasks,
         "results": results,
         "page_actions": all_page_actions,
         "is_new_wiki": not had_existing_pages,
