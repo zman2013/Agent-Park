@@ -31,6 +31,14 @@ export const useAgentStore = defineStore('agent', () => {
   const MAX_RECENT_PER_AGENT = 20
   const recentFiles = ref(JSON.parse(localStorage.getItem(RECENT_FILES_KEY) || '{}'))
 
+  function removeRecentFile(agentId, filePath) {
+    const list = recentFiles.value[agentId]
+    if (!list) return
+    const idx = list.findIndex(f => f.path === filePath)
+    if (idx !== -1) list.splice(idx, 1)
+    localStorage.setItem(RECENT_FILES_KEY, JSON.stringify(recentFiles.value))
+  }
+
   function addRecentFile(agentId, filePath) {
     if (!recentFiles.value[agentId]) recentFiles.value[agentId] = []
     const list = recentFiles.value[agentId]
@@ -466,6 +474,7 @@ export const useAgentStore = defineStore('agent', () => {
     recentFiles,
     addRecentFile,
     getRecentFiles,
+    removeRecentFile,
     syncState,
     updateTaskStatus,
     addMessage,

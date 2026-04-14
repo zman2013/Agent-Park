@@ -29,3 +29,10 @@ bash run.sh status   # 查看运行状态
 ```bash
 bash run.sh restart
 ```
+
+## 临时文件规则
+
+- **禁止在项目根目录或 docs/ 下创建临时目录/文件**（如 `pages/`、`docs/wiki/`、`wiki-merge/`、`*.json` 中间产物等）
+- 所有临时工作目录和中间产物统一输出到 `out/` 目录
+- `out/` 已在 `.gitignore` 中，不会被 git 追踪
+- wiki ingest 的实际写入目标是 `/data1/common/wiki/{wiki_name}/`，不是 `docs/wiki/`
