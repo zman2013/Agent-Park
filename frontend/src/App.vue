@@ -18,7 +18,7 @@
       v-if="leftVisible"
       class="w-1 flex-shrink-0 cursor-col-resize hover:bg-blue-500/40 active:bg-blue-500/60 transition-colors"
       style="margin-left: -1px; z-index: 10;"
-      @mousedown.prevent="leftVisible && rightVisible ? startBothDrag($event) : startLeftDrag($event)"
+      @mousedown.prevent="startLeftDrag($event)"
     />
 
     <!-- Center Panel -->
@@ -60,7 +60,7 @@
       v-if="rightVisible"
       class="w-1 flex-shrink-0 cursor-col-resize hover:bg-blue-500/40 active:bg-blue-500/60 transition-colors"
       style="margin-left: -1px; z-index: 10;"
-      @mousedown.prevent="leftVisible ? startBothDrag($event) : startRightDrag($event)"
+      @mousedown.prevent="startRightDrag($event)"
     />
 
     <!-- Right Panel (File Browser) -->
@@ -148,16 +148,15 @@ function saveRightWidth() {
   localStorage.setItem(RIGHT_WIDTH_KEY, String(rightWidth.value))
 }
 
-// ── Drag state (supports left-only, right-only, or both) ─────────────────────
-let dragging = 'none'  // 'none' | 'left' | 'right' | 'both'
+// ── Drag state ───────────────────────────────────────────────────────────────
+let dragging = 'none'  // 'none' | 'left' | 'right'
 let dragStartX = 0
-let dragStartLeft = 0
-let dragStartRight = 0
+let dragStartDelta = 0
 
 function startLeftDrag(e) {
   dragging = 'left'
   dragStartX = e.clientX
-  dragStartLeft = leftWidth.value
+  dragStartDelta = leftWidth.value
   document.body.style.cursor = 'col-resize'
   document.body.style.userSelect = 'none'
 }
@@ -165,16 +164,7 @@ function startLeftDrag(e) {
 function startRightDrag(e) {
   dragging = 'right'
   dragStartX = e.clientX
-  dragStartRight = rightWidth.value
-  document.body.style.cursor = 'col-resize'
-  document.body.style.userSelect = 'none'
-}
-
-function startBothDrag(e) {
-  dragging = 'both'
-  dragStartX = e.clientX
-  dragStartLeft = leftWidth.value
-  dragStartRight = rightWidth.value
+  dragStartDelta = rightWidth.value
   document.body.style.cursor = 'col-resize'
   document.body.style.userSelect = 'none'
 }
@@ -182,18 +172,18 @@ function startBothDrag(e) {
 function onDrag(e) {
   if (dragging === 'none') return
   const delta = e.clientX - dragStartX
-  if (dragging === 'left' || dragging === 'both') {
-    leftWidth.value = Math.min(LEFT_MAX, Math.max(LEFT_MIN, dragStartLeft + delta))
+  if (dragging === 'left') {
+    leftWidth.value = Math.min(LEFT_MAX, Math.max(LEFT_MIN, dragStartDelta + delta))
   }
-  if (dragging === 'right' || dragging === 'both') {
-    rightWidth.value = Math.min(RIGHT_MAX, Math.max(RIGHT_MIN, dragStartRight - delta))
+  if (dragging === 'right') {
+    rightWidth.value = Math.min(RIGHT_MAX, Math.max(RIGHT_MIN, dragStartDelta - delta))
   }
 }
 
 function stopDrag() {
   if (dragging === 'none') return
-  const wasLeft = dragging === 'left' || dragging === 'both'
-  const wasRight = dragging === 'right' || dragging === 'both'
+  const wasLeft = dragging === 'left'
+  const wasRight = dragging === 'right'
   dragging = 'none'
   document.body.style.cursor = ''
   document.body.style.userSelect = ''

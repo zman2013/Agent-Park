@@ -185,7 +185,6 @@ watch(
     loadError.value = ''
     showLargeConfirm.value = false
     isBinary.value = false
-    wordWrap.value = false
     loadContent()
   },
   { immediate: true }
