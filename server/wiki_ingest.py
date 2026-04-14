@@ -286,7 +286,8 @@ async def _try_extract_knowledge_with_retry(
         # 2. Fix unescaped newlines in string values
         json_str = _fix_json_newlines(json_str)
 
-        # 3. Try to find JSON object or array
+        # 3. Try to find JSON object or array (including prose prefix like
+        #    "Here is the JSON: [...]")
         if json_str.startswith("["):
             m2 = re.search(r"\[[\s\S]*\]", json_str)
             candidate = m2.group(0) if m2 else json_str
@@ -294,7 +295,10 @@ async def _try_extract_knowledge_with_retry(
             m2 = re.search(r"\{[\s\S]*\}", json_str)
             candidate = m2.group(0) if m2 else json_str
         else:
-            candidate = json_str
+            m2 = re.search(r"\[[\s\S]*\]", json_str)
+            if not m2:
+                m2 = re.search(r"\{[\s\S]*\}", json_str)
+            candidate = m2.group(0) if m2 else json_str
 
         try:
             items = json.loads(candidate, strict=False)
