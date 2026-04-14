@@ -67,7 +67,7 @@
     <div v-if="rightVisible" class="flex-shrink-0 bg-[#111] border-l border-gray-800 flex flex-col h-full overflow-hidden" :style="{ width: rightWidth + 'px' }">
       <div class="p-4 flex items-center justify-between flex-shrink-0">
         <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Files</span>
-        <button class="text-gray-600 hover:text-gray-300 transition-colors text-lg leading-none" @click="closeFileBrowser" title="Close">×</button>
+        <button class="text-gray-600 hover:text-gray-300 transition-colors text-lg leading-none" @click="toggleFileBrowser" title="Close">×</button>
       </div>
       <div class="flex-shrink-0 px-2">
         <UnseenTasksPanel />
@@ -217,12 +217,6 @@ const memoryAgentName = computed(() => {
   return agent?.name || ''
 })
 
-function closeFileBrowser() {
-  rightVisible.value = false
-  fileBrowserState.value.agentId = null
-  fileBrowserState.value.selectedFile = null
-  fileBrowserState.value.fileSize = 0
-}
 
 function toggleFileBrowser() {
   if (!rightVisible.value && !fileBrowserState.value.agentId) {
