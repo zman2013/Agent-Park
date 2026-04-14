@@ -225,6 +225,11 @@ function closeFileBrowser() {
 }
 
 function toggleFileBrowser() {
+  if (!rightVisible.value && !fileBrowserState.value.agentId) {
+    const agentId = currentAgentId.value
+    if (!agentId) return
+    fileBrowserState.value.agentId = agentId
+  }
   rightVisible.value = !rightVisible.value
 }
 
