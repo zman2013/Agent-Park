@@ -211,6 +211,7 @@ const commands = [
   { id: 'toggle-terminal', label: 'Toggle Terminal', shortcut: '⌘J', keywords: ['terminal', 'shell'] },
   { id: 'toggle-memory', label: 'Toggle Memory Panel', shortcut: '⌘K', keywords: ['memory', 'context'] },
   { id: 'toggle-prompts', label: 'Toggle Prompts Panel', shortcut: '⌘U', keywords: ['prompts'] },
+  { id: 'toggle-file-browser', label: 'Toggle File Browser', shortcut: '⌘L', keywords: ['files', 'explorer', 'browser', 'right'] },
   { id: 'go-to-task', label: 'Go to Task...', shortcut: '', keywords: ['task', 'switch', 'jump'] },
   { id: 'open-files', label: 'Open Files', shortcut: '', keywords: ['files', 'explorer', 'browser'] },
   { id: 'create-task', label: 'Create New Task', shortcut: '', keywords: ['new', 'task', 'create'] },
