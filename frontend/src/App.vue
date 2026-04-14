@@ -75,7 +75,7 @@
       <FileBrowserPanel
         :agent-id="fileBrowserState.agentId"
         :initial-path="fileBrowserState.selectedFile || ''"
-        @close="closeFileBrowser"
+        @close="toggleFileBrowser"
         @file-select="onFileSelect"
       />
     </div>
@@ -224,6 +224,10 @@ function closeFileBrowser() {
   fileBrowserState.value.fileSize = 0
 }
 
+function toggleFileBrowser() {
+  rightVisible.value = !rightVisible.value
+}
+
 function onFileSelect({ path, size }) {
   fileBrowserState.value.selectedFile = path
   fileBrowserState.value.fileSize = size
@@ -297,17 +301,7 @@ function onCommandExecute(commandId) {
       }
       break
     case 'toggle-file-browser': {
-      if (rightVisible.value) {
-        closeFileBrowser()
-      } else {
-        const agentId = currentAgentId.value
-        if (agentId) {
-          rightVisible.value = true
-          fileBrowserState.value.agentId = agentId
-          fileBrowserState.value.selectedFile = null
-          fileBrowserState.value.fileSize = 0
-        }
-      }
+      toggleFileBrowser()
       break
     }
     case 'open-files': {
@@ -389,17 +383,7 @@ function handleGlobalKeydown(e) {
   }
   if (e.metaKey && e.key === 'i') {
     e.preventDefault()
-    if (rightVisible.value) {
-      closeFileBrowser()
-    } else {
-      const agentId = currentAgentId.value
-      if (agentId) {
-        rightVisible.value = true
-        fileBrowserState.value.agentId = agentId
-        fileBrowserState.value.selectedFile = null
-        fileBrowserState.value.fileSize = 0
-      }
-    }
+    toggleFileBrowser()
   }
   if (e.key === 'Escape' && fileBrowserState.value.selectedFile) {
     fileBrowserState.value.selectedFile = null
