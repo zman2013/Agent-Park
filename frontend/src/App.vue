@@ -397,7 +397,7 @@ function handleGlobalKeydown(e) {
       store.openPromptsPanel()
     }
   }
-  if (e.metaKey && e.key === 'l') {
+  if (e.metaKey && e.key === 'i') {
     e.preventDefault()
     if (rightVisible.value) {
       closeFileBrowser()
