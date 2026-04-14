@@ -168,7 +168,20 @@ def _fix_json_newlines(json_str: str) -> str:
     in_string = False
     while i < len(json_str):
         ch = json_str[i]
-        if ch == '"' and (i == 0 or json_str[i - 1] != '\\'):
+        if ch == '"':
+            # A quote is escaped only when preceded by an odd number of
+            # consecutive backslashes.
+            backslash_count = 0
+            j = i - 1
+            while j >= 0 and json_str[j] == '\\':
+                backslash_count += 1
+                j -= 1
+
+            if backslash_count % 2 == 1:
+                result.append(ch)
+                i += 1
+                continue
+
             in_string = not in_string
             result.append(ch)
         elif ch == '\n' and in_string:
