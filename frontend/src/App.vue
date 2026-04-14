@@ -8,38 +8,20 @@
       WebSocket disconnected — reconnecting...
     </div>
 
-    <!-- Left Panel -->
-    <template v-if="leftVisible">
-      <template v-if="fileBrowserState.panelOpen">
-        <div
-          class="flex-shrink-0 bg-[#111] border-r border-gray-800 flex flex-col h-full overflow-hidden"
-          :style="{ width: leftWidth + 'px' }"
-        >
-          <div class="p-4 flex items-center justify-between flex-shrink-0">
-            <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Files</span>
-          </div>
-          <div class="flex-shrink-0 px-2">
-            <UnseenTasksPanel />
-          </div>
-          <FileBrowserPanel
-            :agent-id="fileBrowserState.agentId"
-            :initial-path="fileBrowserState.selectedFile || ''"
-            @close="closeFileBrowser"
-            @file-select="onFileSelect"
-          />
-        </div>
-      </template>
-      <AgentTree v-else class="flex-shrink-0" :style="{ width: leftWidth + 'px' }" />
+    <!-- Left Panel (AgentTree) -->
+    <div v-if="leftVisible" class="flex-shrink-0 bg-[#111] flex flex-col h-full overflow-hidden" :style="{ width: leftWidth + 'px' }">
+      <AgentTree class="flex-1 overflow-hidden" />
+    </div>
 
-      <!-- Resize handle -->
-      <div
-        class="w-1 flex-shrink-0 cursor-col-resize hover:bg-blue-500/40 active:bg-blue-500/60 transition-colors"
-        style="margin-left: -1px; z-index: 10;"
-        @mousedown.prevent="startDrag"
-      />
-    </template>
+    <!-- Resize handle: left ↔ center (shown when left is visible) -->
+    <div
+      v-if="leftVisible"
+      class="w-1 flex-shrink-0 cursor-col-resize hover:bg-blue-500/40 active:bg-blue-500/60 transition-colors"
+      style="margin-left: -1px; z-index: 10;"
+      @mousedown.prevent="startLeftDrag($event)"
+    />
 
-    <!-- Right Panel -->
+    <!-- Center Panel -->
     <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
       <template v-if="fileBrowserState.selectedFile">
         <FileContentView
@@ -70,6 +52,31 @@
       <PromptsPanel
         :visible="store.promptsPanelOpen"
         @close="store.closePromptsPanel()"
+      />
+    </div>
+
+    <!-- Resize handle: center ↔ right (shown when right is visible) -->
+    <div
+      v-if="rightVisible"
+      class="w-1 flex-shrink-0 cursor-col-resize hover:bg-blue-500/40 active:bg-blue-500/60 transition-colors"
+      style="margin-left: -1px; z-index: 10;"
+      @mousedown.prevent="startRightDrag($event)"
+    />
+
+    <!-- Right Panel (File Browser) -->
+    <div v-if="rightVisible" class="flex-shrink-0 bg-[#111] border-l border-gray-800 flex flex-col h-full overflow-hidden" :style="{ width: rightWidth + 'px' }">
+      <div class="p-4 flex items-center justify-between flex-shrink-0">
+        <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Files</span>
+        <button class="text-gray-600 hover:text-gray-300 transition-colors text-lg leading-none" @click="toggleFileBrowser" title="Close">×</button>
+      </div>
+      <div class="flex-shrink-0 px-2">
+        <UnseenTasksPanel />
+      </div>
+      <FileBrowserPanel
+        :agent-id="fileBrowserState.agentId"
+        :initial-path="fileBrowserState.selectedFile || ''"
+        @close="toggleFileBrowser"
+        @file-select="onFileSelect"
       />
     </div>
 
@@ -119,45 +126,73 @@ const LEFT_MIN = 180
 const LEFT_MAX = 600
 const LEFT_DEFAULT = 288 // w-72 = 18rem = 288px
 
+// ── Right panel width & visibility ──────────────────────────────────────────
+const RIGHT_WIDTH_KEY = 'agent-park:right-width'
+const RIGHT_MIN = 180
+const RIGHT_MAX = 600
+const RIGHT_DEFAULT = 288
+
 const leftVisible = ref(true)
 const leftWidth = ref(
   parseInt(localStorage.getItem(LEFT_WIDTH_KEY) || String(LEFT_DEFAULT), 10)
 )
+const rightVisible = ref(false)
+const rightWidth = ref(
+  parseInt(localStorage.getItem(RIGHT_WIDTH_KEY) || String(RIGHT_DEFAULT), 10)
+)
 
-function saveWidth() {
+function saveLeftWidth() {
   localStorage.setItem(LEFT_WIDTH_KEY, String(leftWidth.value))
 }
+function saveRightWidth() {
+  localStorage.setItem(RIGHT_WIDTH_KEY, String(rightWidth.value))
+}
 
-// Drag state
-let dragging = false
+// ── Drag state ───────────────────────────────────────────────────────────────
+let dragging = 'none'  // 'none' | 'left' | 'right'
 let dragStartX = 0
-let dragStartWidth = 0
+let dragStartDelta = 0
 
-function startDrag(e) {
-  dragging = true
+function startLeftDrag(e) {
+  dragging = 'left'
   dragStartX = e.clientX
-  dragStartWidth = leftWidth.value
+  dragStartDelta = leftWidth.value
+  document.body.style.cursor = 'col-resize'
+  document.body.style.userSelect = 'none'
+}
+
+function startRightDrag(e) {
+  dragging = 'right'
+  dragStartX = e.clientX
+  dragStartDelta = rightWidth.value
   document.body.style.cursor = 'col-resize'
   document.body.style.userSelect = 'none'
 }
 
 function onDrag(e) {
-  if (!dragging) return
+  if (dragging === 'none') return
   const delta = e.clientX - dragStartX
-  leftWidth.value = Math.min(LEFT_MAX, Math.max(LEFT_MIN, dragStartWidth + delta))
+  if (dragging === 'left') {
+    leftWidth.value = Math.min(LEFT_MAX, Math.max(LEFT_MIN, dragStartDelta + delta))
+  }
+  if (dragging === 'right') {
+    rightWidth.value = Math.min(RIGHT_MAX, Math.max(RIGHT_MIN, dragStartDelta - delta))
+  }
 }
 
 function stopDrag() {
-  if (!dragging) return
-  dragging = false
+  if (dragging === 'none') return
+  const wasLeft = dragging === 'left'
+  const wasRight = dragging === 'right'
+  dragging = 'none'
   document.body.style.cursor = ''
   document.body.style.userSelect = ''
-  saveWidth()
+  if (wasLeft) saveLeftWidth()
+  if (wasRight) saveRightWidth()
 }
 
 // ── File browser state ────────────────────────────────────────────────────────
 const fileBrowserState = ref({
-  panelOpen: false,
   agentId: null,
   selectedFile: null,
   fileSize: 0,
@@ -182,11 +217,14 @@ const memoryAgentName = computed(() => {
   return agent?.name || ''
 })
 
-function closeFileBrowser() {
-  fileBrowserState.value.panelOpen = false
-  fileBrowserState.value.agentId = null
-  fileBrowserState.value.selectedFile = null
-  fileBrowserState.value.fileSize = 0
+
+function toggleFileBrowser() {
+  if (!rightVisible.value && !fileBrowserState.value.agentId) {
+    const agentId = currentAgentId.value
+    if (!agentId) return
+    fileBrowserState.value.agentId = agentId
+  }
+  rightVisible.value = !rightVisible.value
 }
 
 function onFileSelect({ path, size }) {
@@ -230,7 +268,7 @@ function onForkTask(e) {
 }
 
 function onOpenFiles(e) {
-  fileBrowserState.value.panelOpen = true
+  rightVisible.value = true
   fileBrowserState.value.agentId = e.detail.agentId
   fileBrowserState.value.selectedFile = null
   fileBrowserState.value.fileSize = 0
@@ -261,10 +299,14 @@ function onCommandExecute(commandId) {
         store.openPromptsPanel()
       }
       break
+    case 'toggle-file-browser': {
+      toggleFileBrowser()
+      break
+    }
     case 'open-files': {
       const agentId = currentAgentId.value
       if (agentId) {
-        fileBrowserState.value.panelOpen = true
+        rightVisible.value = true
         fileBrowserState.value.agentId = agentId
         fileBrowserState.value.selectedFile = null
         fileBrowserState.value.fileSize = 0
@@ -282,8 +324,7 @@ function onCommandExecute(commandId) {
 }
 
 function onPaletteOpenFile({ agentId, path, size }) {
-  // Open file browser to that agent, select the file
-  fileBrowserState.value.panelOpen = true
+  rightVisible.value = true
   fileBrowserState.value.agentId = agentId
   fileBrowserState.value.selectedFile = path
   fileBrowserState.value.fileSize = size
@@ -291,7 +332,7 @@ function onPaletteOpenFile({ agentId, path, size }) {
 }
 
 function onPaletteOpenDirectory({ agentId, path }) {
-  fileBrowserState.value.panelOpen = true
+  rightVisible.value = true
   fileBrowserState.value.agentId = agentId
   fileBrowserState.value.selectedFile = null
   fileBrowserState.value.fileSize = 0
@@ -338,6 +379,10 @@ function handleGlobalKeydown(e) {
     } else {
       store.openPromptsPanel()
     }
+  }
+  if (e.metaKey && e.key === 'i') {
+    e.preventDefault()
+    toggleFileBrowser()
   }
   if (e.key === 'Escape' && fileBrowserState.value.selectedFile) {
     fileBrowserState.value.selectedFile = null

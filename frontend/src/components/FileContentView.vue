@@ -110,7 +110,7 @@ const loading = ref(false)
 const loadError = ref('')
 const showLargeConfirm = ref(false)
 const isBinary = ref(false)
-const wordWrap = ref(false)
+const wordWrap = ref(true)
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.bmp', '.avif'])
 
@@ -185,7 +185,6 @@ watch(
     loadError.value = ''
     showLargeConfirm.value = false
     isBinary.value = false
-    wordWrap.value = false
     loadContent()
   },
   { immediate: true }

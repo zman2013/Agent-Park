@@ -4,11 +4,6 @@
     <div class="flex items-center gap-2 px-3 py-2 border-b border-gray-800 text-xs text-gray-400 flex-shrink-0">
       <span class="text-gray-500">📁</span>
       <span class="font-mono truncate flex-1 min-w-0" :title="cwd">{{ cwd || '/' }}</span>
-      <button
-        class="text-gray-600 hover:text-gray-300 transition-colors ml-1 flex-shrink-0"
-        title="Close file browser"
-        @click="$emit('close')"
-      >✕</button>
     </div>
 
     <!-- Loading / error state -->
