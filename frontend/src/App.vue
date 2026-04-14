@@ -23,12 +23,12 @@
 
     <!-- Center Panel -->
     <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
-      <template v-if="fileBrowserState.selectedFile">
+      <template v-if="fileContentViewVisible && fileBrowserState.selectedFile">
         <FileContentView
           :agent-id="fileBrowserState.agentId"
           :file-path="fileBrowserState.selectedFile"
           :file-size="fileBrowserState.fileSize"
-          @close="fileBrowserState.selectedFile = null"
+          @close="fileContentViewVisible = false"
         />
       </template>
       <template v-else-if="store.currentTask">
@@ -64,13 +64,17 @@
     />
 
     <!-- Right Panel (File Browser) -->
-    <div v-if="rightVisible" class="flex-shrink-0 bg-[#111] border-l border-gray-800 flex flex-col h-full overflow-hidden" :style="{ width: rightWidth + 'px' }">
+    <div v-if="rightVisible" class="flex-shrink-0 bg-[#111] border-l border-gray-800 flex flex-col h-full" :style="{ width: rightWidth + 'px' }">
       <div class="p-4 flex items-center justify-between flex-shrink-0">
         <span class="text-xs text-gray-500 uppercase tracking-wider font-semibold">Files</span>
         <button class="text-gray-600 hover:text-gray-300 transition-colors text-lg leading-none" @click="toggleFileBrowser" title="Close">×</button>
       </div>
       <div class="flex-shrink-0 px-2">
-        <UnseenTasksPanel />
+        <RecentFilesPanel
+          v-if="fileBrowserState.agentId"
+          :agent-id="fileBrowserState.agentId"
+          @file-select="onRecentFileSelect"
+        />
       </div>
       <FileBrowserPanel
         :agent-id="fileBrowserState.agentId"
@@ -98,7 +102,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from './stores/agentStore'
 import { useWebSocket } from './composables/useWebSocket'
 import AgentTree from './components/AgentTree.vue'
@@ -110,8 +114,8 @@ import MemoryPanel from './components/MemoryPanel.vue'
 import PromptsPanel from './components/PromptsPanel.vue'
 import FileBrowserPanel from './components/FileBrowserPanel.vue'
 import FileContentView from './components/FileContentView.vue'
-import UnseenTasksPanel from './components/UnseenTasksPanel.vue'
 import CommandPalette from './components/CommandPalette.vue'
+import RecentFilesPanel from './components/RecentFilesPanel.vue'
 
 const store = useAgentStore()
 const { connected: wsConnected, createTask, sendUserMessage, forkTask } = useWebSocket()
@@ -198,6 +202,9 @@ const fileBrowserState = ref({
   fileSize: 0,
 })
 
+// Whether the file content view is currently visible (separate from selectedFile)
+const fileContentViewVisible = ref(false)
+
 const currentAgentCwd = computed(() => {
   const task = store.currentTask
   if (!task) return ''
@@ -217,6 +224,22 @@ const memoryAgentName = computed(() => {
   return agent?.name || ''
 })
 
+// Auto-switch right panel (file browser) agent only when switching to a task of a different agent
+let lastKnownAgentId = store.currentTask?.agent_id || null
+
+watch(
+  () => store.currentTask?.agent_id,
+  (nextAgentId) => {
+    if (nextAgentId && nextAgentId !== lastKnownAgentId && rightVisible.value) {
+      fileBrowserState.value.agentId = nextAgentId
+      fileBrowserState.value.selectedFile = null
+      fileBrowserState.value.fileSize = 0
+      fileContentViewVisible.value = false
+    }
+    lastKnownAgentId = nextAgentId
+  },
+)
+
 
 function toggleFileBrowser() {
   if (!rightVisible.value && !fileBrowserState.value.agentId) {
@@ -233,6 +256,13 @@ function onFileSelect({ path, size }) {
   if (fileBrowserState.value.agentId) {
     store.addRecentFile(fileBrowserState.value.agentId, path)
   }
+  fileContentViewVisible.value = true
+}
+
+function onRecentFileSelect({ path }) {
+  fileBrowserState.value.selectedFile = path
+  fileBrowserState.value.fileSize = 0
+  fileContentViewVisible.value = true
 }
 
 // ── Event handlers ────────────────────────────────────────────────────────────
@@ -272,6 +302,7 @@ function onOpenFiles(e) {
   fileBrowserState.value.agentId = e.detail.agentId
   fileBrowserState.value.selectedFile = null
   fileBrowserState.value.fileSize = 0
+  fileContentViewVisible.value = false
 }
 
 // ── Command Palette handlers ─────────────────────────────────────────────────
@@ -310,6 +341,7 @@ function onCommandExecute(commandId) {
         fileBrowserState.value.agentId = agentId
         fileBrowserState.value.selectedFile = null
         fileBrowserState.value.fileSize = 0
+        fileContentViewVisible.value = false
       }
       break
     }
@@ -328,6 +360,7 @@ function onPaletteOpenFile({ agentId, path, size }) {
   fileBrowserState.value.agentId = agentId
   fileBrowserState.value.selectedFile = path
   fileBrowserState.value.fileSize = size
+  fileContentViewVisible.value = true
   store.addRecentFile(agentId, path)
 }
 
@@ -336,6 +369,7 @@ function onPaletteOpenDirectory({ agentId, path }) {
   fileBrowserState.value.agentId = agentId
   fileBrowserState.value.selectedFile = null
   fileBrowserState.value.fileSize = 0
+  fileContentViewVisible.value = false
 }
 
 function handleGlobalKeydown(e) {
@@ -385,7 +419,7 @@ function handleGlobalKeydown(e) {
     toggleFileBrowser()
   }
   if (e.key === 'Escape' && fileBrowserState.value.selectedFile) {
-    fileBrowserState.value.selectedFile = null
+    fileContentViewVisible.value = false
   }
 }
 

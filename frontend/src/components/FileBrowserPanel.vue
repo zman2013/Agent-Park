@@ -11,6 +11,7 @@
 
     <!-- Tree -->
     <div ref="treeEl" class="flex-1 overflow-auto py-1 min-h-0">
+      <div class="min-w-fit">
       <FileBrowserNode
         v-for="entry in rootEntries"
         :key="`${treeKey}-${entry.name}`"
@@ -24,6 +25,7 @@
         @node-mounted="onNodeMounted"
       />
       <div v-if="rootLoading && rootEntries.length === 0" class="px-3 py-2 text-xs text-gray-600">Loading...</div>
+      </div>
     </div>
   </div>
 </template>
