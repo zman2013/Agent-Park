@@ -773,8 +773,8 @@ async def _generate_index(
     if m:
         stripped = m.group(1).strip()
 
-    # Validate: index.md must start with a Markdown heading
-    if not re.match(r"^#\s", stripped):
+    # Validate: index.md must start with a Markdown heading (any level)
+    if not re.match(r"^#{1,6}\s", stripped):
         logger.warning("Generated index.md does not start with a heading, discarding")
         return ""
 
