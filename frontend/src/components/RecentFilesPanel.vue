@@ -9,7 +9,7 @@
       <div
         v-for="f in recentFiles"
         :key="f.path"
-        class="flex items-center gap-2 px-4 py-1.5 cursor-pointer rounded text-sm transition-colors hover:bg-gray-800/50 group"
+        class="flex items-center gap-2 px-4 py-1.5 cursor-pointer rounded text-xs transition-colors hover:bg-gray-800/50 group"
         @click="handleClick(f)"
       >
         <span class="text-xs text-gray-600 flex-shrink-0">📄</span>

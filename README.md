@@ -90,6 +90,52 @@ python scripts/wiki_ingest.py --date 2026-04-13  # 只处理指定日期的 task
 0 2 * * * docker exec agent-park bash -c "cd /data1/common/agent-park && python scripts/wiki_ingest.py" >> /var/log/wiki-ingest.log 2>&1
 ```
 
+## Wiki 预检索（Agent 启动前知识注入）
+
+Agent 执行任务前，会自动从关联的 Wiki 知识库中检索相关知识并注入到 prompt 中，让 Agent "带着领域知识开始工作"。
+
+### 工作原理
+
+1. Agent 收到 prompt 时，读取关联 Wiki 的 `index.md` 索引
+2. 调用 LLM 从索引中选出与当前任务相关的页面（最多 5 个）
+3. 读取匹配页面的 frontmatter（title / summary / overview）
+4. 组装 `<wiki-context>` 块，插入到 memory 之后、原始 prompt 之前
+
+最终 prompt 结构：
+
+```
+<memory>...agent 记忆...</memory>
+
+<wiki-context>
+...wiki 知识摘要 + 页面链接...
+</wiki-context>
+
+用户的原始 prompt
+```
+
+### 跳过检索
+
+在 prompt 前加 `!wiki` 前缀可跳过 wiki 预检索（如 `!wiki 帮我做 X`），前缀会被自动剥离。
+
+### 配置
+
+在 `config.json` 中配置 `wiki_search`（可选，默认复用 `wiki_ingest` 配置）：
+
+```json
+{
+  "wiki_search": {
+    "command": "qwen",
+    "timeout": 30,
+    "max_pages": 5
+  }
+}
+```
+
+- `command`：LLM 命令，默认复用 `wiki_ingest.command`
+- `timeout`：超时秒数，默认 30s（更短的超时，不能让用户等太久）
+- `max_pages`：最大返回页面数，默认 5
+- `wiki_base`：默认复用 `wiki_ingest.wiki_base`
+
 ## License
 
 [MIT](LICENSE)

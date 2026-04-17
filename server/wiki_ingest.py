@@ -764,8 +764,21 @@ async def _generate_index(
         return ""
 
     stripped = result.strip()
-    # Return whatever the LLM gives us for index (less strict validation)
-    return stripped if stripped else ""
+    if not stripped:
+        return ""
+
+    # LLM often wraps the index content in a ```markdown ... ``` code block
+    # with explanatory text before/after. Extract the code block content.
+    m = re.search(r"```(?:markdown|md)?\s*\n(.*?)\n```", stripped, re.DOTALL)
+    if m:
+        stripped = m.group(1).strip()
+
+    # Validate: index.md must start with a Markdown heading (any level)
+    if not re.match(r"^#{1,6}\s", stripped):
+        logger.warning("Generated index.md does not start with a heading, discarding")
+        return ""
+
+    return stripped
 
 
 # ── File writing ────────────────────────────────────────────────────────────────
