@@ -490,15 +490,56 @@ class AgentRunner:
             task.fork_session_id = None  # consume once
             app_state.save_agent_tasks(task.agent_id)
 
-        # Inject memory only on new sessions (no existing session_id and not a fork)
+        # Strip !wiki prefix before any prompt augmentation
+        skip_wiki = False
+        if prompt.startswith("!wiki"):
+            skip_wiki = True
+            prompt = prompt[len("!wiki"):].lstrip()
+
+        # Inject memory and wiki context only on new sessions (no existing session_id and not a fork)
         if not session_id and not fork_sid:
             from server.memory import load_memory
             from server.config import memory_config
             mem_cfg = memory_config()
             memory_lines = load_memory(task.agent_id, mem_cfg["max_lines"])
+
+            parts: list[str] = []
             if memory_lines:
                 memory_text = "\n".join(memory_lines)
-                prompt = f"<memory>\n{memory_text}\n</memory>\n\n{prompt}"
+                parts.append(f"<memory>\n{memory_text}\n</memory>")
+
+            if not skip_wiki and agent and agent.wiki:
+                try:
+                    from server.wiki_search import search_wiki
+                    from server.routes_ws import broadcast
+                    # Notify user that wiki search is starting
+                    _notice_start = Message(
+                        role="agent", type="system", streaming=False,
+                        content=f"🔍 正在检索 wiki 知识库（{agent.wiki}）...",
+                    )
+                    task.messages.append(_notice_start)
+                    await broadcast({"type": "message", "task_id": task_id, "message": _notice_start.model_dump()})
+
+                    wiki_context = await search_wiki(prompt, agent.wiki)
+
+                    if wiki_context:
+                        parts.append(wiki_context)
+                        _notice_done = Message(
+                            role="agent", type="system", streaming=False,
+                            content=f"📚 Wiki 检索完成，已注入上下文：\n\n{wiki_context}",
+                        )
+                    else:
+                        _notice_done = Message(
+                            role="agent", type="system", streaming=False,
+                            content=f"📭 Wiki 检索完成，未找到相关页面。",
+                        )
+                    task.messages.append(_notice_done)
+                    await broadcast({"type": "message", "task_id": task_id, "message": _notice_done.model_dump()})
+                except Exception:
+                    logger.exception("Wiki search failed for task %s, skipping", task_id)
+
+            parts.append(prompt)
+            prompt = "\n\n".join(parts)
 
         # Select adapter and build args
         adapter = get_adapter(command)

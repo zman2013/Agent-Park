@@ -63,6 +63,18 @@ def knowledge_config() -> dict:
     }
 
 
+def wiki_search_config() -> dict:
+    """Return wiki search configuration with defaults."""
+    cfg = get_config().get("wiki_search", {})
+    wiki_cfg = wiki_ingest_config()
+    return {
+        "command": cfg.get("command", wiki_cfg["command"]),
+        "wiki_base": cfg.get("wiki_base", wiki_cfg["wiki_base"]),
+        "timeout": int(cfg.get("timeout", 30)),
+        "max_pages": int(cfg.get("max_pages", 5)),
+    }
+
+
 def wiki_ingest_config() -> dict:
     """Return the wiki ingest configuration with defaults."""
     cfg = get_config().get("wiki_ingest", {})
