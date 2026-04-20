@@ -677,16 +677,35 @@ def _update_index_incrementally(wiki_dir: Path, wiki_name: str, updates: list[di
             elif in_header:
                 header_lines.append(line)
             elif current_cat is not None:
-                # Parse table rows: | [file.md](pages/file.md) | title | summary |
+                # Format 1: table row | [file.md](pages/file.md) | title | summary |
                 m = re.match(r"\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|\s*([^|]*)\|\s*([^|]*)\|", line)
                 if m:
                     link_text = m.group(1).strip()
                     file_path_in_link = m.group(2).strip()
                     row_title = m.group(3).strip()
                     row_summary = m.group(4).strip()
-                    # Normalize file key to "pages/xxx.md"
                     file_key = file_path_in_link if file_path_in_link.startswith("pages/") else f"pages/{link_text}"
                     sections[current_cat].append((file_key, row_title, row_summary))
+                    continue
+                # Format 2: bullet list  - [title](pages/file.md) — summary
+                #           or           - **[title](pages/file.md)**: summary
+                m = re.match(r"-\s+(?:\*\*)?(?:\[([^\]]+)\]\((pages/[^)]+)\))(?:\*\*)?[：:—\-–\s]*(.*)", line)
+                if m:
+                    row_title = m.group(1).strip()
+                    file_key = m.group(2).strip()
+                    row_summary = m.group(3).strip().lstrip(":：—–- ")
+                    sections[current_cat].append((file_key, row_title, row_summary))
+
+    # Backfill: add any pages present on disk but missing from all sections
+    indexed_files = {fk for rows in sections.values() for (fk, _, _) in rows}
+    for meta in _read_page_metadata(wiki_dir):
+        fk = meta["file"]
+        if fk not in indexed_files:
+            cat = "其他"
+            if cat not in sections:
+                sections[cat] = []
+                section_order.append(cat)
+            sections[cat].append((fk, meta["title"], meta["summary"]))
 
     # Upsert each update into its category section
     for u in updates:
