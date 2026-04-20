@@ -273,54 +273,14 @@ async def _try_extract_knowledge_with_retry(
             log_entries.append(f"  {label}: empty/timeout")
             continue
 
-        # Try to parse JSON — use robust extraction
-        json_str = result.strip()
-
-        # 1. Try to extract from markdown code block
-        #    Use first ``` marker + last ``` marker to handle nested code fences
-        m = re.search(r"```(?:json)?\s*\n", json_str)
-        if m:
-            start = m.end()
-            # Find closing ``` by scanning from end of string (handles nested fences)
-            end = json_str.rfind("```", start)
-            # Check if found ``` is on its own line (proper closing fence)
-            while end > start:
-                # Check if line before ``` is empty or whitespace only
-                before = json_str[start:end].rstrip()
-                line_before = before.rsplit("\n", 1)[-1]
-                if line_before.strip() == "" or not line_before.strip().startswith("```"):
-                    break  # proper closing
-                end = json_str.rfind("```", start, end)
-            if end > start:
-                json_str = json_str[start:end].strip()
-            else:
-                json_str = json_str[start:].strip()
-
-        # 2. Fix unescaped newlines in string values
-        json_str = _fix_json_newlines(json_str)
-
-        # 3. Try to find JSON object or array (including prose prefix like
-        #    "Here is the JSON: [...]")
-        if json_str.startswith("["):
-            m2 = re.search(r"\[[\s\S]*\]", json_str)
-            candidate = m2.group(0) if m2 else json_str
-        elif json_str.startswith("{"):
-            m2 = re.search(r"\{[\s\S]*\}", json_str)
-            candidate = m2.group(0) if m2 else json_str
-        else:
-            m2 = re.search(r"\[[\s\S]*\]", json_str)
-            if not m2:
-                m2 = re.search(r"\{[\s\S]*\}", json_str)
-            candidate = m2.group(0) if m2 else json_str
-
-        try:
-            items = json.loads(candidate, strict=False)
-            if isinstance(items, list):
-                log_entries.append(f"  {label}: {len(items)} item(s)")
-                return items, log_entries
+        parsed = _parse_json_from_llm_output(result)
+        if isinstance(parsed, list):
+            log_entries.append(f"  {label}: {len(parsed)} item(s)")
+            return parsed, log_entries
+        elif parsed is not None:
             log_entries.append(f"  {label}: not a list")
-        except json.JSONDecodeError as e:
-            log_entries.append(f"  {label}: JSON parse failed (pos {e.pos}: {e.msg})")
+        else:
+            log_entries.append(f"  {label}: JSON parse failed")
 
     log_entries.append("  all attempts failed")
     return [], log_entries
@@ -379,15 +339,6 @@ async def enrich_knowledge_summaries(
         logger.warning("Failed to generate summaries for knowledge points")
         return knowledge_points
 
-    json_str = result.strip()
-    m = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", json_str, re.DOTALL)
-    if m:
-        json_str = m.group(1).strip()
-    else:
-        m2 = re.search(r"\[.*\]", json_str, re.DOTALL)
-        if m2:
-            json_str = m2.group(0)
-
     items = _parse_json_from_llm_output(result)
     if isinstance(items, list) and len(items) == len(knowledge_points):
         for kp, summary in zip(knowledge_points, items):
@@ -421,32 +372,7 @@ async def ingest_to_wiki(
         index_content = index_path.read_text(encoding="utf-8")
 
     # Read existing page list for context (with L0/L1 info)
-    pages_dir = wiki_dir / "pages"
-    existing_pages = []
-    if pages_dir.exists():
-        for p in sorted(pages_dir.glob("*.md")):
-            title = p.stem
-            summary = ""
-            overview = ""
-            try:
-                text = p.read_text(encoding="utf-8")
-                m_title = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
-                if m_title:
-                    title = m_title.group(1).strip()
-                m_summary = re.search(r'^summary:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
-                if m_summary:
-                    summary = m_summary.group(1).strip()
-                m_overview = re.search(r'^overview:\s*\|?\s*\n((?:  .+\n)+)', text, re.MULTILINE)
-                if m_overview:
-                    overview = textwrap.dedent(m_overview.group(1)).strip()
-            except Exception:
-                pass
-            existing_pages.append({
-                "file": f"pages/{p.name}",
-                "title": title,
-                "summary": summary,
-                "overview": overview,
-            })
+    existing_pages = _read_page_metadata(wiki_dir)
 
     if existing_pages:
         parts = []
@@ -561,28 +487,28 @@ async def ingest_to_wiki(
                 "category": category,
             })
 
-    # ── Phase 3: Generate updated index.md ──
-    index_md = await _generate_index(
-        wiki_dir=wiki_dir,
-        wiki_name=wiki_name,
-        updates=updates,
-        command=command,
-        timeout=timeout,
-    )
+    # ── Phase 3: Update index.md incrementally ──
+    _update_index_incrementally(wiki_dir, wiki_name, updates)
 
-    return {"updates": updates, "index_md": index_md, "log_entry": log_entry}
+    return {"updates": updates, "log_entry": log_entry}
 
 
 def _parse_json_from_llm_output(text: str) -> dict | list | None:
     """Robust JSON extraction from LLM output."""
     json_str = text.strip()
 
-    # 1. Try markdown code block — use the full match to include ``` fences
-    m = re.search(r"```(?:json)?\s*\n?", json_str)
+    # 1. Try markdown code block — use rfind to handle nested code fences
+    m = re.search(r"```(?:json)?\s*\n", json_str)
     if m:
-        # Find the content after ```json... marker, then find the last ```
         start = m.end()
         end = json_str.rfind("```", start)
+        # Skip closing fences that are actually nested (preceded by content)
+        while end > start:
+            before = json_str[start:end].rstrip()
+            line_before = before.rsplit("\n", 1)[-1]
+            if line_before.strip() == "" or not line_before.strip().startswith("```"):
+                break
+            end = json_str.rfind("```", start, end)
         if end > start:
             json_str = json_str[start:end].strip()
         else:
@@ -618,6 +544,38 @@ def _parse_json_from_llm_output(text: str) -> dict | list | None:
                 pass
 
     return None
+
+
+def _read_page_metadata(wiki_dir: Path) -> list[dict]:
+    """Read title/summary/overview from all pages in wiki_dir/pages/."""
+    pages_dir = wiki_dir / "pages"
+    result = []
+    if not pages_dir.exists():
+        return result
+    for p in sorted(pages_dir.glob("*.md")):
+        title = p.stem
+        summary = ""
+        overview = ""
+        try:
+            text = p.read_text(encoding="utf-8")
+            m_title = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
+            if m_title:
+                title = m_title.group(1).strip()
+            m_summary = re.search(r'^summary:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
+            if m_summary:
+                summary = m_summary.group(1).strip()
+            m_overview = re.search(r'^overview:\s*\|?\s*\n((?:  .+\n)+)', text, re.MULTILINE)
+            if m_overview:
+                overview = textwrap.dedent(m_overview.group(1)).strip()
+        except Exception:
+            pass
+        result.append({
+            "file": f"pages/{p.name}",
+            "title": title,
+            "summary": summary,
+            "overview": overview,
+        })
+    return result
 
 
 async def _generate_page_content(
@@ -696,89 +654,102 @@ async def _generate_page_content(
     return stripped
 
 
-async def _generate_index(
-    wiki_dir: Path,
-    wiki_name: str,
-    updates: list[dict],
-    command: str,
-    timeout: int,
-) -> str:
-    """Generate updated index.md content."""
-    # Build list of all pages for context
-    pages_dir = wiki_dir / "pages"
-    page_list = []
+def _update_index_incrementally(wiki_dir: Path, wiki_name: str, updates: list[dict]) -> None:
+    """Update index.md by upserting rows for changed pages, preserving existing content."""
+    index_path = wiki_dir / "index.md"
 
-    # Pages from updates (with their new summaries)
+    # Parse existing index into {category: [(file, title, summary), ...]}
+    sections: dict[str, list[tuple[str, str, str]]] = {}
+    section_order: list[str] = []
+    header_lines: list[str] = []  # lines before first ## section
+
+    if index_path.exists():
+        text = index_path.read_text(encoding="utf-8")
+        current_cat: str | None = None
+        in_header = True
+        for line in text.splitlines():
+            if line.startswith("## "):
+                in_header = False
+                current_cat = line[3:].strip()
+                if current_cat not in sections:
+                    sections[current_cat] = []
+                    section_order.append(current_cat)
+            elif in_header:
+                header_lines.append(line)
+            elif current_cat is not None:
+                # Parse table rows: | [file.md](pages/file.md) | title | summary |
+                m = re.match(r"\|\s*\[([^\]]+)\]\(([^)]+)\)\s*\|\s*([^|]*)\|\s*([^|]*)\|", line)
+                if m:
+                    link_text = m.group(1).strip()
+                    file_path_in_link = m.group(2).strip()
+                    row_title = m.group(3).strip()
+                    row_summary = m.group(4).strip()
+                    # Normalize file key to "pages/xxx.md"
+                    file_key = file_path_in_link if file_path_in_link.startswith("pages/") else f"pages/{link_text}"
+                    sections[current_cat].append((file_key, row_title, row_summary))
+
+    # Upsert each update into its category section
     for u in updates:
-        page_list.append({
-            "file": u["file"],
-            "title": u.get("title", ""),
-            "summary": u.get("summary", ""),
-            "category": u.get("category", ""),
-        })
+        file_key = u.get("file", "")
+        title = u.get("title", "")
+        summary = u.get("summary", "")
+        category = u.get("category", "") or "其他"
+        if not file_key or not title:
+            continue
 
-    # Existing pages not in updates
-    updated_files = {u["file"] for u in updates}
-    if pages_dir.exists():
-        for p in sorted(pages_dir.glob("*.md")):
-            fpath = f"pages/{p.name}"
-            if fpath not in updated_files:
-                title = p.stem
-                summary = ""
-                try:
-                    text = p.read_text(encoding="utf-8")
-                    m_title = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
-                    if m_title:
-                        title = m_title.group(1).strip()
-                    m_summary = re.search(r'^summary:\s*["\']?(.+?)["\']?\s*$', text, re.MULTILINE)
-                    if m_summary:
-                        summary = m_summary.group(1).strip()
-                except Exception:
-                    pass
-                page_list.append({
-                    "file": fpath,
-                    "title": title,
-                    "summary": summary,
-                    "category": "",
-                })
+        if category not in sections:
+            sections[category] = []
+            section_order.append(category)
 
-    if not page_list:
-        return ""
+        rows = sections[category]
+        # Check if file exists in this category
+        found = False
+        for i, (fk, _, _) in enumerate(rows):
+            if fk == file_key:
+                rows[i] = (file_key, title, summary)
+                found = True
+                break
+        if not found:
+            # Also check other categories
+            for cat in section_order:
+                if cat == category:
+                    continue
+                for i, (fk, _, _) in enumerate(sections[cat]):
+                    if fk == file_key:
+                        sections[cat].pop(i)
+                        break
+            rows.append((file_key, title, summary))
 
-    page_json = json.dumps(page_list, ensure_ascii=False, indent=2)
+    # Serialize back to markdown
+    if not header_lines or not any(l.strip() for l in header_lines):
+        header_lines = [
+            f"# {wiki_name} Wiki — 索引",
+            "",
+            f"> 本索引按主题分类列出 wiki 中的所有页面。",
+            "",
+            "---",
+            "",
+        ]
 
-    prompt = f"""你是 wiki 索引维护者。根据以下页面列表生成 index.md。
+    out_lines = list(header_lines)
+    # Ensure header ends with blank line before first section
+    while out_lines and out_lines[-1].strip() == "":
+        out_lines.pop()
+    out_lines.append("")
 
-## 页面列表
-{page_json}
+    for cat in section_order:
+        rows = sections[cat]
+        if not rows:
+            continue
+        out_lines.append(f"## {cat}")
+        out_lines.append("| 文件 | 标题 | 摘要 |")
+        out_lines.append("|------|------|------|")
+        for (fk, t, s) in rows:
+            fname = fk.split("/")[-1]
+            out_lines.append(f"| [{fname}]({fk}) | {t} | {s} |")
+        out_lines.append("")
 
-## 要求
-1. 按分类组织页面
-2. 每个条目包含：文件名、标题、一句话摘要
-3. 输出完整的 index.md Markdown 内容
-
-只输出 index.md 内容，不要其他内容。"""
-
-    result = await _llm_call(command, prompt=prompt, timeout=timeout)
-    if not result:
-        return ""
-
-    stripped = result.strip()
-    if not stripped:
-        return ""
-
-    # LLM often wraps the index content in a ```markdown ... ``` code block
-    # with explanatory text before/after. Extract the code block content.
-    m = re.search(r"```(?:markdown|md)?\s*\n(.*?)\n```", stripped, re.DOTALL)
-    if m:
-        stripped = m.group(1).strip()
-
-    # Validate: index.md must start with a Markdown heading (any level)
-    if not re.match(r"^#{1,6}\s", stripped):
-        logger.warning("Generated index.md does not start with a heading, discarding")
-        return ""
-
-    return stripped
+    index_path.write_text("\n".join(out_lines), encoding="utf-8")
 
 
 # ── File writing ────────────────────────────────────────────────────────────────
@@ -829,7 +800,7 @@ def apply_wiki_updates(wiki_dir: Path, plan: dict) -> list[str]:
             content = content.replace("---\n", f"---\noverview: |\n  {overview}\n", 1)
 
         # Ensure frontmatter has updated date
-        if f"updated:" in content:
+        if "updated:" in content:
             content = re.sub(r"updated:.*$", f"updated: {today}", content, flags=re.MULTILINE)
 
         # Resolve and validate target path to prevent traversal/absolute-path writes
@@ -852,12 +823,6 @@ def apply_wiki_updates(wiki_dir: Path, plan: dict) -> list[str]:
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content, encoding="utf-8")
         written.append(filepath)
-
-    # Update index.md if provided
-    index_md = plan.get("index_md", "")
-    if index_md:
-        (wiki_dir / "index.md").write_text(index_md, encoding="utf-8")
-        written.append("index.md")
 
     # Append log entry
     log_entry = plan.get("log_entry", "")
@@ -940,12 +905,14 @@ async def ingest_task(
     ingested[task_id] = today
     save_ingested(wiki_dir, ingested)
 
+    n_updates = len(plan.get("updates", []))
     return {
-        "updates": len(plan.get("updates", [])),
+        "updates": n_updates,
         "files": files,
         "page_actions": page_actions,
         "log_entry": plan.get("log_entry", ""),
         "extract_attempts": extract_attempts,
+        "extracted": n_updates > 0,
     }
 
 

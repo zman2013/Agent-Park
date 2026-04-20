@@ -1,6 +1,7 @@
 """Wiki knowledge pre-retrieval for agent prompts."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import textwrap
@@ -16,7 +17,7 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
     or any error occurs (never raises).
     """
     from server.config import wiki_search_config
-    from server.wiki_ingest import _llm_call, _parse_json_from_llm_output
+    from server.wiki_ingest import _llm_call, _parse_json_from_llm_output, _read_page_metadata
 
     cfg = wiki_search_config()
     wiki_base = Path(cfg["wiki_base"])
@@ -33,14 +34,21 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
         logger.exception("[wiki-search] failed to read index: %s", index_path)
         return ""
 
-    # Ask LLM which pages are relevant
-    selection_prompt = (
-        f"你是 wiki 知识检索引擎。根据用户任务，从索引中选出相关页面。\n\n"
-        f"用户任务：{prompt}\n\n"
-        f"Wiki 索引：\n{index_content}\n\n"
-        f"输出 JSON 数组，包含相关页面的文件名（如 \"pages/xxx.md\"，最多 {cfg['max_pages']} 个）。"
-        f"无相关页面则输出空数组 []。只输出 JSON，不要其他内容。"
-    )
+    # Build page metadata for richer selection context
+    page_meta = _read_page_metadata(wiki_dir)
+    page_details_parts: list[str] = []
+    for p in page_meta:
+        line = f"- {p['file']}: {p['title']}"
+        if p["summary"]:
+            line += f"\n  摘要: {p['summary']}"
+        if p["overview"]:
+            line += f"\n  概览: {p['overview'][:300]}"
+        page_details_parts.append(line)
+    page_details_str = "\n".join(page_details_parts) if page_details_parts else ""
+
+    # Ask LLM which pages are relevant (phase 1)
+    from server.wiki_prompts import phase1_selection, phase2_verification
+    selection_prompt = phase1_selection(prompt, index_content, page_details_str, cfg["max_pages"])
 
     logger.info(
         "[wiki-search] querying LLM (wiki=%s, command=%s, timeout=%s)\nprompt preview: %.200s",
@@ -66,10 +74,29 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
 
     logger.info("[wiki-search] selected pages: %s", filenames)
 
-    # Build context from each matched page's frontmatter
-    sections: list[str] = []
+    # Phase 2: verify each candidate page is actually relevant
     pages_dir = wiki_dir / "pages"
-    for filename in filenames[: cfg["max_pages"]]:
+    verified: list[str] = []
+    verify_tasks = [
+        _verify_page_relevance(filename, pages_dir, prompt, cfg, wiki_name)
+        for filename in filenames[: cfg["max_pages"]]
+    ]
+    results = await asyncio.gather(*verify_tasks)
+    for filename, relevant in zip(filenames[: cfg["max_pages"]], results):
+        if relevant:
+            verified.append(filename)
+        else:
+            logger.info("[wiki-search] phase2 rejected: %s", filename)
+
+    if not verified:
+        logger.info("[wiki-search] all candidates rejected by phase2 (wiki=%s)", wiki_name)
+        return ""
+
+    logger.info("[wiki-search] phase2 verified pages: %s", verified)
+
+    # Build context from each verified page
+    sections: list[str] = []
+    for filename in verified:
         # Normalize: accept "pages/foo.md" or just "foo.md"
         name = filename.replace("pages/", "").strip("/")
         page_path = pages_dir / name
@@ -98,6 +125,48 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
         "[wiki-search] built wiki-context with %d page(s) (wiki=%s):\n%s",
         len(sections), wiki_name, result,
     )
+    return result
+
+
+async def _verify_page_relevance(
+    filename: str, pages_dir: Path, prompt: str, cfg: dict, wiki_name: str
+) -> bool:
+    """Phase 2: verify a candidate page is actually relevant using its summary."""
+    from server.wiki_ingest import _llm_call
+    from server.wiki_prompts import phase2_verification
+
+    name = filename.replace("pages/", "").strip("/")
+    page_path = pages_dir / name
+    if not page_path.exists():
+        return False
+    try:
+        content = page_path.read_text(encoding="utf-8")
+    except Exception:
+        return False
+
+    title = name
+    summary = ""
+    overview = ""
+    m = re.search(r'^title:\s*["\']?(.+?)["\']?\s*$', content, re.MULTILINE)
+    if m:
+        title = m.group(1).strip()
+    m = re.search(r'^summary:\s*["\']?(.+?)["\']?\s*$', content, re.MULTILINE)
+    if m:
+        summary = m.group(1).strip()
+    m = re.search(r'^overview:\s*\|?\s*\n((?:  .+\n)+)', content, re.MULTILINE)
+    if m:
+        overview = textwrap.dedent(m.group(1)).strip()
+
+    page_desc = f"标题：{title}\n"
+    if summary:
+        page_desc += f"摘要：{summary}\n"
+    if overview:
+        page_desc += f"概览：{overview}\n"
+
+    verify_prompt = phase2_verification(prompt, page_desc)
+    raw = await _llm_call(cfg["command"], verify_prompt, timeout=cfg["timeout"])
+    result = (raw or "").strip().upper().startswith("YES")
+    logger.info("[wiki-search] phase2 verify %s => %s (raw: %.20s)", filename, result, raw or "")
     return result
 
 
