@@ -210,7 +210,11 @@ class CcoAdapter(BaseAdapter):
     async def _handle_user(self, chunk: dict, ctx: ChunkContext) -> None:
         message_data = chunk.get("message", {})
         content_blocks = message_data.get("content", [])
+        if not isinstance(content_blocks, list):
+            return
         for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
             if block.get("type") == "tool_result":
                 result_content = block.get("content", "")
                 if isinstance(result_content, list):
