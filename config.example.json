@@ -21,6 +21,29 @@
     "hotfiles_recent_days": 7,
     "default_task_count": 5
   },
+  "wiki_search": {
+    "command": "cco",
+    "timeout": 30,
+    "max_pages": 5
+  },
+  "wiki_ingest": {
+    "command": "your-ingest-command",
+    "retry_commands": ["fallback-command-1", "fallback-command-2"],
+    "wiki_base": "/path/to/wiki",
+    "timeout": 300,
+    "max_message_chars": 50000,
+    "schedule": {
+      "enabled": true,
+      "hour": 0,
+      "minute": 0
+    },
+    "feishu_notify": {
+      "enabled": false,
+      "cli_path": "",
+      "chat_id": "",
+      "env_file": ""
+    }
+  },
   "agents": [
     {
       "name": "my-agent",
