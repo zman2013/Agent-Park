@@ -31,17 +31,22 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
     if backend == "memforge":
         try:
             result = await _search_memforge(prompt, wiki_name, cfg)
-            if result:
-                return result
-            logger.info(
-                "[wiki-search] memforge returned no sections, falling back to local (wiki=%s)",
-                wiki_name,
-            )
         except Exception:
             logger.exception(
                 "[wiki-search] memforge backend failed, falling back to local (wiki=%s)",
                 wiki_name,
             )
+        else:
+            # A successful memforge query with zero hits is a legitimate
+            # "no match" — respect it instead of paying LLM cost to second-guess.
+            if result:
+                return result
+            logger.info(
+                "[wiki-search] memforge returned no sections (wiki=%s); "
+                "not falling back to local because the query itself succeeded",
+                wiki_name,
+            )
+            return ""
 
     return await _search_local(prompt, wiki_name, cfg)
 

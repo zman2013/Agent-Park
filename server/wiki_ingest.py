@@ -1087,3 +1087,52 @@ async def ingest_agent_tasks(
             "extract_retry_used": extract_retry_used,
         },
     }
+
+
+# ── Memforge reindex hook ─────────────────────────────────────────────────────
+
+
+async def maybe_trigger_memforge_reindex() -> None:
+    """If configured, refresh the memforge index after a successful ingest.
+
+    Shared entry point used by both the in-process scheduler
+    (``server.routes_ws._run_daily_wiki_ingest``) and the CLI script
+    (``scripts/wiki_ingest.py``). Any failure is logged but does not affect
+    the caller's outcome.
+    """
+    from server.config import wiki_ingest_config
+    from server.memforge_client import memforge_reindex, MemforgeError
+
+    cfg = wiki_ingest_config()
+    if not cfg.get("memforge_reindex_enabled"):
+        return
+
+    script = (cfg.get("memforge_reindex_script") or "").strip()
+    if not script:
+        logger.info(
+            "[memforge] reindex enabled but 'memforge_reindex_script' is not "
+            "configured; skipping."
+        )
+        return
+    timeout = float(cfg.get("memforge_reindex_timeout", 600))
+
+    extra_targets: dict[str, str] = {}
+    wiki_base = (cfg.get("wiki_base") or "").strip()
+    if wiki_base:
+        extra_targets["wiki"] = wiki_base
+
+    logger.info(
+        "[memforge] triggering reindex (script=%s, timeout=%ss)", script, timeout,
+    )
+    try:
+        rc = await memforge_reindex(
+            kind="wiki", timeout=timeout, script_path=script, quiet=True,
+            extra_targets=extra_targets or None,
+        )
+    except MemforgeError as exc:
+        logger.warning("[memforge] reindex skipped: %s", exc)
+        return
+    if rc == 0:
+        logger.info("[memforge] reindex completed.")
+    else:
+        logger.warning("[memforge] reindex exit=%s (see logs)", rc)

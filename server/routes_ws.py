@@ -182,7 +182,7 @@ async def _wiki_ingest_loop() -> None:
 
 async def _run_daily_wiki_ingest(date: str) -> None:
     """Run wiki ingest for all agents that have a wiki configured."""
-    from server.wiki_ingest import ingest_agent_tasks
+    from server.wiki_ingest import ingest_agent_tasks, maybe_trigger_memforge_reindex
     from server.wiki_notify import send_wiki_digest
     from server.config import wiki_ingest_config
 
@@ -225,6 +225,14 @@ async def _run_daily_wiki_ingest(date: str) -> None:
             await send_wiki_digest(feishu_cfg, all_results, date)
         except Exception:
             logger.exception("Wiki digest notification failed")
+
+    # Refresh memforge vector index so the next agent prompts see new knowledge.
+    # No-op unless wiki_ingest.memforge_reindex_enabled=true; failures are
+    # logged and do not affect the scheduler loop.
+    try:
+        await maybe_trigger_memforge_reindex()
+    except Exception:
+        logger.exception("memforge reindex hook crashed")
 
 
 def task_created_message(task) -> dict[str, Any]:

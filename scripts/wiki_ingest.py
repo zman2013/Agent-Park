@@ -34,6 +34,7 @@ from server.state import app_state
 from server.wiki_ingest import (
     _wiki_dir, load_ingested, save_ingested, ensure_wiki_structure,
     ingest_task, ingest_agent_tasks,
+    maybe_trigger_memforge_reindex,
 )
 
 DATA_DIR = PROJECT_ROOT / "data"
@@ -225,50 +226,7 @@ async def run_single_task(session_or_task_id: str, force: bool = False, wiki_ove
         print(f"  [{pa['action']}] {pa['file']}")
     print(f"Files written: {len(files)}")
 
-    await _maybe_trigger_memforge_reindex()
-
-
-# ── Memforge reindex hook ─────────────────────────────────────────────────────
-
-
-async def _maybe_trigger_memforge_reindex() -> None:
-    """If configured, refresh the memforge index after a successful ingest.
-
-    Any failure is logged but does not affect the ingest outcome.
-    """
-    cfg = wiki_ingest_config()
-    if not cfg.get("memforge_reindex_enabled"):
-        return
-
-    script = (cfg.get("memforge_reindex_script") or "").strip()
-    if not script:
-        print(
-            "[memforge] reindex enabled but 'memforge_reindex_script' is not "
-            "configured; skipping."
-        )
-        return
-    timeout = float(cfg.get("memforge_reindex_timeout", 600))
-
-    from server.memforge_client import memforge_reindex, MemforgeError
-
-    extra_targets: dict[str, str] = {}
-    wiki_base = (cfg.get("wiki_base") or "").strip()
-    if wiki_base:
-        extra_targets["wiki"] = wiki_base
-
-    print(f"\n[memforge] triggering reindex (script={script}, timeout={timeout}s)...")
-    try:
-        rc = await memforge_reindex(
-            kind="wiki", timeout=timeout, script_path=script, quiet=True,
-            extra_targets=extra_targets or None,
-        )
-    except MemforgeError as exc:
-        print(f"[memforge] reindex skipped: {exc}")
-        return
-    if rc == 0:
-        print("[memforge] reindex completed.")
-    else:
-        print(f"[memforge] reindex exit={rc} (see logs)")
+    await maybe_trigger_memforge_reindex()
 
 
 # ── Batch mode ────────────────────────────────────────────────────────────────
@@ -341,7 +299,7 @@ async def run_batch(date: str | None = None) -> None:
     print(f"\n{'='*60}")
     print(f"Summary: {total_processed} tasks processed, {total_skipped} skipped, {total_errors} errors")
 
-    await _maybe_trigger_memforge_reindex()
+    await maybe_trigger_memforge_reindex()
 
     # Send Feishu notification
     feishu_cfg = cfg.get("feishu_notify", {})
