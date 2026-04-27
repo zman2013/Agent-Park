@@ -1,4 +1,16 @@
-"""Wiki knowledge pre-retrieval for agent prompts."""
+"""Wiki knowledge pre-retrieval for agent prompts.
+
+Two backends are supported:
+
+* ``local``    — read ``{wiki}/index.md`` and let an LLM pick relevant pages.
+* ``memforge`` — query the memforge knowledge index through its unified
+                 entrypoint script and use the returned sources.
+
+``local`` is the default so existing deployments keep working with no extra
+setup. ``memforge`` requires the memforge script to be available at
+``wiki_search.memforge_script``; if it fails at runtime we fall back to
+``local`` automatically so the agent never sees a degraded prompt.
+"""
 from __future__ import annotations
 
 import logging
@@ -10,16 +22,44 @@ logger = logging.getLogger(__name__)
 
 
 async def search_wiki(prompt: str, wiki_name: str) -> str:
-    """Search wiki for knowledge relevant to prompt.
-
-    Returns a formatted <wiki-context> block, or empty string if nothing found
-    or any error occurs (never raises).
-    """
+    """Return a formatted <wiki-context> block, or '' on any failure."""
     from server.config import wiki_search_config
-    from server.wiki_ingest import _llm_call, _parse_json_from_llm_output
 
     cfg = wiki_search_config()
-    wiki_base = Path(cfg["wiki_base"])
+    backend = cfg.get("backend", "local")
+
+    if backend == "memforge":
+        try:
+            result = await _search_memforge(prompt, wiki_name, cfg)
+            if result:
+                return result
+            logger.info(
+                "[wiki-search] memforge returned no sections, falling back to local (wiki=%s)",
+                wiki_name,
+            )
+        except Exception:
+            logger.exception(
+                "[wiki-search] memforge backend failed, falling back to local (wiki=%s)",
+                wiki_name,
+            )
+
+    return await _search_local(prompt, wiki_name, cfg)
+
+
+# ── Local backend (LLM picks pages from index.md) ─────────────────────────────
+
+
+async def _search_local(prompt: str, wiki_name: str, cfg: dict) -> str:
+    from server.wiki_ingest import _llm_call, _parse_json_from_llm_output
+
+    wiki_base_raw = cfg.get("wiki_base") or ""
+    if not wiki_base_raw:
+        logger.info(
+            "[wiki-search] wiki_base not configured; skipping local search (wiki=%s)",
+            wiki_name,
+        )
+        return ""
+    wiki_base = Path(wiki_base_raw)
     wiki_dir = wiki_base / wiki_name
     index_path = wiki_dir / "index.md"
 
@@ -33,7 +73,6 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
         logger.exception("[wiki-search] failed to read index: %s", index_path)
         return ""
 
-    # Ask LLM which pages are relevant
     selection_prompt = (
         f"你是 wiki 知识检索引擎。根据用户任务，从索引中选出相关页面。\n\n"
         f"用户任务：{prompt}\n\n"
@@ -66,11 +105,9 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
 
     logger.info("[wiki-search] selected pages: %s", filenames)
 
-    # Build context from each matched page's frontmatter
-    sections: list[str] = []
     pages_dir = wiki_dir / "pages"
+    sections: list[str] = []
     for filename in filenames[: cfg["max_pages"]]:
-        # Normalize: accept "pages/foo.md" or just "foo.md"
         name = filename.replace("pages/", "").strip("/")
         page_path = pages_dir / name
         if not page_path.exists():
@@ -82,6 +119,110 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
         else:
             logger.warning("[wiki-search] failed to format page: %s", page_path)
 
+    return _wrap_context(sections, wiki_name)
+
+
+# ── Memforge backend (vector search via unified entrypoint) ───────────────────
+
+
+async def _search_memforge(prompt: str, wiki_name: str, cfg: dict) -> str:
+    from server.memforge_client import memforge_search
+
+    script_path = cfg.get("memforge_script", "") or ""
+    if not script_path:
+        logger.info(
+            "[wiki-search] wiki_search.memforge_script not configured; "
+            "falling back to local (wiki=%s)",
+            wiki_name,
+        )
+        return ""
+
+    wiki_base_raw = cfg.get("wiki_base") or ""
+    if not wiki_base_raw:
+        logger.info(
+            "[wiki-search] wiki_base not configured; cannot resolve page paths "
+            "for memforge hits (wiki=%s)",
+            wiki_name,
+        )
+        return ""
+
+    top_k = int(cfg.get("top_k") or cfg.get("max_pages") or 5)
+    timeout = float(cfg.get("timeout", 15))
+    max_pages = int(cfg.get("max_pages", 5))
+
+    # Query a bit more than we need so we still have enough after filtering
+    # out other wikis and deduping pages.
+    query_top_k = max(top_k, max_pages) * 2
+
+    logger.info(
+        "[wiki-search] memforge query (wiki=%s, script=%s, top_k=%d)\nprompt preview: %.200s",
+        wiki_name, script_path, query_top_k, prompt,
+    )
+
+    response = await memforge_search(
+        prompt,
+        kind="wiki",
+        top_k=query_top_k,
+        timeout=timeout,
+        script_path=script_path,
+        extra_targets={"wiki": wiki_base_raw},
+    )
+
+    semantic = response.get("semantic") or []
+    if not isinstance(semantic, list):
+        return ""
+
+    wiki_base = Path(wiki_base_raw)
+    wiki_dir = wiki_base / wiki_name
+    wiki_prefix = f"wiki/{wiki_name}/"
+
+    seen: set[Path] = set()
+    page_paths: list[Path] = []
+    for hit in semantic:
+        source = (hit or {}).get("source", "")
+        if not isinstance(source, str) or not source.startswith(wiki_prefix):
+            continue
+        rel = source[len(wiki_prefix):]
+        page_path = wiki_dir / rel
+        if page_path in seen:
+            continue
+        if not page_path.exists():
+            continue
+        # Only surface real page files (skip index.md / WIKI.md noise).
+        if page_path.suffix.lower() != ".md":
+            continue
+        if page_path.name in ("index.md", "WIKI.md", "log.md"):
+            continue
+        seen.add(page_path)
+        page_paths.append(page_path)
+        if len(page_paths) >= max_pages:
+            break
+
+    if not page_paths:
+        logger.info(
+            "[wiki-search] memforge returned 0 eligible pages for wiki=%s (semantic=%d)",
+            wiki_name, len(semantic),
+        )
+        return ""
+
+    logger.info(
+        "[wiki-search] memforge selected pages: %s",
+        [str(p.relative_to(wiki_dir.parent)) for p in page_paths],
+    )
+
+    sections: list[str] = []
+    for page_path in page_paths:
+        section = _format_page_section(page_path, wiki_dir)
+        if section:
+            sections.append(section)
+
+    return _wrap_context(sections, wiki_name)
+
+
+# ── Shared formatting helpers ─────────────────────────────────────────────────
+
+
+def _wrap_context(sections: list[str], wiki_name: str) -> str:
     if not sections:
         logger.info("[wiki-search] no sections built, returning empty (wiki=%s)", wiki_name)
         return ""

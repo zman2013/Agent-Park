@@ -64,28 +64,44 @@ def knowledge_config() -> dict:
 
 
 def wiki_search_config() -> dict:
-    """Return wiki search configuration with defaults."""
+    """Return wiki search configuration with defaults.
+
+    Path fields (``memforge_script``, ``wiki_base``) have no hardcoded defaults;
+    callers must supply them via config.json. Empty string means "not
+    configured" — the relevant code path is expected to degrade gracefully.
+    """
     cfg = get_config().get("wiki_search", {})
     wiki_cfg = wiki_ingest_config()
     return {
+        "backend": cfg.get("backend", "local"),
+        "memforge_script": cfg.get("memforge_script", ""),
         "command": cfg.get("command", wiki_cfg["command"]),
         "wiki_base": cfg.get("wiki_base", wiki_cfg["wiki_base"]),
         "timeout": int(cfg.get("timeout", 30)),
         "max_pages": int(cfg.get("max_pages", 5)),
+        "top_k": int(cfg.get("top_k", 5)),
     }
 
 
 def wiki_ingest_config() -> dict:
-    """Return the wiki ingest configuration with defaults."""
+    """Return the wiki ingest configuration with defaults.
+
+    Path fields (``wiki_base``, ``memforge_reindex_script``) have no hardcoded
+    defaults; callers must supply them via config.json. Empty string means
+    "not configured" — callers should handle that explicitly.
+    """
     cfg = get_config().get("wiki_ingest", {})
     feishu_cfg = cfg.get("feishu_notify", {})
     schedule_cfg = cfg.get("schedule", {})
     return {
         "command": cfg.get("command", "qwen"),
-        "wiki_base": cfg.get("wiki_base", "/data1/common/wiki"),
+        "wiki_base": cfg.get("wiki_base", ""),
         "timeout": int(cfg.get("timeout", 300)),
         "max_message_chars": int(cfg.get("max_message_chars", 50000)),
         "retry_commands": cfg.get("retry_commands", ["glm", "ccs"]),
+        "memforge_reindex_enabled": bool(cfg.get("memforge_reindex_enabled", False)),
+        "memforge_reindex_script": cfg.get("memforge_reindex_script", ""),
+        "memforge_reindex_timeout": int(cfg.get("memforge_reindex_timeout", 600)),
         "feishu_notify": {
             "enabled": feishu_cfg.get("enabled", False),
             "cli_path": feishu_cfg.get("cli_path", ""),
