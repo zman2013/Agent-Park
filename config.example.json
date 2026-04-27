@@ -21,6 +21,47 @@
     "hotfiles_recent_days": 7,
     "default_task_count": 5
   },
+  "wiki_ingest": {
+    "command": "qwen",
+
+    "_comment_wiki_base": "REQUIRED: absolute path to the directory that holds your wikis. No hardcoded default — leave empty and wiki ingest/search will refuse to run.",
+    "wiki_base": "/data1/common/wiki",
+
+    "timeout": 300,
+    "max_message_chars": 50000,
+    "retry_commands": ["glm", "ccs"],
+
+    "_comment_memforge": "ingest 完成后是否调用 memforge 增量刷新向量索引；默认关闭，保持现有 local 行为不变",
+    "memforge_reindex_enabled": false,
+
+    "_comment_memforge_script": "REQUIRED when memforge_reindex_enabled=true: absolute path to memforge.sh. No hardcoded default.",
+    "memforge_reindex_script": "/data1/common/memory/scripts/memforge.sh",
+    "memforge_reindex_timeout": 600,
+
+    "feishu_notify": {
+      "enabled": false,
+      "cli_path": "/path/to/feishu/cli.py",
+      "chat_id": "oc_xxx",
+      "env_file": "/path/to/feishu/.env"
+    },
+    "schedule": {
+      "enabled": true,
+      "hour": 0,
+      "minute": 0
+    }
+  },
+  "wiki_search": {
+    "_comment_backend": "local = 现有行为，让 LLM 从 index.md 中选页；memforge = 走 memforge 向量检索。memforge 失败会自动降级为 local。",
+    "backend": "local",
+
+    "_comment_memforge_script": "REQUIRED when backend=memforge: absolute path to memforge.sh. No hardcoded default.",
+    "memforge_script": "/data1/common/memory/scripts/memforge.sh",
+
+    "command": "qwen",
+    "timeout": 30,
+    "max_pages": 5,
+    "top_k": 5
+  },
   "agents": [
     {
       "name": "my-agent",

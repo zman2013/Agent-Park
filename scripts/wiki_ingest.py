@@ -38,7 +38,20 @@ from server.wiki_ingest import (
 
 DATA_DIR = PROJECT_ROOT / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
-WIKI_ROOT = "/data1/common/wiki"
+
+
+def _require_wiki_base(cfg: dict) -> str:
+    """Return wiki_base from config, or abort with a clear error if missing."""
+    base = (cfg.get("wiki_base") or "").strip()
+    if not base:
+        print(
+            "Error: wiki_ingest.wiki_base is not configured in config.json. "
+            "Set it to the directory that holds your wikis "
+            "(e.g. \"/data1/common/wiki\").",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return base
 
 
 # ── Single task helpers ───────────────────────────────────────────────────────
@@ -133,8 +146,9 @@ async def run_single_task(session_or_task_id: str, force: bool = False, wiki_ove
         sys.exit(1)
 
     cfg = _wiki_cfg()
+    wiki_base = _require_wiki_base(cfg)
     wiki_name = wiki_override or auto_wiki
-    wiki_dir = _wiki_dir(wiki_name, WIKI_ROOT)
+    wiki_dir = _wiki_dir(wiki_name, wiki_base)
     ensure_wiki_structure(wiki_dir, wiki_name)
 
     task_name = getattr(task, "name", "")
@@ -158,7 +172,7 @@ async def run_single_task(session_or_task_id: str, force: bool = False, wiki_ove
     result = await ingest_task(
         task, wiki_name,
         command=cfg["command"],
-        wiki_base=WIKI_ROOT,
+        wiki_base=wiki_base,
         timeout=cfg["timeout"],
         max_message_chars=cfg["max_message_chars"],
         retry_commands=cfg.get("retry_commands", ["glm", "ccs"]),
@@ -210,6 +224,51 @@ async def run_single_task(session_or_task_id: str, force: bool = False, wiki_ove
     for pa in page_actions:
         print(f"  [{pa['action']}] {pa['file']}")
     print(f"Files written: {len(files)}")
+
+    await _maybe_trigger_memforge_reindex()
+
+
+# ── Memforge reindex hook ─────────────────────────────────────────────────────
+
+
+async def _maybe_trigger_memforge_reindex() -> None:
+    """If configured, refresh the memforge index after a successful ingest.
+
+    Any failure is logged but does not affect the ingest outcome.
+    """
+    cfg = wiki_ingest_config()
+    if not cfg.get("memforge_reindex_enabled"):
+        return
+
+    script = (cfg.get("memforge_reindex_script") or "").strip()
+    if not script:
+        print(
+            "[memforge] reindex enabled but 'memforge_reindex_script' is not "
+            "configured; skipping."
+        )
+        return
+    timeout = float(cfg.get("memforge_reindex_timeout", 600))
+
+    from server.memforge_client import memforge_reindex, MemforgeError
+
+    extra_targets: dict[str, str] = {}
+    wiki_base = (cfg.get("wiki_base") or "").strip()
+    if wiki_base:
+        extra_targets["wiki"] = wiki_base
+
+    print(f"\n[memforge] triggering reindex (script={script}, timeout={timeout}s)...")
+    try:
+        rc = await memforge_reindex(
+            kind="wiki", timeout=timeout, script_path=script, quiet=True,
+            extra_targets=extra_targets or None,
+        )
+    except MemforgeError as exc:
+        print(f"[memforge] reindex skipped: {exc}")
+        return
+    if rc == 0:
+        print("[memforge] reindex completed.")
+    else:
+        print(f"[memforge] reindex exit={rc} (see logs)")
 
 
 # ── Batch mode ────────────────────────────────────────────────────────────────
@@ -281,6 +340,8 @@ async def run_batch(date: str | None = None) -> None:
 
     print(f"\n{'='*60}")
     print(f"Summary: {total_processed} tasks processed, {total_skipped} skipped, {total_errors} errors")
+
+    await _maybe_trigger_memforge_reindex()
 
     # Send Feishu notification
     feishu_cfg = cfg.get("feishu_notify", {})

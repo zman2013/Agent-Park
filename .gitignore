@@ -9,6 +9,7 @@ frontend/dist/
 *.pid
 logs/
 data/
+out/
 
 # Dolt database files (added by bd init)
 .dolt/

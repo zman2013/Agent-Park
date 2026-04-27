@@ -882,7 +882,7 @@ async def ingest_task(
     task,
     wiki_name: str,
     command: str,
-    wiki_base: str = "/data1/common/wiki",
+    wiki_base: str,
     timeout: int = 300,
     max_message_chars: int = 50000,
     retry_commands: list[str] | None = None,
@@ -967,6 +967,9 @@ async def ingest_agent_tasks(
     timeout = cfg["timeout"]
     max_message_chars = cfg["max_message_chars"]
     retry_commands = cfg.get("retry_commands", RETRY_COMMANDS)
+
+    if not wiki_base:
+        return {"error": "wiki_ingest.wiki_base is not configured in config.json"}
 
     agent = app_state.get_agent(agent_id)
     if not agent:
