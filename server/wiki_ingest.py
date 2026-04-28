@@ -955,7 +955,14 @@ async def ingest_agent_tasks(
     retry_commands = cfg.get("retry_commands", RETRY_COMMANDS)
 
     if not wiki_base:
-        return {"error": "wiki_ingest.wiki_base is not configured in config.json"}
+        # Hard failure: the scheduled caller (routes_ws._run_daily_wiki_ingest)
+        # treats a returned dict as a successful completion and would log
+        # "processed=0 skipped=0" silently on every daily run. Raise so the
+        # misconfiguration surfaces via the scheduler's exception handler
+        # (which logs at ERROR level and appends an error result).
+        raise RuntimeError(
+            "wiki_ingest.wiki_base is not configured in config.json"
+        )
 
     agent = app_state.get_agent(agent_id)
     if not agent:

@@ -211,12 +211,12 @@ async def _run_daily_wiki_ingest(date: str) -> None:
                 result.get("tasks_processed", 0),
                 result.get("tasks_skipped", 0),
             )
-        except Exception:
+        except Exception as exc:
             logger.exception("Wiki ingest failed for agent %s", agent_id)
             all_results.append({
                 "agent_id": agent_id,
                 "wiki": wiki_name,
-                "error": str(Exception),
+                "error": str(exc),
             })
 
     if all_results:

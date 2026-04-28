@@ -241,9 +241,27 @@ async def _search_memforge(prompt: str, wiki_name: str, cfg: dict) -> str:
             break
 
     if not page_paths:
+        # Distinguish two zero-result cases:
+        # 1. semantic was already empty → memforge itself found no match. Respect
+        #    that as "no match" (return "" from dispatcher, skip local).
+        # 2. semantic had hits but our wiki_prefix filter drained them (common
+        #    in multi-wiki indexes where top-k is dominated by other wikis).
+        #    Local selection may still surface relevant pages — raise so the
+        #    dispatcher falls back instead of losing wiki context entirely.
+        if semantic:
+            logger.info(
+                "[wiki-search] memforge returned %d hits but none matched "
+                "wiki_prefix=%s (likely dominated by other wikis); "
+                "falling back to local",
+                len(semantic), wiki_prefix,
+            )
+            raise _MemforgeUnavailable(
+                f"memforge top-k dominated by other wikis "
+                f"({len(semantic)} hits, 0 for {wiki_name})"
+            )
         logger.info(
-            "[wiki-search] memforge returned 0 eligible pages for wiki=%s (semantic=%d)",
-            wiki_name, len(semantic),
+            "[wiki-search] memforge returned 0 hits for wiki=%s (true no-match)",
+            wiki_name,
         )
         return ""
 
