@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Migration script: generate L0 summary and L1 overview for existing wiki pages.
 
-Scans all wiki pages under /data1/common/wiki, finds those missing
+Scans all wiki pages under the configured wiki base, finds those missing
 summary or overview in frontmatter, calls LLM to generate them, and
 writes back to the file.
 
@@ -219,8 +219,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--wiki-dir",
         type=str,
-        default="/data1/common/wiki",
-        help="Path to wiki root directory (default: /data1/common/wiki)",
+        default=None,
+        help="Path to wiki root directory (default: wiki_ingest.wiki_base from config.json)",
     )
     parser.add_argument(
         "--command",
@@ -244,9 +244,18 @@ if __name__ == "__main__":
     cfg = _get_config()
     command = args.command or cfg.get("command", "claude")
 
+    wiki_dir = args.wiki_dir or (cfg.get("wiki_base") or "").strip()
+    if not wiki_dir:
+        print(
+            "Error: wiki directory is not configured. Pass --wiki-dir or set "
+            "wiki_ingest.wiki_base in config.json.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
     asyncio.run(
         main(
-            wiki_dir=args.wiki_dir,
+            wiki_dir=wiki_dir,
             command=command,
             dry_run=args.dry_run,
             timeout=args.timeout,

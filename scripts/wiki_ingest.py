@@ -34,11 +34,25 @@ from server.state import app_state
 from server.wiki_ingest import (
     _wiki_dir, load_ingested, save_ingested, ensure_wiki_structure,
     ingest_task, ingest_agent_tasks,
+    maybe_trigger_memforge_reindex,
 )
 
 DATA_DIR = PROJECT_ROOT / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
-WIKI_ROOT = "/data1/common/wiki"
+
+
+def _require_wiki_base(cfg: dict) -> str:
+    """Return wiki_base from config, or abort with a clear error if missing."""
+    base = (cfg.get("wiki_base") or "").strip()
+    if not base:
+        print(
+            "Error: wiki_ingest.wiki_base is not configured in config.json. "
+            "Set it to the directory that holds your wikis "
+            "(e.g. \"/data1/common/wiki\").",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return base
 
 
 # ── Single task helpers ───────────────────────────────────────────────────────
@@ -133,8 +147,9 @@ async def run_single_task(session_or_task_id: str, force: bool = False, wiki_ove
         sys.exit(1)
 
     cfg = _wiki_cfg()
+    wiki_base = _require_wiki_base(cfg)
     wiki_name = wiki_override or auto_wiki
-    wiki_dir = _wiki_dir(wiki_name, WIKI_ROOT)
+    wiki_dir = _wiki_dir(wiki_name, wiki_base)
     ensure_wiki_structure(wiki_dir, wiki_name)
 
     task_name = getattr(task, "name", "")
@@ -158,7 +173,7 @@ async def run_single_task(session_or_task_id: str, force: bool = False, wiki_ove
     result = await ingest_task(
         task, wiki_name,
         command=cfg["command"],
-        wiki_base=WIKI_ROOT,
+        wiki_base=wiki_base,
         timeout=cfg["timeout"],
         max_message_chars=cfg["max_message_chars"],
         retry_commands=cfg.get("retry_commands", ["glm", "ccs"]),
@@ -210,6 +225,8 @@ async def run_single_task(session_or_task_id: str, force: bool = False, wiki_ove
     for pa in page_actions:
         print(f"  [{pa['action']}] {pa['file']}")
     print(f"Files written: {len(files)}")
+
+    await maybe_trigger_memforge_reindex()
 
 
 # ── Batch mode ────────────────────────────────────────────────────────────────
@@ -281,6 +298,8 @@ async def run_batch(date: str | None = None) -> None:
 
     print(f"\n{'='*60}")
     print(f"Summary: {total_processed} tasks processed, {total_skipped} skipped, {total_errors} errors")
+
+    await maybe_trigger_memforge_reindex()
 
     # Send Feishu notification
     feishu_cfg = cfg.get("feishu_notify", {})

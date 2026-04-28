@@ -866,7 +866,7 @@ async def ingest_task(
     task,
     wiki_name: str,
     command: str,
-    wiki_base: str = "/data1/common/wiki",
+    wiki_base: str,
     timeout: int = 300,
     max_message_chars: int = 50000,
     retry_commands: list[str] | None = None,
@@ -953,6 +953,16 @@ async def ingest_agent_tasks(
     timeout = cfg["timeout"]
     max_message_chars = cfg["max_message_chars"]
     retry_commands = cfg.get("retry_commands", RETRY_COMMANDS)
+
+    if not wiki_base:
+        # Hard failure: the scheduled caller (routes_ws._run_daily_wiki_ingest)
+        # treats a returned dict as a successful completion and would log
+        # "processed=0 skipped=0" silently on every daily run. Raise so the
+        # misconfiguration surfaces via the scheduler's exception handler
+        # (which logs at ERROR level and appends an error result).
+        raise RuntimeError(
+            "wiki_ingest.wiki_base is not configured in config.json"
+        )
 
     agent = app_state.get_agent(agent_id)
     if not agent:
@@ -1070,3 +1080,52 @@ async def ingest_agent_tasks(
             "extract_retry_used": extract_retry_used,
         },
     }
+
+
+# ── Memforge reindex hook ─────────────────────────────────────────────────────
+
+
+async def maybe_trigger_memforge_reindex() -> None:
+    """If configured, refresh the memforge index after a successful ingest.
+
+    Shared entry point used by both the in-process scheduler
+    (``server.routes_ws._run_daily_wiki_ingest``) and the CLI script
+    (``scripts/wiki_ingest.py``). Any failure is logged but does not affect
+    the caller's outcome.
+    """
+    from server.config import wiki_ingest_config
+    from server.memforge_client import memforge_reindex, MemforgeError
+
+    cfg = wiki_ingest_config()
+    if not cfg.get("memforge_reindex_enabled"):
+        return
+
+    script = (cfg.get("memforge_reindex_script") or "").strip()
+    if not script:
+        logger.info(
+            "[memforge] reindex enabled but 'memforge_reindex_script' is not "
+            "configured; skipping."
+        )
+        return
+    timeout = float(cfg.get("memforge_reindex_timeout", 600))
+
+    extra_targets: dict[str, str] = {}
+    wiki_base = (cfg.get("wiki_base") or "").strip()
+    if wiki_base:
+        extra_targets["wiki"] = wiki_base
+
+    logger.info(
+        "[memforge] triggering reindex (script=%s, timeout=%ss)", script, timeout,
+    )
+    try:
+        rc = await memforge_reindex(
+            kind="wiki", timeout=timeout, script_path=script, quiet=True,
+            extra_targets=extra_targets or None,
+        )
+    except MemforgeError as exc:
+        logger.warning("[memforge] reindex skipped: %s", exc)
+        return
+    if rc == 0:
+        logger.info("[memforge] reindex completed.")
+    else:
+        logger.warning("[memforge] reindex exit=%s (see logs)", rc)
