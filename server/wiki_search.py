@@ -23,6 +23,14 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+class _MemforgeUnavailable(Exception):
+    """Raised when the memforge backend cannot run (missing config, etc.).
+
+    Distinguishes "setup not available" (→ fall back to local) from a
+    successful memforge query that returned zero hits (→ respect as "no match").
+    """
+
+
 async def search_wiki(prompt: str, wiki_name: str) -> str:
     """Return a formatted <wiki-context> block, or '' on any failure."""
     from server.config import wiki_search_config
@@ -33,6 +41,11 @@ async def search_wiki(prompt: str, wiki_name: str) -> str:
     if backend == "memforge":
         try:
             result = await _search_memforge(prompt, wiki_name, cfg)
+        except _MemforgeUnavailable as exc:
+            logger.info(
+                "[wiki-search] memforge unavailable (%s); falling back to local (wiki=%s)",
+                exc, wiki_name,
+            )
         except Exception:
             logger.exception(
                 "[wiki-search] memforge backend failed, falling back to local (wiki=%s)",
@@ -165,21 +178,15 @@ async def _search_memforge(prompt: str, wiki_name: str, cfg: dict) -> str:
 
     script_path = cfg.get("memforge_script", "") or ""
     if not script_path:
-        logger.info(
-            "[wiki-search] wiki_search.memforge_script not configured; "
-            "falling back to local (wiki=%s)",
-            wiki_name,
+        raise _MemforgeUnavailable(
+            "wiki_search.memforge_script not configured"
         )
-        return ""
 
     wiki_base_raw = cfg.get("wiki_base") or ""
     if not wiki_base_raw:
-        logger.info(
-            "[wiki-search] wiki_base not configured; cannot resolve page paths "
-            "for memforge hits (wiki=%s)",
-            wiki_name,
+        raise _MemforgeUnavailable(
+            "wiki_search.wiki_base not configured"
         )
-        return ""
 
     top_k = int(cfg.get("top_k") or cfg.get("max_pages") or 5)
     timeout = float(cfg.get("timeout", 15))
