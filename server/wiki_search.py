@@ -210,12 +210,23 @@ async def _search_memforge(prompt: str, wiki_name: str, cfg: dict) -> str:
         extra_targets={"wiki": wiki_base_raw},
     )
 
-    semantic = response.get("semantic") or []
+    semantic = response.get("semantic")
+    if semantic is None:
+        # Missing key is tolerated as "no hits" — some memforge versions may
+        # omit the field rather than returning []. Normalize to empty list.
+        semantic = []
     if not isinstance(semantic, list):
-        return ""
+        # A non-list payload signals a malformed response (e.g. error object
+        # returned with exit 0, schema mismatch). Treating this as "zero hits"
+        # would silently skip local fallback. Raise so the dispatcher degrades
+        # to local selection.
+        raise _MemforgeUnavailable(
+            f"memforge response has non-list 'semantic' field: {type(semantic).__name__}"
+        )
 
     wiki_base = Path(wiki_base_raw)
-    wiki_dir = wiki_base / wiki_name
+    wiki_dir = (wiki_base / wiki_name).resolve()
+    pages_root = (wiki_dir / "pages").resolve()
     wiki_prefix = f"wiki/{wiki_name}/"
 
     seen: set[Path] = set()
@@ -225,7 +236,21 @@ async def _search_memforge(prompt: str, wiki_name: str, cfg: dict) -> str:
         if not isinstance(source, str) or not source.startswith(wiki_prefix):
             continue
         rel = source[len(wiki_prefix):]
-        page_path = wiki_dir / rel
+        # Resolve and enforce containment under the wiki's pages/ directory so
+        # malformed index entries (e.g. `..` segments) cannot escape and pull
+        # in unrelated markdown files as prompt context.
+        try:
+            page_path = (wiki_dir / rel).resolve()
+        except (OSError, ValueError):
+            continue
+        try:
+            page_path.relative_to(pages_root)
+        except ValueError:
+            logger.warning(
+                "[wiki-search] memforge source escaped pages dir, skipping: %s",
+                source,
+            )
+            continue
         if page_path in seen:
             continue
         if not page_path.exists():
@@ -250,14 +275,15 @@ async def _search_memforge(prompt: str, wiki_name: str, cfg: dict) -> str:
         #    dispatcher falls back instead of losing wiki context entirely.
         if semantic:
             logger.info(
-                "[wiki-search] memforge returned %d hits but none matched "
-                "wiki_prefix=%s (likely dominated by other wikis); "
+                "[wiki-search] memforge returned %d hits but none survived "
+                "wiki_prefix/containment filter for %s "
+                "(likely dominated by other wikis or malformed sources); "
                 "falling back to local",
                 len(semantic), wiki_prefix,
             )
             raise _MemforgeUnavailable(
-                f"memforge top-k dominated by other wikis "
-                f"({len(semantic)} hits, 0 for {wiki_name})"
+                f"memforge top-k yielded 0 usable hits for {wiki_name} "
+                f"({len(semantic)} total hits filtered out)"
             )
         logger.info(
             "[wiki-search] memforge returned 0 hits for wiki=%s (true no-match)",
