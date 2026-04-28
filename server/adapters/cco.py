@@ -54,8 +54,12 @@ class CcoAdapter(BaseAdapter):
     async def handle_chunk(self, chunk: dict[str, Any], ctx: ChunkContext) -> None:
         chunk_type = chunk.get("type", "")
 
-        if chunk_type == "system" and chunk.get("subtype") == "init":
-            await self._handle_system_init(chunk, ctx)
+        if chunk_type == "system":
+            subtype = chunk.get("subtype")
+            if subtype == "init":
+                await self._handle_system_init(chunk, ctx)
+            elif subtype == "compact_boundary":
+                await self._handle_compact_boundary(chunk, ctx)
             return
 
         if chunk_type == "stream_event":
@@ -80,6 +84,24 @@ class CcoAdapter(BaseAdapter):
         sid = chunk.get("session_id")
         if sid:
             await ctx.save_session(sid)
+
+    # ── compact boundary ────────────────────────────────────────────────
+
+    async def _handle_compact_boundary(self, chunk: dict, ctx: ChunkContext) -> None:
+        trigger = ""
+        meta = chunk.get("compact_metadata")
+        if isinstance(meta, dict):
+            trigger = meta.get("trigger") or ""
+        trigger_label = {
+            "auto": "自动触发",
+            "manual": "手动触发",
+        }.get(trigger, "")
+        suffix = f"（{trigger_label}）" if trigger_label else ""
+        notice = (
+            f"🗜️ 会话已压缩（compact）{suffix}。"
+            "系统为控制上下文长度重新生成了对话摘要，之前的详细历史已被折叠。"
+        )
+        await ctx.send_system_notice(notice)
 
     # ── stream_event ────────────────────────────────────────────────────
 
