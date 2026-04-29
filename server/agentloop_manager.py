@@ -173,7 +173,7 @@ def _pid_matches(pid: int, expected_start_time: int | None) -> bool:
     return current is not None and current == expected_start_time
 
 
-
+def _read_state(cwd: Path) -> dict[str, Any] | None:
     state_path = cwd / AGENTLOOP_DIR / STATE_FILE
     if not state_path.exists():
         return None
@@ -188,17 +188,18 @@ def _derive_status_from_state(state: dict[str, Any] | None) -> str:
 
     The agentloop CLI (``agentloop/loop.py``) returns ExitCode.SUCCESS without
     setting ``exhausted_reason`` when PM decides ``done`` and every todolist
-    item is done (loop.py:120–124). So the primary signal for a successful
-    completion is ``last_decision.next == "done"``; ``exhausted_reason`` only
-    fires on budget/limit/validation exhaustion.
+    item is done. When PM decides ``done`` but items remain, the loop now
+    calls ``mark_exhausted`` with reason ``"no actionable items"`` before
+    exiting — so ``exhausted_reason`` reliably distinguishes success from
+    exhaustion, and ``last_decision.next == "done"`` alone is insufficient.
     """
     if not state:
         return "unknown"
+    if state.get("exhausted_reason"):
+        return "exhausted"
     last = state.get("last_decision") or {}
     if last.get("next") == "done":
         return "done"
-    if state.get("exhausted_reason"):
-        return "exhausted"
     # Process gone but state shows neither done nor exhausted — likely crash
     # or manual kill.
     return "stopped"

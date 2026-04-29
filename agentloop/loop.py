@@ -125,10 +125,16 @@ def run(
         state.record_decision(decision)
 
         if decision.next == "done":
-            state.save(cwd)
             if todolist.items and all(it.status == "done" for it in todolist.items):
+                state.save(cwd)
                 return LoopResult(ExitCode.SUCCESS, decision.reason or "all done")
-            return LoopResult(ExitCode.EXHAUSTED, decision.reason or "no actionable items")
+            # PM said done but items remain non-done → we're exhausting with
+            # nothing actionable left. Persist that so `resume` knows not to
+            # silently re-enter the loop.
+            reason = decision.reason or "no actionable items"
+            state.mark_exhausted(reason)
+            state.save(cwd)
+            return LoopResult(ExitCode.EXHAUSTED, reason)
 
         if state.same_decision_count >= 3:
             reason = (
