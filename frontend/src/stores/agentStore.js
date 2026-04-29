@@ -495,22 +495,31 @@ export const useAgentStore = defineStore('agent', () => {
   }
 
   async function fetchAgentLoopSnapshot(loopId) {
+    // Capture which loop was selected at call time so a stale response from a
+    // previous loop (user switched before this request resolved) can't
+    // overwrite the now-current snapshot.
+    const requestedFor = loopId
     try {
       const res = await fetch(`/api/agentloops/${loopId}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
-      agentloopSnapshot.value = await res.json()
+      const data = await res.json()
+      if (selectedAgentLoopId.value !== requestedFor) return
+      agentloopSnapshot.value = data
     } catch (e) {
       // keep old snapshot on failure
     }
   }
 
   async function fetchAgentLoopRunLog(loopId, cycle) {
+    const requestedFor = { loopId, cycle }
     try {
       const res = await fetch(`/api/agentloops/${loopId}/runs/${cycle}`)
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
+      if (selectedAgentLoopId.value !== requestedFor.loopId) return
       agentloopRunLog.value = { cycle, lines: data.lines || [] }
     } catch (e) {
+      if (selectedAgentLoopId.value !== requestedFor.loopId) return
       agentloopRunLog.value = { cycle, lines: [] }
     }
   }

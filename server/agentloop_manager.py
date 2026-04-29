@@ -87,15 +87,50 @@ def _find(loop_id: str) -> dict[str, Any] | None:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Return True only if pid exists and is not a zombie.
+
+    ``os.kill(pid, 0)`` succeeds for zombies, which would keep a finished loop
+    stuck in ``running`` status (we launch detached and never waitpid, so a
+    crashed child lingers as a zombie until reaped by init when we exit the
+    session group). We additionally try a non-blocking reap — harmless if pid
+    is not our child — and check ``/proc/<pid>/status`` State to filter Z.
+    """
     if pid <= 0:
         return False
+    # Non-blocking reap: collects our own child if it has already exited, so
+    # subsequent probes see ProcessLookupError. Safe no-op if pid is not our
+    # direct child (raises ChildProcessError).
+    try:
+        reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if reaped_pid == pid:
+            return False
+    except ChildProcessError:
+        pass
+    except OSError:
+        pass
+
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Process exists, we just can't signal it.
+        # Process exists under another uid; can't introspect /proc status
+        # reliably, assume alive.
         return True
+
+    # Filter zombies via /proc (Linux-only; this project targets Linux per
+    # CLAUDE.md). Other platforms fall through and report alive.
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("State:"):
+                    # e.g. "State:\tZ (zombie)"
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] == "Z":
+                        return False
+                    break
+    except (FileNotFoundError, OSError):
+        return False
     return True
 
 
@@ -110,16 +145,23 @@ def _read_state(cwd: Path) -> dict[str, Any] | None:
 
 
 def _derive_status_from_state(state: dict[str, Any] | None) -> str:
-    """Infer a finished loop's status from its state.json."""
+    """Infer a finished loop's status from its state.json.
+
+    The agentloop CLI (``agentloop/loop.py``) returns ExitCode.SUCCESS without
+    setting ``exhausted_reason`` when PM decides ``done`` and every todolist
+    item is done (loop.py:120–124). So the primary signal for a successful
+    completion is ``last_decision.next == "done"``; ``exhausted_reason`` only
+    fires on budget/limit/validation exhaustion.
+    """
     if not state:
         return "unknown"
+    last = state.get("last_decision") or {}
+    if last.get("next") == "done":
+        return "done"
     if state.get("exhausted_reason"):
-        # distinguish "all done" from "stopped for budget/limit"
-        last = state.get("last_decision") or {}
-        if last.get("next") == "done":
-            return "done"
         return "exhausted"
-    # No exhaustion but process is gone — likely a crash or manual kill.
+    # Process gone but state shows neither done nor exhausted — likely crash
+    # or manual kill.
     return "stopped"
 
 
