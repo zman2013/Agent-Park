@@ -20,6 +20,13 @@
         @click="handleStop"
       >{{ stopping ? '停止中...' : '停止' }}</button>
       <button
+        v-else-if="snap && snap.status"
+        class="ml-2 px-2 py-0.5 bg-green-700/60 hover:bg-green-700 text-green-100 rounded text-xs transition-colors"
+        :disabled="starting"
+        :title="snap.exhausted_reason ? `从 ${snap.status} 状态继续执行 loop` : '启动 agentloop'"
+        @click="handleStart"
+      >{{ starting ? '启动中...' : '启动' }}</button>
+      <button
         class="ml-1 text-gray-600 hover:text-gray-300 transition-colors px-1 text-xs"
         title="关闭"
         @click="handleClose"
@@ -113,6 +120,7 @@ const store = useAgentStore()
 
 const selectedCycle = ref(null)
 const stopping = ref(false)
+const starting = ref(false)
 
 const snap = computed(() => store.agentloopSnapshot)
 const runLog = computed(() => store.agentloopRunLog)
@@ -163,6 +171,16 @@ async function handleStop() {
     await store.stopAgentLoop(props.loopId)
   } finally {
     stopping.value = false
+  }
+}
+
+async function handleStart() {
+  if (starting.value) return
+  starting.value = true
+  try {
+    await store.startAgentLoop(props.loopId)
+  } finally {
+    starting.value = false
   }
 }
 
