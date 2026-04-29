@@ -68,9 +68,10 @@ def test_cascade_closure_single_chain(tmp_path: Path):
         _dev("T-002", deps=["T-001"]),
         _dev("T-003", deps=["T-002"]),
     )
-    newly = _cascade(tmp_path, tl, cycle=7)
+    newly, downgraded = _cascade(tmp_path, tl, cycle=7)
     ids = {i for i, _ in newly}
     assert ids == {"T-002", "T-003"}
+    assert downgraded == []
     assert tl.by_id("T-002").status == "abandoned"
     assert tl.by_id("T-003").status == "abandoned"
 
@@ -93,10 +94,13 @@ def test_cascade_qa_abandoned_downgrades_dev(tmp_path: Path):
         _dev("T-001", status="ready_for_qa"),
         _qa("T-002", source="follows T-001", status="abandoned"),
     )
-    _cascade(tmp_path, tl, cycle=7)
+    newly, downgraded = _cascade(tmp_path, tl, cycle=7)
     # dev should be rolled back to pending so fuse gets another shot
     assert tl.by_id("T-001").status == "pending"
     assert "downgraded" in tl.by_id("T-001").attempt_log[-1].notes
+    # regression: downgrade must be reported so the loop persists it
+    assert newly == []
+    assert [i for i, _ in downgraded] == ["T-001"]
 
 
 def test_cascade_aggregated_qa_downgrades_all_reviewed_devs(tmp_path: Path):
@@ -107,7 +111,8 @@ def test_cascade_aggregated_qa_downgrades_all_reviewed_devs(tmp_path: Path):
         _dev("T-003", status="ready_for_qa"),
         _qa("T-010", source="follows T-001, T-002, T-003", status="abandoned"),
     )
-    _cascade(tmp_path, tl, cycle=7)
+    _, downgraded = _cascade(tmp_path, tl, cycle=7)
+    assert {i for i, _ in downgraded} == {"T-001", "T-002", "T-003"}
     for dev_id in ("T-001", "T-002", "T-003"):
         assert tl.by_id(dev_id).status == "pending", dev_id
         assert "downgraded" in tl.by_id(dev_id).attempt_log[-1].notes
@@ -115,7 +120,65 @@ def test_cascade_aggregated_qa_downgrades_all_reviewed_devs(tmp_path: Path):
 
 def test_cascade_empty_when_nothing_abandoned(tmp_path: Path):
     tl = _tl(_dev("T-001"), _dev("T-002", deps=["T-001"]))
-    assert _cascade(tmp_path, tl, cycle=3) == []
+    assert _cascade(tmp_path, tl, cycle=3) == ([], [])
+
+
+def test_loop_persists_downgrade_only_cascade(tmp_path: Path, monkeypatch):
+    """Regression (Codex P1): when _cascade only downgrades (no newly
+    abandoned) the main loop must still call scheduler_write, otherwise PM
+    dispatches a dev that the agent then sees as ``ready_for_qa`` on disk.
+    """
+    from agentloop import loop as scheduler
+    from agentloop.agents.base import RunResult
+    from agentloop.todolist import TODOLIST_FILE, parse as parse_tl, write as write_tl
+
+    tl = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _qa("T-002", source="follows T-001", status="abandoned"),
+    )
+    write_tl(tmp_path, tl)
+    design_path = tmp_path / "design.md"
+    design_path.write_text("# design\n", encoding="utf-8")
+
+    observed_status: dict[str, str] = {}
+
+    def spy_dev(cwd: Path, item_id: str, cycle: int, cfg) -> RunResult:
+        # What the agent would see on disk at dispatch time.
+        on_disk = parse_tl(cwd).by_id(item_id)
+        observed_status[item_id] = on_disk.status if on_disk else "missing"
+        # Finish the item so the loop can exit.
+        on_disk.status = "ready_for_qa"
+        from agentloop.todolist import Attempt, write as wt
+        on_disk.attempt_log.append(Attempt(cycle, "ready_for_qa", "ok"))
+        tl2 = parse_tl(cwd)
+        target = tl2.by_id(item_id)
+        target.status = "ready_for_qa"
+        target.attempt_log.append(Attempt(cycle, "ready_for_qa", "ok"))
+        wt(cwd, tl2)
+        return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1,
+                         cost_cny=0.0, success=True, errors=[])
+
+    def spy_qa(cwd: Path, item_id: str, cycle: int, cfg) -> RunResult:
+        tl2 = parse_tl(cwd)
+        qa = tl2.by_id(item_id)
+        from agentloop.validator import _reviewed_dev_ids
+        for dev_id in _reviewed_dev_ids(qa, tl2):
+            d = tl2.by_id(dev_id)
+            if d is not None:
+                d.status = "done"
+        qa.status = "done"
+        from agentloop.todolist import write as wt
+        wt(cwd, tl2)
+        return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1,
+                         cost_cny=0.0, success=True, errors=[])
+
+    monkeypatch.setattr("agentloop.loop.dev_agent.run", spy_dev)
+    monkeypatch.setattr("agentloop.loop.qa_agent.run", spy_qa)
+
+    scheduler.run(design_path, max_cycles=10)
+    # The dev agent must have observed T-001 at ``pending``, never the
+    # stale ``ready_for_qa`` that would leak through an unpersisted cascade.
+    assert observed_status.get("T-001") == "pending", observed_status
 
 
 # ---------- classify_terminal -----------------------------------------

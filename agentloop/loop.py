@@ -103,13 +103,23 @@ def run(
         # items. `_fuse` turns over-limit items abandoned; `_cascade` closes
         # the downstream DAG and downgrades stranded qa/dev pairs.
         fused = _fuse(cwd, todolist, config.limits.max_item_attempts, state.cycle)
-        cascaded = _cascade(cwd, todolist, state.cycle)
-        if fused or cascaded:
+        cascaded, downgraded = _cascade(cwd, todolist, state.cycle)
+        if fused or cascaded or downgraded:
             for iid, reason_txt in fused + cascaded:
                 state.abandoned_events.append(
                     {
                         "cycle": state.cycle,
                         "item_id": iid,
+                        "reason": reason_txt,
+                        "at": _utcnow_iso(),
+                    }
+                )
+            for iid, reason_txt in downgraded:
+                state.scheduler_events.append(
+                    {
+                        "cycle": state.cycle,
+                        "kind": "qa_abandoned_downgrade",
+                        "dev_id": iid,
                         "reason": reason_txt,
                         "at": _utcnow_iso(),
                     }
@@ -481,16 +491,24 @@ def _fuse(cwd: Path, tl: Todolist, max_attempts: int, cycle: int) -> list[tuple[
     return newly
 
 
-def _cascade(cwd: Path, tl: Todolist, cycle: int) -> list[tuple[str, str]]:
+def _cascade(
+    cwd: Path, tl: Todolist, cycle: int
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Cascade ``abandoned`` through downstream deps; downgrade stranded qa-dev.
 
     Fixed-point iteration: anything whose dep is abandoned becomes abandoned
     itself. Independent DAG branches survive. After propagation, any qa item
     already in ``abandoned`` causes its paired ``ready_for_qa`` dev to roll
     back to ``pending`` (give retry-and-fuse another shot before final fuse).
-    Returns list of (item_id, reason) for newly abandoned items.
+
+    Returns ``(newly_abandoned, downgraded)`` where each element is a
+    ``(item_id, reason)`` tuple. Both lists are needed by the main loop so
+    that downgrade-only passes still trigger ``scheduler_write`` — without
+    persisting, in-memory state drifts from disk and subsequent dispatches
+    see stale ``ready_for_qa`` on the file system.
     """
     newly: list[tuple[str, str]] = []
+    downgraded: list[tuple[str, str]] = []
     abandoned = {it.id for it in tl.items if it.status == "abandoned"}
 
     changed = True
@@ -517,10 +535,10 @@ def _cascade(cwd: Path, tl: Todolist, cycle: int) -> list[tuple[str, str]]:
             dev = tl.by_id(dev_id)
             if dev is None or dev.status != "ready_for_qa":
                 continue
-            sw.downgrade_reviewed_dev(
-                tl, dev_id, cycle, f"qa {it.id} abandoned"
-            )
-    return newly
+            reason = f"qa {it.id} abandoned"
+            if sw.downgrade_reviewed_dev(tl, dev_id, cycle, reason):
+                downgraded.append((dev_id, reason))
+    return newly, downgraded
 
 
 def _classify_terminal(
