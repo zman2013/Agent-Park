@@ -555,3 +555,39 @@ def test_fresh_wipes_state_but_keeps_config(tmp_path: Path):
     assert not (state_dir / "state.json").exists()
     assert not runs.exists()
     assert not (tmp_path / TODOLIST_FILE).exists()
+
+
+# ---------- config loading: new convergence knobs -----------------------
+
+
+def test_config_loads_new_convergence_limits(tmp_path: Path):
+    """Codex P2: config.toml must be able to override the new v2 limits.
+
+    Without this, ``max_planner_attempts`` and ``max_fingerprint_stuck`` are
+    effectively hard-coded defaults even when operators set them in config.
+    """
+    from agentloop.config import AgentConfig
+
+    state_dir = tmp_path / ".agentloop"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        "[limits]\n"
+        "max_cycles = 50\n"
+        "max_planner_attempts = 7\n"
+        "max_fingerprint_stuck = 9\n",
+        encoding="utf-8",
+    )
+
+    cfg = AgentConfig.load(tmp_path)
+    assert cfg.limits.max_cycles == 50
+    assert cfg.limits.max_planner_attempts == 7
+    assert cfg.limits.max_fingerprint_stuck == 9
+
+
+def test_config_defaults_when_new_limits_absent(tmp_path: Path):
+    from agentloop.config import AgentConfig
+
+    cfg = AgentConfig.load(tmp_path)
+    # No config.toml: defaults hold.
+    assert cfg.limits.max_planner_attempts == 3
+    assert cfg.limits.max_fingerprint_stuck == 4

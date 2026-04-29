@@ -24,8 +24,10 @@ from .todolist import (
     Attempt,
     Item,
     Todolist,
+    parse as parse_todolist,
     write as write_todolist,
 )
+from .validator import validate_transition
 
 
 SCHEDULER = "scheduler"
@@ -41,8 +43,18 @@ def _utcnow() -> str:
 def scheduler_write(cwd: Path, tl: Todolist) -> None:
     """Persist ``tl`` to disk via the same renderer as agents use.
 
-    Callers are expected to have already mutated ``tl`` in memory.
+    Runs the scheduler-actor validator first so structural corruption (duplicate
+    ids, invalid type/status) never reaches disk. The scheduler bypass skips the
+    per-actor transition matrix but still enforces ``_check_item_shape``, which
+    is exactly the guardrail this path needs. ``before`` is read from the file
+    to match what agents see; if that read fails we still fall through to the
+    shape-only check by passing an empty Todolist.
     """
+    try:
+        before = parse_todolist(cwd)
+    except Exception:  # noqa: BLE001 — treat unreadable file as "no prior state"
+        before = Todolist(metadata={}, items=[])
+    validate_transition(before, tl, SCHEDULER, None)
     write_todolist(cwd, tl)
 
 

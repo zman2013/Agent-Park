@@ -72,6 +72,10 @@ class AgentConfig:
             self.limits.max_item_attempts = int(lim["max_item_attempts"])
         if "max_cost_cny" in lim:
             self.limits.max_cost_cny = float(lim["max_cost_cny"])
+        if "max_planner_attempts" in lim:
+            self.limits.max_planner_attempts = int(lim["max_planner_attempts"])
+        if "max_fingerprint_stuck" in lim:
+            self.limits.max_fingerprint_stuck = int(lim["max_fingerprint_stuck"])
 
         if "review_plan" in data:
             self.review_plan = bool(data["review_plan"])

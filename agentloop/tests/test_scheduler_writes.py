@@ -263,3 +263,55 @@ def test_startup_health_noop_on_empty_todolist(tmp_path: Path):
     # no todolist.md present
     _startup_health(tmp_path, state)
     assert state.exhausted_reason is None
+
+
+# ---------- scheduler_write structural validation --------------------------
+
+
+def test_scheduler_write_rejects_invalid_shape(tmp_path: Path):
+    """Codex P2: scheduler_write must run shape validation before persisting.
+
+    Without the guardrail, a buggy mutator could write a todolist with a
+    duplicate id or bogus status and later cycles would crash on parse. With
+    the guardrail, the bad write is rejected and the on-disk todolist stays
+    consistent.
+    """
+    good = _tl(_dev("T-001", status="pending"))
+    sw.scheduler_write(tmp_path, good)  # seed disk
+
+    bad = Todolist(
+        metadata={"project": "test"},
+        items=[Item(id="T-001", type="dev", status="pending", title="dup"),
+               Item(id="T-001", type="qa", status="pending", title="dup")],
+    )
+    with pytest.raises(ValidationError, match="duplicate item id"):
+        sw.scheduler_write(tmp_path, bad)
+
+    # disk untouched: still the good state
+    reloaded = parse_todolist(tmp_path)
+    assert len(reloaded.items) == 1
+    assert reloaded.by_id("T-001").status == "pending"
+
+
+def test_scheduler_write_rejects_bogus_status(tmp_path: Path):
+    good = _tl(_dev("T-001"))
+    sw.scheduler_write(tmp_path, good)
+
+    bad = Todolist(
+        metadata={"project": "test"},
+        items=[Item(id="T-001", type="dev", status="bogus", title="x")],
+    )
+    with pytest.raises(ValidationError, match="invalid status"):
+        sw.scheduler_write(tmp_path, bad)
+
+
+def test_scheduler_write_allows_valid_pending_to_abandoned(tmp_path: Path):
+    """Normal scheduler mutations (fuse/cascade) must still pass."""
+    good = _tl(_dev("T-001", status="pending"))
+    sw.scheduler_write(tmp_path, good)
+
+    sw.mark_abandoned(good, "T-001", "exceeded limit", cycle=5)
+    sw.scheduler_write(tmp_path, good)  # should not raise
+
+    reloaded = parse_todolist(tmp_path)
+    assert reloaded.by_id("T-001").status == "abandoned"
