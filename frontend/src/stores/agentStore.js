@@ -26,6 +26,16 @@ export const useAgentStore = defineStore('agent', () => {
   // Archived agent filter
   const showArchived = ref(false)
 
+  // ── AgentLoop state ────────────────────────────────────────────────────────
+  // Currently selected agentloop shown in the center area (mutually exclusive with currentTaskId)
+  const selectedAgentLoopId = ref(null)
+  // Full list of non-dismissed agentloops (for both sidebar "recent" and task-header link lookup)
+  const agentloops = ref([])
+  // Detailed snapshot for the currently selected agentloop (state + todolist + runs)
+  const agentloopSnapshot = ref(null)
+  // Run log for the currently viewed cycle
+  const agentloopRunLog = ref({ cycle: null, lines: [] })
+
   // Recent files (per agent, localStorage-backed)
   const RECENT_FILES_KEY = 'agent-park:recent-files'
   const MAX_RECENT_PER_AGENT = 20
@@ -226,6 +236,12 @@ export const useAgentStore = defineStore('agent', () => {
 
   function selectTask(taskId) {
     currentTaskId.value = taskId
+    // Entering a task exits agentloop view
+    if (selectedAgentLoopId.value) {
+      selectedAgentLoopId.value = null
+      agentloopSnapshot.value = null
+      agentloopRunLog.value = { cycle: null, lines: [] }
+    }
     // Only dismiss if the task is not in 'running' state
     const task = tasks.value[taskId]
     if (!task || task.status !== 'running') {
@@ -458,6 +474,88 @@ export const useAgentStore = defineStore('agent', () => {
     if (idx !== -1) entries.splice(idx, 1)
   }
 
+  // ── AgentLoop actions ──────────────────────────────────────────────────────
+
+  async function fetchAgentLoops() {
+    try {
+      const res = await fetch('/api/agentloops?include_dismissed=true')
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      agentloops.value = Array.isArray(data) ? data : []
+    } catch (e) {
+      // silent — avoid toast spam on every poll failure
+    }
+  }
+
+  // Find any agentloop (including dismissed) registered for the given cwd.
+  // Used by TaskItem / ChatView to keep an entry point visible after dismiss.
+  function findAgentLoopByCwd(cwd) {
+    if (!cwd) return null
+    return (agentloops.value || []).find(l => l.cwd === cwd) || null
+  }
+
+  async function fetchAgentLoopSnapshot(loopId) {
+    try {
+      const res = await fetch(`/api/agentloops/${loopId}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      agentloopSnapshot.value = await res.json()
+    } catch (e) {
+      // keep old snapshot on failure
+    }
+  }
+
+  async function fetchAgentLoopRunLog(loopId, cycle) {
+    try {
+      const res = await fetch(`/api/agentloops/${loopId}/runs/${cycle}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const data = await res.json()
+      agentloopRunLog.value = { cycle, lines: data.lines || [] }
+    } catch (e) {
+      agentloopRunLog.value = { cycle, lines: [] }
+    }
+  }
+
+  async function selectAgentLoop(loopId) {
+    selectedAgentLoopId.value = loopId
+    currentTaskId.value = null
+    agentloopSnapshot.value = null
+    agentloopRunLog.value = { cycle: null, lines: [] }
+    if (loopId) {
+      await fetchAgentLoopSnapshot(loopId)
+    }
+  }
+
+  function clearSelectedAgentLoop() {
+    selectedAgentLoopId.value = null
+    agentloopSnapshot.value = null
+    agentloopRunLog.value = { cycle: null, lines: [] }
+  }
+
+  async function dismissAgentLoopRecent(loopId) {
+    // optimistic UI update
+    const idx = agentloops.value.findIndex(l => l.loop_id === loopId)
+    if (idx !== -1) agentloops.value.splice(idx, 1)
+    try {
+      await fetch(`/api/agentloops/${loopId}/dismiss`, { method: 'POST' })
+    } catch (e) {
+      addToast(`Failed to dismiss agentloop: ${e.message}`, 'error')
+    }
+  }
+
+  async function stopAgentLoop(loopId) {
+    try {
+      const res = await fetch(`/api/agentloops/${loopId}/stop`, { method: 'POST' })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      await fetchAgentLoops()
+      if (selectedAgentLoopId.value === loopId) {
+        await fetchAgentLoopSnapshot(loopId)
+      }
+      addToast('AgentLoop 已停止', 'success')
+    } catch (e) {
+      addToast(`停止失败: ${e.message}`, 'error')
+    }
+  }
+
   return {
     agents,
     tasks,
@@ -510,5 +608,18 @@ export const useAgentStore = defineStore('agent', () => {
     updateTaskFields,
     updateTaskSession,
     addAgent,
+    // agentloop
+    selectedAgentLoopId,
+    agentloops,
+    agentloopSnapshot,
+    agentloopRunLog,
+    fetchAgentLoops,
+    fetchAgentLoopSnapshot,
+    fetchAgentLoopRunLog,
+    selectAgentLoop,
+    clearSelectedAgentLoop,
+    dismissAgentLoopRecent,
+    stopAgentLoop,
+    findAgentLoopByCwd,
   }
 })

@@ -35,6 +35,14 @@
       ⑂
     </button>
     <button
+      v-if="matchedLoop"
+      class="text-gray-600 hover:text-blue-400 text-xs opacity-0 group-hover:opacity-100 transition-opacity"
+      @click.stop="openAgentLoop"
+      title="打开 AgentLoop"
+    >
+      🔁
+    </button>
+    <button
       class="text-gray-600 hover:text-red-400 text-xs opacity-0 group-hover:opacity-100 transition-opacity"
       @click.stop="handleDelete"
       title="Delete task"
@@ -55,6 +63,20 @@ const props = defineProps({
 const store = useAgentStore()
 const isActive = computed(() => store.currentTaskId === props.task?.id)
 const hasSession = computed(() => !!store.taskSessions[props.task?.id])
+
+// Show an "open AgentLoop" button when any agentloop is registered for this
+// task's agent cwd — including dismissed ones, per user request that the entry
+// stay visible even after dismissing from the sidebar.
+const matchedLoop = computed(() => {
+  const agent = store.agents.find(a => a.id === props.task?.agent_id)
+  return store.findAgentLoopByCwd(agent?.cwd)
+})
+
+function openAgentLoop() {
+  if (matchedLoop.value) {
+    store.selectAgentLoop(matchedLoop.value.loop_id)
+  }
+}
 
 const editing = ref(false)
 const editName = ref('')
