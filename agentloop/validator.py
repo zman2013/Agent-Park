@@ -209,12 +209,19 @@ def _reviewed_dev_id(qa_item: Item, before: Todolist) -> str | None:
     """Return the dev item id this qa item targets.
 
     Uses ``source: follows T-xxx`` or ``source: qa-finding of T-xxx``; falls
-    back to the first ``ready_for_qa`` dev item in the todolist.
+    back to the first ``ready_for_qa`` dev item in the todolist. Matching is
+    case-insensitive because PM/planner prompts accept ``t-002`` as well as
+    ``T-002``; treating them differently here causes spurious
+    "modified unrelated item" rollbacks when the QA agent echoes the
+    lowercased form.
     """
     source = qa_item.source or ""
     for token in source.split():
-        if token.startswith("T-"):
-            return token.strip(".,;")
+        stripped = token.strip(".,;")
+        if stripped[:2].upper() == "T-" and len(stripped) > 2:
+            # Normalize to uppercase so downstream id comparisons (which run
+            # against canonical uppercase ids in the todolist) succeed.
+            return "T-" + stripped[2:]
     for it in before.items:
         if it.type == "dev" and it.status == "ready_for_qa":
             return it.id

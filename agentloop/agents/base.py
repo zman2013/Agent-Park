@@ -248,11 +248,16 @@ def _parse_stream_json(lines: list[str]) -> _Aggregate:
 
 
 def _next_sequence(runs_dir: Path) -> int:
-    existing = sorted(runs_dir.glob("*.jsonl"))
-    if not existing:
-        return 1
-    last = existing[-1].name.split("-", 1)[0]
-    try:
-        return int(last) + 1
-    except ValueError:
-        return len(existing) + 1
+    # Sort numerically, not lexicographically — otherwise once the sequence
+    # crosses 1000 we get "1000-*" < "999-*" and _next_sequence would keep
+    # returning a stale value, overwriting older run logs.
+    max_seen = 0
+    for p in runs_dir.glob("*.jsonl"):
+        prefix = p.name.split("-", 1)[0]
+        try:
+            n = int(prefix)
+        except ValueError:
+            continue
+        if n > max_seen:
+            max_seen = n
+    return max_seen + 1
