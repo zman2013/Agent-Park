@@ -99,6 +99,20 @@ def test_cascade_qa_abandoned_downgrades_dev(tmp_path: Path):
     assert "downgraded" in tl.by_id("T-001").attempt_log[-1].notes
 
 
+def test_cascade_aggregated_qa_downgrades_all_reviewed_devs(tmp_path: Path):
+    """Aggregated qa abandoned → every reviewed dev at ready_for_qa rolls back."""
+    tl = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="ready_for_qa"),
+        _dev("T-003", status="ready_for_qa"),
+        _qa("T-010", source="follows T-001, T-002, T-003", status="abandoned"),
+    )
+    _cascade(tmp_path, tl, cycle=7)
+    for dev_id in ("T-001", "T-002", "T-003"):
+        assert tl.by_id(dev_id).status == "pending", dev_id
+        assert "downgraded" in tl.by_id(dev_id).attempt_log[-1].notes
+
+
 def test_cascade_empty_when_nothing_abandoned(tmp_path: Path):
     tl = _tl(_dev("T-001"), _dev("T-002", deps=["T-001"]))
     assert _cascade(tmp_path, tl, cycle=3) == []
@@ -224,6 +238,29 @@ def test_decision_advanced_qa_done():
         _qa("T-002", source="follows T-001", status="done"),
     )
     d = Decision(next="qa", item_id="T-002", reason="x")
+    assert _decision_advanced(before, after, d) is True
+
+
+def test_decision_advanced_aggregated_qa_any_reviewed_dev_moves():
+    """_decision_advanced must scan all reviewed devs, not just the first.
+
+    Regression: aggregated qa (source "follows T-001, T-002") that moved only
+    T-002 previously reported False because the helper only inspected T-001.
+    """
+    from agentloop.loop import _decision_advanced
+
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="ready_for_qa"),
+        _qa("T-010", source="follows T-001, T-002", status="pending"),
+    )
+    # qa stayed pending and didn't touch its own attempt_log, but T-002 moved
+    after = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="done"),
+        _qa("T-010", source="follows T-001, T-002", status="pending"),
+    )
+    d = Decision(next="qa", item_id="T-010", reason="x")
     assert _decision_advanced(before, after, d) is True
 
 
@@ -397,11 +434,13 @@ def test_per_item_failure_does_not_kill_loop(tmp_path: Path, monkeypatch):
         from agentloop.todolist import parse as parse_tl, write as write_tl
         tl = parse_tl(cwd)
         qa = tl.by_id(item_id)
-        # qa targets the dev referenced in source; mark both done
-        from agentloop.validator import _reviewed_dev_id
-        dev_id = _reviewed_dev_id(qa, tl)
-        if dev_id:
-            tl.by_id(dev_id).status = "done"
+        # qa targets the dev(s) referenced in source; mark all reviewed devs
+        # + itself done.
+        from agentloop.validator import _reviewed_dev_ids
+        for dev_id in _reviewed_dev_ids(qa, tl):
+            dev = tl.by_id(dev_id)
+            if dev is not None:
+                dev.status = "done"
         qa.status = "done"
         write_tl(cwd, tl)
         return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1, cost_cny=0.0, success=True, errors=[])
@@ -504,10 +543,11 @@ def test_stall_killed_doing_recovered(tmp_path: Path, monkeypatch):
     def fake_qa_run(cwd: Path, item_id: str, cycle: int, cfg) -> RunResult:
         tl = parse_tl(cwd)
         qa = tl.by_id(item_id)
-        from agentloop.validator import _reviewed_dev_id
-        dev_id = _reviewed_dev_id(qa, tl)
-        if dev_id:
-            tl.by_id(dev_id).status = "done"
+        from agentloop.validator import _reviewed_dev_ids
+        for dev_id in _reviewed_dev_ids(qa, tl):
+            dev = tl.by_id(dev_id)
+            if dev is not None:
+                dev.status = "done"
         qa.status = "done"
         from agentloop.todolist import write as wt
         wt(cwd, tl)

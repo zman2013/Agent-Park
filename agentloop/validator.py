@@ -163,7 +163,7 @@ def _validate_qa(before: Todolist, after: Todolist, item_id: str | None) -> None
     if qa_self.status == "done":
         raise ValidationError(f"qa item {item_id} already done")
 
-    reviewed_id = _reviewed_dev_id(qa_self, before)
+    reviewed_ids = _reviewed_dev_ids(qa_self, before)
 
     before_ids = {it.id for it in before.items}
     after_ids = {it.id for it in after.items}
@@ -173,10 +173,8 @@ def _validate_qa(before: Todolist, after: Todolist, item_id: str | None) -> None
     if removed:
         raise ValidationError(f"qa cannot remove items, but removed: {sorted(removed)}")
 
-    # status changes must be on {qa_self, reviewed_id}; any other change is illegal
-    allowed_touch = {item_id}
-    if reviewed_id:
-        allowed_touch.add(reviewed_id)
+    # status changes must be on {qa_self, *reviewed_ids}; any other change is illegal
+    allowed_touch = {item_id} | set(reviewed_ids)
 
     for item in after.items:
         b = before.by_id(item.id)
@@ -216,27 +214,31 @@ def _validate_qa(before: Todolist, after: Todolist, item_id: str | None) -> None
                 )
 
 
-def _reviewed_dev_id(qa_item: Item, before: Todolist) -> str | None:
-    """Return the dev item id this qa item targets.
+def _reviewed_dev_ids(qa_item: Item, before: Todolist) -> list[str]:
+    """Return all dev item ids this qa item targets.
 
-    Uses ``source: follows T-xxx`` or ``source: qa-finding of T-xxx``; falls
-    back to the first ``ready_for_qa`` dev item in the todolist. Matching is
-    case-insensitive because PM/planner prompts accept ``t-002`` as well as
-    ``T-002``; treating them differently here causes spurious
-    "modified unrelated item" rollbacks when the QA agent echoes the
-    lowercased form.
+    Supports both 1:1 qa (``source: follows T-001``) and aggregated qa
+    (``source: follows T-001, T-002, T-003`` or any whitespace/comma/bracket
+    mix). Matching is case-insensitive; returned ids are normalized to
+    upper-case ``T-NNN`` form for comparison against canonical todolist ids.
+
+    Falls back to the first ``ready_for_qa`` dev item when the source string
+    contains no ``T-xxx`` tokens.
     """
+    import re
     source = qa_item.source or ""
-    for token in source.split():
-        stripped = token.strip(".,;")
-        if stripped[:2].upper() == "T-" and len(stripped) > 2:
-            # Normalize to uppercase so downstream id comparisons (which run
-            # against canonical uppercase ids in the todolist) succeed.
-            return "T-" + stripped[2:]
+    raw = re.findall(r"[Tt]-\d+", source)
+    ids: list[str] = []
+    for r in raw:
+        normalized = "T-" + r[2:]
+        if normalized not in ids:
+            ids.append(normalized)
+    if ids:
+        return ids
     for it in before.items:
         if it.type == "dev" and it.status == "ready_for_qa":
-            return it.id
-    return None
+            return [it.id]
+    return []
 
 
 # ----- equality helpers ---------------------------------------------------

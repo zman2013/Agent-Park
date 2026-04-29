@@ -253,6 +253,84 @@ def test_validator_allows_qa_pending_pending():
     validate_transition(before, after, "qa", "T-002")  # should not raise
 
 
+# ---------- aggregated qa (N:1 dev:qa) ----------------------------------
+
+
+def test_reviewed_dev_ids_parses_aggregated_source():
+    from agentloop.validator import _reviewed_dev_ids
+
+    qa = Item(id="T-010", type="qa", status="pending", title="agg qa",
+              source="follows T-001, T-002, T-003")
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="ready_for_qa"),
+        _dev("T-003", status="ready_for_qa"),
+    )
+    assert _reviewed_dev_ids(qa, before) == ["T-001", "T-002", "T-003"]
+
+
+def test_reviewed_dev_ids_no_space_brackets():
+    from agentloop.validator import _reviewed_dev_ids
+
+    qa = Item(id="T-010", type="qa", status="pending", title="agg qa",
+              source="[T-001,T-002]")
+    assert _reviewed_dev_ids(qa, _tl()) == ["T-001", "T-002"]
+
+
+def test_reviewed_dev_ids_case_insensitive_and_deduped():
+    from agentloop.validator import _reviewed_dev_ids
+
+    qa = Item(id="T-010", type="qa", status="pending", title="agg qa",
+              source="follows t-001, T-001, T-002")
+    assert _reviewed_dev_ids(qa, _tl()) == ["T-001", "T-002"]
+
+
+def test_reviewed_dev_ids_fallback_to_first_ready_for_qa():
+    """If source has no T-xxx tokens, fall back to the first ready_for_qa dev."""
+    from agentloop.validator import _reviewed_dev_ids
+
+    qa = Item(id="T-010", type="qa", status="pending", title="legacy qa",
+              source="")
+    before = _tl(
+        _dev("T-001", status="pending"),
+        _dev("T-002", status="ready_for_qa"),
+    )
+    assert _reviewed_dev_ids(qa, before) == ["T-002"]
+
+
+def test_validator_allows_aggregated_qa_marking_all_devs_done():
+    """Aggregated qa may transition every reviewed dev to done in one run."""
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="ready_for_qa"),
+        _qa("T-003", source="follows T-001, T-002"),
+    )
+    after = _tl(
+        _dev("T-001", status="done"),
+        _dev("T-002", status="done"),  # previously would raise "unrelated item"
+        _qa("T-003", source="follows T-001, T-002", status="done"),
+    )
+    validate_transition(before, after, "qa", "T-003")  # should not raise
+
+
+def test_validator_still_rejects_touching_truly_unrelated_dev():
+    """allowed_touch must not accidentally let qa touch dev not in its source."""
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="ready_for_qa"),
+        _dev("T-003", status="pending"),   # not covered by qa source
+        _qa("T-004", source="follows T-001, T-002"),
+    )
+    after = _tl(
+        _dev("T-001", status="done"),
+        _dev("T-002", status="done"),
+        _dev("T-003", status="doing"),      # illegal — qa must not touch T-003
+        _qa("T-004", source="follows T-001, T-002", status="done"),
+    )
+    with pytest.raises(ValidationError, match="unrelated"):
+        validate_transition(before, after, "qa", "T-004")
+
+
 # ---------- PM decisions ------------------------------------------------
 
 

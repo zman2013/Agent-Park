@@ -27,7 +27,7 @@ from .config import AgentConfig
 from . import scheduler_writes as sw
 from .state import Decision, LoopState
 from .todolist import Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
-from .validator import ValidationError, _reviewed_dev_id, validate_transition
+from .validator import ValidationError, _reviewed_dev_ids, validate_transition
 
 logger = logging.getLogger(__name__)
 
@@ -376,15 +376,16 @@ def _decision_advanced(before: Todolist, after: Todolist, decision: Decision) ->
         return True
     if _attempt_log_digest(a) != _attempt_log_digest(b):
         return True
-    reviewed = _reviewed_dev_id(a, before)
-    if reviewed:
+    # Aggregated qa can review multiple dev items — any one advancing counts.
+    for reviewed in _reviewed_dev_ids(a, before):
         rb = before.by_id(reviewed)
         ra = after.by_id(reviewed)
-        if rb is not None and ra is not None:
-            if rb.status != ra.status:
-                return True
-            if _attempt_log_digest(rb) != _attempt_log_digest(ra):
-                return True
+        if rb is None or ra is None:
+            continue
+        if rb.status != ra.status:
+            return True
+        if _attempt_log_digest(rb) != _attempt_log_digest(ra):
+            return True
     return False
 
 
@@ -507,19 +508,18 @@ def _cascade(cwd: Path, tl: Todolist, cycle: int) -> list[tuple[str, str]]:
                 newly.append((it.id, reason))
                 changed = True
 
-    # qa abandoned → downgrade reviewed dev back to pending
+    # qa abandoned → downgrade every reviewed dev still at ready_for_qa.
+    # Aggregated qa reviews multiple devs; all of them need another shot.
     for it in tl.items:
         if it.type != "qa" or it.status != "abandoned":
             continue
-        dev_id = _reviewed_dev_id(it, tl)
-        if not dev_id:
-            continue
-        dev = tl.by_id(dev_id)
-        if dev is None or dev.status != "ready_for_qa":
-            continue
-        sw.downgrade_reviewed_dev(
-            tl, dev_id, cycle, f"qa {it.id} abandoned"
-        )
+        for dev_id in _reviewed_dev_ids(it, tl):
+            dev = tl.by_id(dev_id)
+            if dev is None or dev.status != "ready_for_qa":
+                continue
+            sw.downgrade_reviewed_dev(
+                tl, dev_id, cycle, f"qa {it.id} abandoned"
+            )
     return newly
 
 

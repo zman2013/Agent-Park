@@ -5,7 +5,10 @@
 ## 你的任务
 审查**被你负责的 qa item** `{{item_id}}` 所指向的 dev 产物。
 
-先读 `todolist.md` 找到 `{{item_id}}`，它的 `source: follows T-DEV`，这个 T-DEV 就是你要审查的 dev item；对应的代码改动就在这个 cycle 刚跑完。
+先读 `todolist.md` 找到 `{{item_id}}`，它的 `source` 字段列出了你要审查的 dev item：
+- 单 dev：`source: follows T-DEV` —— 审查单个 dev
+- 聚合 qa：`source: follows T-001, T-002, T-003` —— 审查这批 dev 产生的整体行为
+对应的代码改动就在这个 cycle 刚跑完。
 
 ## 硬约束（违反则整个轮次回滚）
 - ❌ **绝不修改** `design.md`
@@ -13,7 +16,7 @@
 - ❌ **绝不改已经 `done` 的 item**
 - ❌ **绝不删除** 任何 item
 - ✅ 你可以：
-  - 把 **被审查的 dev item** 的 status 从 `ready_for_qa` 改为 `done`（通过）或 `pending`（打回，并在它的 attempt_log 追加一行 qa findings）
+  - 把 **被审查的 dev item**（可能有多个）的 status 从 `ready_for_qa` 改为 `done`（通过）或 `pending`（打回，并在它的 attempt_log 追加一行 qa findings）
   - 把 **自己（`{{item_id}}`）** 的 status 改为 `done`
   - 在 `{{item_id}}` 的 `findings` 字段写一行结论
   - 如果发现**新的问题**需要修复，在 todolist 末尾追加新的 dev+qa item 对：
@@ -48,8 +51,10 @@
 - 发现问题**不要自己试图修改代码**，只写 findings + 追加 dev item
 
 ## 判决
-- 如果代码**完全符合** design 对该任务的要求 → 被审查 item 转 `done`，自己转 `done`，`findings: 无`
-- 如果有问题 → 被审查 item 回 `pending` + 在它的 attempt_log 追加 `- cycle {{cycle}}: pending (qa findings: <具体问题> → T-XXX)`；自己转 `done`（你的工作完成了）；追加修复 item
+- 如果代码**完全符合** design 对该任务的要求 → 每个被审查的 dev item 都转 `done`，自己转 `done`，`findings: 无`
+  - 聚合 qa 场景下，你必须把 `source` 列出的**每一个** dev item 都标 done，否则调度器会判定你没完成工作并进入重试
+- 如果有问题 → 把有问题的 dev item 回 `pending` + 在它的 attempt_log 追加 `- cycle {{cycle}}: pending (qa findings: <具体问题> → T-XXX)`；自己转 `done`（你的工作完成了）；追加修复 item
+  - 聚合 qa 场景下，合格的 dev 照常转 `done`，只把不合格的 dev 回 `pending`
 
 ## 当前上下文
 - 工作目录：`{{cwd}}`
