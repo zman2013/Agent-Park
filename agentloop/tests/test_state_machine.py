@@ -238,6 +238,21 @@ def test_qa_cannot_touch_done_item():
         validate_transition(before, after, "qa", "T-002")
 
 
+def test_validator_allows_qa_pending_pending():
+    """QA may stay in pending while appending to its own attempt_log."""
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _qa("T-002", source="follows T-001"),
+    )
+    after = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        Item(id="T-002", type="qa", status="pending", title="qa T-002",
+             source="follows T-001",
+             attempt_log=[Attempt(3, "pending", "qa tool read failed — retry")]),
+    )
+    validate_transition(before, after, "qa", "T-002")  # should not raise
+
+
 # ---------- PM decisions ------------------------------------------------
 
 
@@ -377,6 +392,39 @@ def test_limits_new_defaults():
 def test_exit_code_partial_success_exists():
     from agentloop.loop import ExitCode
     assert ExitCode.PARTIAL_SUCCESS.value == 3
+
+
+def test_cli_tag_covers_partial_success(capsys):
+    """cli._report_result must print PARTIAL_SUCCESS without KeyError."""
+    from agentloop.cli import _report_result
+    from agentloop.loop import ExitCode, LoopResult
+
+    code = _report_result(LoopResult(ExitCode.PARTIAL_SUCCESS, "1 abandoned"))
+    assert code == 3
+    out = capsys.readouterr().out
+    assert "PARTIAL_SUCCESS" in out
+    assert "1 abandoned" in out
+
+
+def test_server_derive_status_partial():
+    """server/_derive_status_from_state should return 'partial' when PM said
+    done and abandoned_events is non-empty."""
+    from server.agentloop_manager import _derive_status_from_state
+
+    partial_state = {
+        "exhausted_reason": None,
+        "last_decision": {"next": "done", "item_id": None, "reason": "1 item abandoned"},
+        "abandoned_events": [{"item_id": "T-001", "cycle": 6}],
+    }
+    assert _derive_status_from_state(partial_state) == "partial"
+
+    # all-done still maps to "done"
+    done_state = {
+        "exhausted_reason": None,
+        "last_decision": {"next": "done", "item_id": None, "reason": "all done"},
+        "abandoned_events": [],
+    }
+    assert _derive_status_from_state(done_state) == "done"
 
 
 # ---------- rollback semantics (black-box: validator failure) -----------

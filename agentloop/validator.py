@@ -27,6 +27,9 @@ _ALLOWED_DEV = {
 _ALLOWED_QA_SELF = {
     # the qa item itself transitions pending -> done
     ("pending", "done"),
+    # qa may also stay pending while appending to its own attempt_log
+    # (e.g. recording a finding without yet closing the review)
+    ("pending", "pending"),
 }
 _ALLOWED_QA_REVIEWED = {
     # the dev item being reviewed transitions ready_for_qa -> done/pending

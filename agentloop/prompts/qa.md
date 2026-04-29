@@ -30,6 +30,19 @@
 - source: follows T-XXX
 ```
 
+## attempt_log 归属（重要）
+- **QA 自己运行失败**（例如你读不到代码、发现工具错误、需要重新审）：
+  在**自己（qa item `{{item_id}}`）**的 attempt_log 追加一行，保持自身 `status:pending` 不变；
+  **不要**把这种失败写到 dev 的 attempt_log 上
+- **dev 产物有问题被你打回**：
+  在**被审查的 dev item** 的 attempt_log 追加 `- cycle {{cycle}}: pending (qa findings: ...)`；
+  自己（qa）转 `done`（你的审查工作完成了，只是结论是 fail）
+
+这样每个 item 的失败次数独立计数，熔断（超过 max_item_attempts 自动 abandoned）才能精准落在该失败的 item 上。
+
+## 动态创建的 qa
+如果你的 qa item 首条 `attempt_log` notes 含 `auto-created by scheduler`，说明这是调度器为孤儿 dev 自动补齐的 qa。按常规审查即可，无需特殊处理。
+
 ## 审查标准
 - 以 `design.md` 为准，**不是**以 dev 的自我描述为准
 - 发现问题**不要自己试图修改代码**，只写 findings + 追加 dev item
