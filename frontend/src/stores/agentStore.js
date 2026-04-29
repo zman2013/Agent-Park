@@ -565,6 +565,42 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  // Re-launch a previously stopped / exhausted / done agentloop.
+  // Backend POST /api/agentloops is idempotent: if status != running it respawns
+  // on the same cwd/design, reading the existing .agentloop/state.json so work
+  // resumes (e.g. another max_cycles worth of cycles after the prior run exited).
+  async function startAgentLoop(loopId) {
+    const entry = (agentloops.value || []).find(l => l.loop_id === loopId)
+      || (selectedAgentLoopId.value === loopId && agentloopSnapshot.value)
+      || null
+    if (!entry || !entry.cwd) {
+      addToast('无法启动：缺少 cwd 信息', 'error')
+      return
+    }
+    try {
+      const res = await fetch('/api/agentloops', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cwd: entry.cwd,
+          design_path: entry.design_path || null,
+          source_task_id: entry.source_task_id || null,
+        }),
+      })
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '')
+        throw new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ''}`)
+      }
+      await fetchAgentLoops()
+      if (selectedAgentLoopId.value === loopId) {
+        await fetchAgentLoopSnapshot(loopId)
+      }
+      addToast('AgentLoop 已启动', 'success')
+    } catch (e) {
+      addToast(`启动失败: ${e.message}`, 'error')
+    }
+  }
+
   return {
     agents,
     tasks,
@@ -629,6 +665,7 @@ export const useAgentStore = defineStore('agent', () => {
     clearSelectedAgentLoop,
     dismissAgentLoopRecent,
     stopAgentLoop,
+    startAgentLoop,
     findAgentLoopByCwd,
   }
 })
