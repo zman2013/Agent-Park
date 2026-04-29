@@ -230,7 +230,7 @@ def run(design_path: Path) -> ExitCode:
 
 | 上限 | 默认 | 含义 |
 |---|---|---|
-| `MAX_CYCLES` | 30 | PM 被调用的总次数 |
+| `MAX_CYCLES` | 60 | PM 被调用的总次数 |
 | `MAX_ITEM_ATTEMPTS` | 5 | 单个 item 被 dev 尝试的次数 |
 | `MAX_COST_CNY` | 1000 | 总成本上限（cco/ccs stream-json 里的 `total_cost_cny` 累加） |
 | PM 三连同决策 | — | 防死循环兜底 |
