@@ -74,6 +74,26 @@ def test_next_id():
     assert tl.next_id() == "T-008"
 
 
+def test_abandoned_status_roundtrip():
+    original = _tl(
+        _dev("T-001", status="abandoned",
+             attempt_log=[Attempt(1, "pending", "qa findings: exceeded limit")]),
+        _qa("T-002", source="follows T-001", status="abandoned"),
+    )
+    text = render(original)
+    parsed = parse_text(text)
+
+    t1 = parsed.by_id("T-001")
+    assert t1 is not None
+    assert t1.status == "abandoned"
+    assert len(t1.attempt_log) == 1
+    assert t1.attempt_log[0].result == "pending"
+
+    t2 = parsed.by_id("T-002")
+    assert t2 is not None
+    assert t2.status == "abandoned"
+
+
 def test_trim_attempt_log_keeps_first_and_last():
     log = [
         Attempt(1, "pending", "first"),
@@ -307,6 +327,53 @@ def test_loopstate_resume_after_exhaust(tmp_path: Path):
     # clear exhaustion for resume
     loaded.exhausted_reason = None
     assert loaded.should_exit(Limits(max_cycles=10)) is None
+
+
+def test_state_load_legacy_json_no_new_fields(tmp_path: Path):
+    """LoopState must tolerate state.json files written by v1 (no new fields)."""
+    state_dir = tmp_path / ".agentloop"
+    state_dir.mkdir()
+    legacy = {
+        "cycle": 7,
+        "total_cost_cny": 3.5,
+        "last_decision": {"next": "dev", "item_id": "T-003", "reason": "x"},
+        "same_decision_count": 1,
+        "started_at": "2026-04-01T00:00:00Z",
+        "exhausted_reason": None,
+        "rollbacks": [],
+    }
+    (state_dir / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
+    loaded = LoopState.load_or_init(tmp_path)
+    assert loaded.cycle == 7
+    assert loaded.fingerprint_history == []
+    assert loaded.abandoned_events == []
+    assert loaded.scheduler_events == []
+    assert loaded.planner_attempts == 0
+
+
+def test_state_new_fields_persist_round_trip(tmp_path: Path):
+    s = LoopState()
+    s.fingerprint_history = ["abc", "def"]
+    s.abandoned_events = [{"item_id": "T-001", "cycle": 3}]
+    s.scheduler_events = [{"kind": "stale_doing_reconciled", "ids": ["T-007"]}]
+    s.planner_attempts = 2
+    s.save(tmp_path)
+    loaded = LoopState.load_or_init(tmp_path)
+    assert loaded.fingerprint_history == ["abc", "def"]
+    assert loaded.abandoned_events == [{"item_id": "T-001", "cycle": 3}]
+    assert loaded.scheduler_events == [{"kind": "stale_doing_reconciled", "ids": ["T-007"]}]
+    assert loaded.planner_attempts == 2
+
+
+def test_limits_new_defaults():
+    lim = Limits()
+    assert lim.max_planner_attempts == 3
+    assert lim.max_fingerprint_stuck == 4
+
+
+def test_exit_code_partial_success_exists():
+    from agentloop.loop import ExitCode
+    assert ExitCode.PARTIAL_SUCCESS.value == 3
 
 
 # ---------- rollback semantics (black-box: validator failure) -----------

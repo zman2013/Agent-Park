@@ -35,6 +35,7 @@ class ExitCode(Enum):
     SUCCESS = 0
     EXHAUSTED = 1
     ERROR = 2
+    PARTIAL_SUCCESS = 3
 
 
 @dataclass
