@@ -1,7 +1,7 @@
 """Config loading for agentloop.
 
 Resolution order (later overrides earlier):
-    1. Built-in defaults (planner/dev = cco, qa = ccs, pm = code-version)
+    1. Built-in defaults (planner = cco, dev/qa = ccs, pm = code-version)
     2. ``~/.agentloop/config.toml`` (global fallback)
     3. ``<cwd>/.agentloop/config.toml`` (project level)
     4. CLI flags (applied by caller)
@@ -39,7 +39,7 @@ class AgentBackend:
 class AgentConfig:
     limits: Limits = field(default_factory=Limits)
     planner: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="cco"))
-    dev: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="cco"))
+    dev: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="ccs"))
     qa: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="ccs"))
     pm: AgentBackend = field(default_factory=lambda: AgentBackend(cmd=None, is_code=True))
     review_plan: bool = False
