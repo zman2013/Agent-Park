@@ -74,6 +74,26 @@ def test_next_id():
     assert tl.next_id() == "T-008"
 
 
+def test_abandoned_status_roundtrip():
+    original = _tl(
+        _dev("T-001", status="abandoned",
+             attempt_log=[Attempt(1, "pending", "qa findings: exceeded limit")]),
+        _qa("T-002", source="follows T-001", status="abandoned"),
+    )
+    text = render(original)
+    parsed = parse_text(text)
+
+    t1 = parsed.by_id("T-001")
+    assert t1 is not None
+    assert t1.status == "abandoned"
+    assert len(t1.attempt_log) == 1
+    assert t1.attempt_log[0].result == "pending"
+
+    t2 = parsed.by_id("T-002")
+    assert t2 is not None
+    assert t2.status == "abandoned"
+
+
 def test_trim_attempt_log_keeps_first_and_last():
     log = [
         Attempt(1, "pending", "first"),
@@ -218,6 +238,99 @@ def test_qa_cannot_touch_done_item():
         validate_transition(before, after, "qa", "T-002")
 
 
+def test_validator_allows_qa_pending_pending():
+    """QA may stay in pending while appending to its own attempt_log."""
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _qa("T-002", source="follows T-001"),
+    )
+    after = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        Item(id="T-002", type="qa", status="pending", title="qa T-002",
+             source="follows T-001",
+             attempt_log=[Attempt(3, "pending", "qa tool read failed — retry")]),
+    )
+    validate_transition(before, after, "qa", "T-002")  # should not raise
+
+
+# ---------- aggregated qa (N:1 dev:qa) ----------------------------------
+
+
+def test_reviewed_dev_ids_parses_aggregated_source():
+    from agentloop.validator import _reviewed_dev_ids
+
+    qa = Item(id="T-010", type="qa", status="pending", title="agg qa",
+              source="follows T-001, T-002, T-003")
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="ready_for_qa"),
+        _dev("T-003", status="ready_for_qa"),
+    )
+    assert _reviewed_dev_ids(qa, before) == ["T-001", "T-002", "T-003"]
+
+
+def test_reviewed_dev_ids_no_space_brackets():
+    from agentloop.validator import _reviewed_dev_ids
+
+    qa = Item(id="T-010", type="qa", status="pending", title="agg qa",
+              source="[T-001,T-002]")
+    assert _reviewed_dev_ids(qa, _tl()) == ["T-001", "T-002"]
+
+
+def test_reviewed_dev_ids_case_insensitive_and_deduped():
+    from agentloop.validator import _reviewed_dev_ids
+
+    qa = Item(id="T-010", type="qa", status="pending", title="agg qa",
+              source="follows t-001, T-001, T-002")
+    assert _reviewed_dev_ids(qa, _tl()) == ["T-001", "T-002"]
+
+
+def test_reviewed_dev_ids_fallback_to_first_ready_for_qa():
+    """If source has no T-xxx tokens, fall back to the first ready_for_qa dev."""
+    from agentloop.validator import _reviewed_dev_ids
+
+    qa = Item(id="T-010", type="qa", status="pending", title="legacy qa",
+              source="")
+    before = _tl(
+        _dev("T-001", status="pending"),
+        _dev("T-002", status="ready_for_qa"),
+    )
+    assert _reviewed_dev_ids(qa, before) == ["T-002"]
+
+
+def test_validator_allows_aggregated_qa_marking_all_devs_done():
+    """Aggregated qa may transition every reviewed dev to done in one run."""
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="ready_for_qa"),
+        _qa("T-003", source="follows T-001, T-002"),
+    )
+    after = _tl(
+        _dev("T-001", status="done"),
+        _dev("T-002", status="done"),  # previously would raise "unrelated item"
+        _qa("T-003", source="follows T-001, T-002", status="done"),
+    )
+    validate_transition(before, after, "qa", "T-003")  # should not raise
+
+
+def test_validator_still_rejects_touching_truly_unrelated_dev():
+    """allowed_touch must not accidentally let qa touch dev not in its source."""
+    before = _tl(
+        _dev("T-001", status="ready_for_qa"),
+        _dev("T-002", status="ready_for_qa"),
+        _dev("T-003", status="pending"),   # not covered by qa source
+        _qa("T-004", source="follows T-001, T-002"),
+    )
+    after = _tl(
+        _dev("T-001", status="done"),
+        _dev("T-002", status="done"),
+        _dev("T-003", status="doing"),      # illegal — qa must not touch T-003
+        _qa("T-004", source="follows T-001, T-002", status="done"),
+    )
+    with pytest.raises(ValidationError, match="unrelated"):
+        validate_transition(before, after, "qa", "T-004")
+
+
 # ---------- PM decisions ------------------------------------------------
 
 
@@ -279,12 +392,15 @@ def test_loopstate_cost_limit():
 
 
 def test_loopstate_stuck_pm():
+    """v2: same_decision_count is tracked but no longer triggers early exit.
+    Convergence now comes from fuse / reconcile / fingerprint_stuck."""
     s = LoopState()
     d = Decision(next="dev", item_id="T-001", reason="x")
     s.record_decision(d)
     s.record_decision(d)
     s.record_decision(d)
-    assert s.should_exit(Limits()) == "PM stuck (3 consecutive same decisions)"
+    assert s.same_decision_count == 3
+    assert s.should_exit(Limits()) is None  # no longer exits on repeated decisions
 
 
 def test_loopstate_persist_round_trip(tmp_path: Path):
@@ -307,6 +423,86 @@ def test_loopstate_resume_after_exhaust(tmp_path: Path):
     # clear exhaustion for resume
     loaded.exhausted_reason = None
     assert loaded.should_exit(Limits(max_cycles=10)) is None
+
+
+def test_state_load_legacy_json_no_new_fields(tmp_path: Path):
+    """LoopState must tolerate state.json files written by v1 (no new fields)."""
+    state_dir = tmp_path / ".agentloop"
+    state_dir.mkdir()
+    legacy = {
+        "cycle": 7,
+        "total_cost_cny": 3.5,
+        "last_decision": {"next": "dev", "item_id": "T-003", "reason": "x"},
+        "same_decision_count": 1,
+        "started_at": "2026-04-01T00:00:00Z",
+        "exhausted_reason": None,
+        "rollbacks": [],
+    }
+    (state_dir / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
+    loaded = LoopState.load_or_init(tmp_path)
+    assert loaded.cycle == 7
+    assert loaded.fingerprint_history == []
+    assert loaded.abandoned_events == []
+    assert loaded.scheduler_events == []
+    assert loaded.planner_attempts == 0
+
+
+def test_state_new_fields_persist_round_trip(tmp_path: Path):
+    s = LoopState()
+    s.fingerprint_history = ["abc", "def"]
+    s.abandoned_events = [{"item_id": "T-001", "cycle": 3}]
+    s.scheduler_events = [{"kind": "stale_doing_reconciled", "ids": ["T-007"]}]
+    s.planner_attempts = 2
+    s.save(tmp_path)
+    loaded = LoopState.load_or_init(tmp_path)
+    assert loaded.fingerprint_history == ["abc", "def"]
+    assert loaded.abandoned_events == [{"item_id": "T-001", "cycle": 3}]
+    assert loaded.scheduler_events == [{"kind": "stale_doing_reconciled", "ids": ["T-007"]}]
+    assert loaded.planner_attempts == 2
+
+
+def test_limits_new_defaults():
+    lim = Limits()
+    assert lim.max_planner_attempts == 3
+    assert lim.max_fingerprint_stuck == 4
+
+
+def test_exit_code_partial_success_exists():
+    from agentloop.loop import ExitCode
+    assert ExitCode.PARTIAL_SUCCESS.value == 3
+
+
+def test_cli_tag_covers_partial_success(capsys):
+    """cli._report_result must print PARTIAL_SUCCESS without KeyError."""
+    from agentloop.cli import _report_result
+    from agentloop.loop import ExitCode, LoopResult
+
+    code = _report_result(LoopResult(ExitCode.PARTIAL_SUCCESS, "1 abandoned"))
+    assert code == 3
+    out = capsys.readouterr().out
+    assert "PARTIAL_SUCCESS" in out
+    assert "1 abandoned" in out
+
+
+def test_server_derive_status_partial():
+    """server/_derive_status_from_state should return 'partial' when PM said
+    done and abandoned_events is non-empty."""
+    from server.agentloop_manager import _derive_status_from_state
+
+    partial_state = {
+        "exhausted_reason": None,
+        "last_decision": {"next": "done", "item_id": None, "reason": "1 item abandoned"},
+        "abandoned_events": [{"item_id": "T-001", "cycle": 6}],
+    }
+    assert _derive_status_from_state(partial_state) == "partial"
+
+    # all-done still maps to "done"
+    done_state = {
+        "exhausted_reason": None,
+        "last_decision": {"next": "done", "item_id": None, "reason": "all done"},
+        "abandoned_events": [],
+    }
+    assert _derive_status_from_state(done_state) == "done"
 
 
 # ---------- rollback semantics (black-box: validator failure) -----------
@@ -359,3 +555,39 @@ def test_fresh_wipes_state_but_keeps_config(tmp_path: Path):
     assert not (state_dir / "state.json").exists()
     assert not runs.exists()
     assert not (tmp_path / TODOLIST_FILE).exists()
+
+
+# ---------- config loading: new convergence knobs -----------------------
+
+
+def test_config_loads_new_convergence_limits(tmp_path: Path):
+    """Codex P2: config.toml must be able to override the new v2 limits.
+
+    Without this, ``max_planner_attempts`` and ``max_fingerprint_stuck`` are
+    effectively hard-coded defaults even when operators set them in config.
+    """
+    from agentloop.config import AgentConfig
+
+    state_dir = tmp_path / ".agentloop"
+    state_dir.mkdir()
+    (state_dir / "config.toml").write_text(
+        "[limits]\n"
+        "max_cycles = 50\n"
+        "max_planner_attempts = 7\n"
+        "max_fingerprint_stuck = 9\n",
+        encoding="utf-8",
+    )
+
+    cfg = AgentConfig.load(tmp_path)
+    assert cfg.limits.max_cycles == 50
+    assert cfg.limits.max_planner_attempts == 7
+    assert cfg.limits.max_fingerprint_stuck == 9
+
+
+def test_config_defaults_when_new_limits_absent(tmp_path: Path):
+    from agentloop.config import AgentConfig
+
+    cfg = AgentConfig.load(tmp_path)
+    # No config.toml: defaults hold.
+    assert cfg.limits.max_planner_attempts == 3
+    assert cfg.limits.max_fingerprint_stuck == 4

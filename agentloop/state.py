@@ -32,6 +32,8 @@ class Limits:
     max_cycles: int = 30
     max_item_attempts: int = 5
     max_cost_cny: float = 1000.0
+    max_planner_attempts: int = 3
+    max_fingerprint_stuck: int = 4
 
 
 @dataclass
@@ -43,6 +45,10 @@ class LoopState:
     started_at: str = ""
     exhausted_reason: str | None = None
     rollbacks: list[dict[str, Any]] = field(default_factory=list)
+    fingerprint_history: list[str] = field(default_factory=list)
+    abandoned_events: list[dict[str, Any]] = field(default_factory=list)
+    scheduler_events: list[dict[str, Any]] = field(default_factory=list)
+    planner_attempts: int = 0
 
     # ----- persistence ---------------------------------------------------
 
@@ -69,6 +75,10 @@ class LoopState:
             started_at=data.get("started_at") or _utcnow(),
             exhausted_reason=data.get("exhausted_reason"),
             rollbacks=list(data.get("rollbacks", [])),
+            fingerprint_history=list(data.get("fingerprint_history", [])),
+            abandoned_events=list(data.get("abandoned_events", [])),
+            scheduler_events=list(data.get("scheduler_events", [])),
+            planner_attempts=int(data.get("planner_attempts", 0)),
         )
 
     def save(self, cwd: Path) -> None:
@@ -82,6 +92,10 @@ class LoopState:
             "started_at": self.started_at,
             "exhausted_reason": self.exhausted_reason,
             "rollbacks": self.rollbacks,
+            "fingerprint_history": self.fingerprint_history,
+            "abandoned_events": self.abandoned_events,
+            "scheduler_events": self.scheduler_events,
+            "planner_attempts": self.planner_attempts,
         }
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -94,8 +108,9 @@ class LoopState:
             return f"max_cycles reached ({limits.max_cycles})"
         if self.total_cost_cny >= limits.max_cost_cny:
             return f"max_cost reached ({self.total_cost_cny:.2f} >= {limits.max_cost_cny})"
-        if self.same_decision_count >= 3:
-            return "PM stuck (3 consecutive same decisions)"
+        # v2: removed same_decision_count early exit — the loop now relies on
+        # fuse / reconcile / fingerprint_stuck for convergence. The counter
+        # itself is still tracked on LoopState for diagnostics.
         return None
 
     def record_decision(self, decision: Decision) -> None:

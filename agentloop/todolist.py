@@ -40,7 +40,7 @@ _ATTEMPT_LINE_RE = re.compile(
 )
 
 VALID_TYPES = {"dev", "qa", "design-update", "manual"}
-VALID_STATUSES = {"pending", "doing", "ready_for_qa", "done"}
+VALID_STATUSES = {"pending", "doing", "ready_for_qa", "done", "abandoned"}
 
 
 @dataclass

@@ -192,6 +192,10 @@ def _derive_status_from_state(state: dict[str, Any] | None) -> str:
     calls ``mark_exhausted`` with reason ``"no actionable items"`` before
     exiting — so ``exhausted_reason`` reliably distinguishes success from
     exhaustion, and ``last_decision.next == "done"`` alone is insufficient.
+
+    v2 adds ``partial``: PM decided ``done`` and no items remain live, but
+    ``abandoned_events`` is non-empty — some items fused out even though the
+    rest completed cleanly.
     """
     if not state:
         return "unknown"
@@ -199,6 +203,8 @@ def _derive_status_from_state(state: dict[str, Any] | None) -> str:
         return "exhausted"
     last = state.get("last_decision") or {}
     if last.get("next") == "done":
+        if state.get("abandoned_events"):
+            return "partial"
         return "done"
     # Process gone but state shows neither done nor exhausted — likely crash
     # or manual kill.

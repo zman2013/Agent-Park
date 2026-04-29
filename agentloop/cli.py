@@ -120,6 +120,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
 def _report_result(result: scheduler.LoopResult) -> int:
     tag = {
         scheduler.ExitCode.SUCCESS: "SUCCESS",
+        scheduler.ExitCode.PARTIAL_SUCCESS: "PARTIAL_SUCCESS",
         scheduler.ExitCode.EXHAUSTED: "EXHAUSTED",
         scheduler.ExitCode.ERROR: "ERROR",
     }[result.code]
