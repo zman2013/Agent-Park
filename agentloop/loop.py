@@ -24,6 +24,7 @@ from .agents import pm as pm_agent
 from .agents import qa as qa_agent
 from .agents.base import RunResult
 from .config import AgentConfig
+from . import scheduler_writes as sw
 from .state import Decision, LoopState
 from .todolist import Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
 from .validator import ValidationError, validate_transition
@@ -106,6 +107,8 @@ def run(
                 pass
 
     # --- phase 1: scheduling loop ---------------------------------------
+    _startup_health(cwd, state)
+
     while True:
         todolist = parse_todolist(cwd)
 
@@ -168,6 +171,50 @@ def run(
 
 
 # ----- helpers ------------------------------------------------------------
+
+
+def _startup_health(cwd: Path, state: LoopState) -> None:
+    """Run once before entering the main loop.
+
+    * Dep cycles / dangling deps → mark exhausted immediately (these are
+      structural planner bugs the loop can't recover from without human edit).
+    * Stale ``doing`` items left over from a prior crashed run → reset to
+      ``pending`` via a scheduler-write. We do this before any PM decision
+      so PM never sees ``doing`` (Inv-D).
+    """
+    tl = parse_todolist(cwd)
+    if not tl.items:
+        return
+    cycles = sw.find_dep_cycles(tl)
+    if cycles:
+        state.mark_exhausted(
+            "dependency cycle: " + " | ".join("→".join(c) for c in cycles)
+        )
+        state.save(cwd)
+        return
+    dangling = sw.find_dangling_deps(tl)
+    if dangling:
+        pairs = ", ".join(f"{a} → {b}" for a, b in dangling)
+        state.mark_exhausted(f"dangling dependencies: {pairs}")
+        state.save(cwd)
+        return
+    reset = sw.stale_doing_reconcile(tl, boot_cycle=state.cycle)
+    if reset:
+        sw.scheduler_write(cwd, tl)
+        state.scheduler_events.append(
+            {
+                "cycle": state.cycle,
+                "kind": "stale_doing_reconciled",
+                "ids": reset,
+                "at": _utcnow_iso(),
+            }
+        )
+        state.save(cwd)
+
+
+def _utcnow_iso() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _dispatch(

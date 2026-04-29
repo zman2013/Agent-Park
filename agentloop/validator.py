@@ -54,6 +54,14 @@ def validate_transition(
     """
     _check_item_shape(after)
 
+    if actor == "scheduler":
+        # Scheduler writes (fuse/cascade/reconcile/dynamic-qa/stale-doing) are
+        # the loop's own bookkeeping. The transition matrix for dev/qa does
+        # not cover them (e.g. pending → abandoned, ready_for_qa → pending
+        # via cascade), but they are still structurally well-formed — shape
+        # check above is sufficient.
+        return
+
     if actor == "planner":
         _validate_planner(before, after)
         return
