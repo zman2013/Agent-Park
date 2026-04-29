@@ -93,7 +93,7 @@ python -m agentloop status design.md                    # 进度表
 
 ```toml
 [limits]
-max_cycles = 30
+max_cycles = 60
 max_item_attempts = 5
 max_cost_cny = 1000
 

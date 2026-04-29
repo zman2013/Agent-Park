@@ -29,7 +29,7 @@ class Decision:
 
 @dataclass
 class Limits:
-    max_cycles: int = 30
+    max_cycles: int = 60
     max_item_attempts: int = 5
     max_cost_cny: float = 1000.0
     max_planner_attempts: int = 3

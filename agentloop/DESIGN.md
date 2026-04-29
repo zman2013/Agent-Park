@@ -271,7 +271,7 @@ Dev 失败后 item 回到 `pending`，下次 PM 仍会再次指派它。Dev 第 
 
 ```toml
 [limits]
-max_cycles = 30
+max_cycles = 60
 max_item_attempts = 5
 max_cost_cny = 1000
 
