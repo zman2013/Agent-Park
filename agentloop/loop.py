@@ -77,28 +77,9 @@ def run(
     todolist_path = cwd / TODOLIST_FILE
     if not todolist_path.exists():
         logger.info("no todolist — running planner")
-        before = Todolist()  # empty
-        result = planner_agent.run(cwd, config.planner)
-        state.record_cost(result.cost_cny)
-        after = parse_todolist(cwd)
-        try:
-            validate_transition(before, after, "planner", None)
-        except ValidationError as e:
-            # Remove the malformed todolist so a later `resume` re-enters
-            # phase 0 with a clean slate instead of skipping planner and
-            # continuing from invalid state.
-            try:
-                todolist_path.unlink()
-            except FileNotFoundError:
-                pass
-            state.mark_exhausted(f"planner validation failed: {e}")
-            state.save(cwd)
-            return LoopResult(ExitCode.ERROR, str(e))
-        if not result.success:
-            state.mark_exhausted("planner failed (non-zero exit or stream error)")
-            state.save(cwd)
-            return LoopResult(ExitCode.ERROR, "planner failed — see .agentloop/runs/")
-        state.save(cwd)
+        planner_result = _run_planner_with_retry(cwd, config, state, todolist_path)
+        if planner_result is not None:
+            return planner_result
 
         if config.review_plan:
             try:
@@ -138,6 +119,25 @@ def run(
             todolist = parse_todolist(cwd)
 
         decision = pm_agent.decide(todolist)
+
+        # v2: dynamic qa creation when PM points at a stranded ready_for_qa dev
+        if decision.next == "qa" and decision.item_id is None:
+            dev_id = _extract_dev_id_from_reason(decision.reason)
+            if dev_id and todolist.by_id(dev_id):
+                new_qa = sw.create_dynamic_qa(todolist, dev_id, state.cycle)
+                sw.scheduler_write(cwd, todolist)
+                state.scheduler_events.append(
+                    {
+                        "cycle": state.cycle,
+                        "kind": "dynamic_qa_created",
+                        "qa_id": new_qa.id,
+                        "for_dev": dev_id,
+                        "at": _utcnow_iso(),
+                    }
+                )
+                todolist = parse_todolist(cwd)
+                decision = pm_agent.decide(todolist)
+
         state.record_decision(decision)
 
         if decision.next == "done":
@@ -153,14 +153,12 @@ def run(
             state.save(cwd)
             return LoopResult(ExitCode.EXHAUSTED, reason)
 
-        if state.same_decision_count >= 3:
-            reason = (
-                f"PM stuck on ({decision.next}, {decision.item_id}) — "
-                "3 consecutive identical decisions"
-            )
-            state.mark_exhausted(reason)
-            state.save(cwd)
-            return LoopResult(ExitCode.EXHAUSTED, reason)
+        # v2: removed the "3 consecutive identical PM decisions" early exit.
+        # PM is deterministic and will keep re-dispatching the head-of-queue
+        # item across retries; the convergence guarantees now come from
+        # `_fuse` (attempt_log ceiling), `_reconcile` (silent failure → log
+        # entry), and `_fingerprint_stuck` (structural no-progress over N
+        # cycles). Keeping `same_decision_count` on LoopState for debugging.
 
         logger.info(
             "cycle %d: %s → %s (%s)",
@@ -168,16 +166,39 @@ def run(
         )
 
         before_text = todolist_path.read_text(encoding="utf-8") if todolist_path.exists() else ""
+        before_tl = todolist
         result = _dispatch(decision, cwd, state.cycle + 1, config)
         state.record_cost(result.cost_cny)
 
         after = parse_todolist(cwd)
         try:
-            validate_transition(todolist, after, decision.next, decision.item_id)
+            validate_transition(before_tl, after, decision.next, decision.item_id)
         except ValidationError as e:
             logger.warning("validation failed: %s — rolling back todolist", e)
             todolist_path.write_text(before_text, encoding="utf-8")
             state.record_rollback(decision.next, decision.item_id, str(e))
+            after = parse_todolist(cwd)
+
+        # v2: reconcile — if the dispatched agent failed to advance the item
+        # (stalled, crashed, or silently exited without a state change),
+        # scheduler writes a pending attempt so the fuse counter moves.
+        if not _decision_advanced(before_tl, after, decision):
+            _reconcile(cwd, after, decision, result, state.cycle + 1)
+
+        # v2: fingerprint stuck check — drives real structural progress even
+        # when individual cycles look like they make headway via attempt_log
+        # growth but nothing terminal happens.
+        fp = _fingerprint(after)
+        state.fingerprint_history.append(fp)
+        if _fingerprint_stuck(state.fingerprint_history, config.limits.max_fingerprint_stuck):
+            reason = (
+                f"structural fingerprint unchanged for "
+                f"{config.limits.max_fingerprint_stuck} cycles"
+            )
+            state.mark_exhausted(reason)
+            state.cycle += 1
+            state.save(cwd)
+            return LoopResult(ExitCode.EXHAUSTED, reason)
 
         state.cycle += 1
         state.save(cwd)
@@ -255,6 +276,183 @@ def _null_result(msg: str) -> RunResult:
         success=False,
         errors=[msg],
     )
+
+
+def _run_planner_with_retry(
+    cwd: Path,
+    config: AgentConfig,
+    state: LoopState,
+    todolist_path: Path,
+) -> LoopResult | None:
+    """Run planner up to limits.max_planner_attempts; return LoopResult on fatal, else None.
+
+    A successful attempt returns None so the caller continues into phase 1.
+    On each failure we unlink any partial todolist so the next attempt starts
+    clean. Final failure marks state exhausted with ExitCode.ERROR.
+    """
+    before = Todolist()  # phase 0 only runs when todolist is empty
+    last_error = ""
+    for attempt in range(config.limits.max_planner_attempts):
+        state.planner_attempts = attempt + 1
+        result = planner_agent.run(cwd, config.planner)
+        state.record_cost(result.cost_cny)
+        after = parse_todolist(cwd)
+        try:
+            validate_transition(before, after, "planner", None)
+            if result.success:
+                state.save(cwd)
+                return None
+            last_error = "planner failed (non-zero exit or stream error)"
+        except ValidationError as e:
+            last_error = f"planner validation failed: {e}"
+        logger.warning(
+            "planner attempt %d/%d failed: %s",
+            attempt + 1, config.limits.max_planner_attempts, last_error,
+        )
+        # Wipe the partial todolist so the next retry sees a clean slate.
+        try:
+            todolist_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    reason = f"planner failed {config.limits.max_planner_attempts} times: {last_error}"
+    state.mark_exhausted(reason)
+    state.save(cwd)
+    return LoopResult(ExitCode.ERROR, reason)
+
+
+def _extract_dev_id_from_reason(reason: str) -> str | None:
+    """Pull a ``T-xxx`` id out of a PM reason string.
+
+    PM's rule 1 emits ``"ready_for_qa T-007 has no matching qa item"``; we
+    parse out the id so the scheduler can attach a dynamic qa.
+    """
+    if not reason:
+        return None
+    import re
+    m = re.search(r"\b(T-\d+)\b", reason)
+    return m.group(1) if m else None
+
+
+def _attempt_log_digest(item: Item) -> str:
+    import hashlib
+    import json
+    data = [(x.cycle, x.result, x.notes.strip()) for x in item.attempt_log]
+    return hashlib.sha256(json.dumps(data).encode("utf-8")).hexdigest()
+
+
+def _decision_advanced(before: Todolist, after: Todolist, decision: Decision) -> bool:
+    """Return True iff the dispatched cycle actually moved the state forward.
+
+    "Forward" means one of:
+    * the assigned item reached a terminal result (dev → ready_for_qa; qa → done)
+    * its attempt_log grew (a failed attempt is still forward progress — fuse
+      will eventually catch it)
+    * for qa decisions, the reviewed dev's status changed
+
+    Silent failure — agent exited cleanly with no attempt_log entry — returns
+    False; caller falls through to :func:`_reconcile`.
+    """
+    if decision.next not in {"dev", "qa"}:
+        return True
+    if decision.item_id is None:
+        return True
+    a = after.by_id(decision.item_id)
+    if a is None:
+        return False
+    b = before.by_id(decision.item_id)
+    if b is None:
+        return True
+
+    if decision.next == "dev":
+        if a.status == "ready_for_qa" and b.status != "ready_for_qa":
+            return True
+        if _attempt_log_digest(a) != _attempt_log_digest(b):
+            return True
+        return False
+
+    # qa
+    if a.status == "done" and b.status != "done":
+        return True
+    if _attempt_log_digest(a) != _attempt_log_digest(b):
+        return True
+    reviewed = _reviewed_dev_id(a, before)
+    if reviewed:
+        rb = before.by_id(reviewed)
+        ra = after.by_id(reviewed)
+        if rb is not None and ra is not None:
+            if rb.status != ra.status:
+                return True
+            if _attempt_log_digest(rb) != _attempt_log_digest(ra):
+                return True
+    return False
+
+
+def _classify_run_failure(result: RunResult) -> str:
+    errors = " ".join(result.errors or [])
+    if "stalled" in errors.lower():
+        return "reconcile: agent stalled"
+    if "exit code" in errors.lower() or "exited with" in errors.lower():
+        return "reconcile: agent exited with error"
+    if result.success:
+        return "reconcile: agent exited cleanly, status not advanced"
+    return "reconcile: agent failed"
+
+
+def _reconcile(cwd: Path, tl: Todolist, decision: Decision, result: RunResult, cycle: int) -> None:
+    """Normalize an un-advanced dispatched item and append a pending attempt.
+
+    Called after validator has run (so any rollback is already applied). The
+    cascade of behaviors:
+
+    * If the target is still ``doing`` → force ``pending`` (never leave
+      doing across cycles; Inv-D).
+    * Append a pending attempt with a classified reason. Idempotent on tail
+      match so a post-crash re-run doesn't duplicate.
+    """
+    if decision.item_id is None:
+        return
+    item = tl.by_id(decision.item_id)
+    if item is None:
+        return
+    note = _classify_run_failure(result)
+
+    mutated = False
+    if item.status == "doing":
+        item.status = "pending"
+        mutated = True
+    if sw.append_scheduler_attempt(item, cycle, "pending", note):
+        mutated = True
+    if mutated:
+        sw.scheduler_write(cwd, tl)
+
+
+def _fingerprint(tl: Todolist) -> str:
+    """Structural digest of the todolist for stuck-detection.
+
+    Granularity ``(id, status, len(attempt_log))`` — so an in-flight retry
+    that pushes an item from N → N+1 attempts advances the fingerprint and
+    resets the stuck counter, while a truly dead loop where nothing is being
+    appended stays fingerprint-stable.
+    """
+    import hashlib
+    parts = [f"{it.id}:{it.status}:{len(it.attempt_log)}" for it in tl.items]
+    blob = "|".join(sorted(parts)).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _fingerprint_stuck(history: list[str], threshold: int) -> bool:
+    """True when the last ``threshold`` fingerprints are all identical.
+
+    We need at least ``threshold`` samples before tripping; a shorter history
+    always returns False.
+    """
+    if threshold <= 1:
+        return False
+    if len(history) < threshold:
+        return False
+    tail = history[-threshold:]
+    return len(set(tail)) == 1
 
 
 def _item_failures(item: Item) -> int:

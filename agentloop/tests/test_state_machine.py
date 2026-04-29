@@ -299,12 +299,15 @@ def test_loopstate_cost_limit():
 
 
 def test_loopstate_stuck_pm():
+    """v2: same_decision_count is tracked but no longer triggers early exit.
+    Convergence now comes from fuse / reconcile / fingerprint_stuck."""
     s = LoopState()
     d = Decision(next="dev", item_id="T-001", reason="x")
     s.record_decision(d)
     s.record_decision(d)
     s.record_decision(d)
-    assert s.should_exit(Limits()) == "PM stuck (3 consecutive same decisions)"
+    assert s.same_decision_count == 3
+    assert s.should_exit(Limits()) is None  # no longer exits on repeated decisions
 
 
 def test_loopstate_persist_round_trip(tmp_path: Path):

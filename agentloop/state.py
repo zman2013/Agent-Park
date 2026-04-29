@@ -108,8 +108,9 @@ class LoopState:
             return f"max_cycles reached ({limits.max_cycles})"
         if self.total_cost_cny >= limits.max_cost_cny:
             return f"max_cost reached ({self.total_cost_cny:.2f} >= {limits.max_cost_cny})"
-        if self.same_decision_count >= 3:
-            return "PM stuck (3 consecutive same decisions)"
+        # v2: removed same_decision_count early exit — the loop now relies on
+        # fuse / reconcile / fingerprint_stuck for convergence. The counter
+        # itself is still tracked on LoopState for diagnostics.
         return None
 
     def record_decision(self, decision: Decision) -> None:
