@@ -134,7 +134,46 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _read_state(cwd: Path) -> dict[str, Any] | None:
+def _proc_start_time(pid: int) -> int | None:
+    """Return pid's start time in clock ticks since boot, or None.
+
+    Used to defeat PID reuse: we persist start_time at spawn and re-check it
+    before signaling. /proc/<pid>/stat field 22 is starttime on Linux.
+    Reading as bytes avoids UnicodeDecodeError on unusual comm names.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as f:
+            data = f.read()
+    except (FileNotFoundError, OSError):
+        return None
+    # comm is wrapped in parens and may contain spaces/parens itself; split
+    # after the last ')'.
+    rparen = data.rfind(b")")
+    if rparen < 0:
+        return None
+    fields = data[rparen + 2:].split()
+    # After comm we have state(1), ppid(2), ...; starttime is field 22 overall,
+    # i.e. index 19 in this tail (0-based after state).
+    if len(fields) < 20:
+        return None
+    try:
+        return int(fields[19])
+    except ValueError:
+        return None
+
+
+def _pid_matches(pid: int, expected_start_time: int | None) -> bool:
+    """True if pid is alive AND (if expected given) its start time still matches."""
+    if not _pid_alive(pid):
+        return False
+    if expected_start_time is None:
+        # Legacy entries predate start_time tracking; fall back to liveness only.
+        return True
+    current = _proc_start_time(pid)
+    return current is not None and current == expected_start_time
+
+
+
     state_path = cwd / AGENTLOOP_DIR / STATE_FILE
     if not state_path.exists():
         return None
@@ -194,7 +233,8 @@ def start(
     existing = _find(loop_id)
     if existing and existing.get("status") == "running":
         pid = existing.get("pid")
-        if pid and _pid_alive(int(pid)):
+        expected_st = existing.get("pid_start_time")
+        if pid and _pid_matches(int(pid), expected_st):
             logger.info("agentloop already running for %s (pid=%s)", cwd_path, pid)
             return existing
 
@@ -240,15 +280,18 @@ def start(
             start_new_session=True,
             env=env,
         )
-    except Exception:
+    finally:
+        # Close our copy of the fd — the child has its own inherited copy and
+        # will keep writing. Leaving this open leaks a descriptor per start()
+        # and eventually trips ulimit -n.
         log_fp.close()
-        raise
 
     entry = {
         "loop_id": loop_id,
         "cwd": str(cwd_path),
         "design_path": str(design),
         "pid": proc.pid,
+        "pid_start_time": _proc_start_time(proc.pid),
         "started_at": _utcnow(),
         "source_task_id": source_task_id,
         "status": "running",
@@ -265,7 +308,11 @@ def stop(loop_id: str, timeout_sec: float = 10.0) -> dict[str, Any] | None:
     if not entry:
         return None
     pid = int(entry.get("pid") or 0)
-    if pid and _pid_alive(pid):
+    expected_st = entry.get("pid_start_time")
+    # Guard against PID reuse: only signal when the live pid still matches
+    # the start_time we recorded at spawn. If it doesn't match, the original
+    # process is gone and this pid now belongs to something unrelated.
+    if pid and _pid_matches(pid, expected_st):
         try:
             # Signal the process group (we used start_new_session=True).
             pgid = os.getpgid(pid)
@@ -274,10 +321,10 @@ def stop(loop_id: str, timeout_sec: float = 10.0) -> dict[str, Any] | None:
             pass
 
         deadline = time.time() + timeout_sec
-        while time.time() < deadline and _pid_alive(pid):
+        while time.time() < deadline and _pid_matches(pid, expected_st):
             time.sleep(0.2)
 
-        if _pid_alive(pid):
+        if _pid_matches(pid, expected_st):
             try:
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -299,11 +346,12 @@ def dismiss(loop_id: str) -> dict[str, Any] | None:
 def _refresh_status(entry: dict[str, Any]) -> dict[str, Any]:
     """Reconcile an entry's ``status`` field with actual process/state on disk."""
     pid = int(entry.get("pid") or 0)
+    expected_st = entry.get("pid_start_time")
     cwd_path = Path(entry["cwd"])
     state = _read_state(cwd_path)
 
     if entry.get("status") == "running":
-        if not _pid_alive(pid):
+        if not _pid_matches(pid, expected_st):
             derived = _derive_status_from_state(state)
             _update_fields(entry["loop_id"], status=derived, stopped_at=_utcnow())
             entry["status"] = derived
@@ -404,7 +452,8 @@ def restore_orphan_loops() -> list[str]:
         if entry.get("status") != "running":
             continue
         pid = int(entry.get("pid") or 0)
-        if _pid_alive(pid):
+        expected_st = entry.get("pid_start_time")
+        if _pid_matches(pid, expected_st):
             logger.info("Re-claimed orphan agentloop pid=%s loop_id=%s", pid, loop_id)
             continue
         state = _read_state(Path(entry["cwd"]))

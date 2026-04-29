@@ -82,6 +82,13 @@ def run(
         try:
             validate_transition(before, after, "planner", None)
         except ValidationError as e:
+            # Remove the malformed todolist so a later `resume` re-enters
+            # phase 0 with a clean slate instead of skipping planner and
+            # continuing from invalid state.
+            try:
+                todolist_path.unlink()
+            except FileNotFoundError:
+                pass
             state.mark_exhausted(f"planner validation failed: {e}")
             state.save(cwd)
             return LoopResult(ExitCode.ERROR, str(e))
