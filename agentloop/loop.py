@@ -26,8 +26,8 @@ from .agents.base import RunResult
 from .config import AgentConfig
 from . import scheduler_writes as sw
 from .state import Decision, LoopState
-from .todolist import Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
-from .validator import ValidationError, validate_transition
+from .todolist import Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
+from .validator import ValidationError, _reviewed_dev_id, validate_transition
 
 logger = logging.getLogger(__name__)
 
@@ -117,25 +117,38 @@ def run(
             state.save(cwd)
             return LoopResult(ExitCode.EXHAUSTED, reason)
 
-        # exhaust on per-item attempt ceiling
-        stuck_id = _item_over_attempt_limit(todolist, config.limits.max_item_attempts)
-        if stuck_id:
-            reason = f"item {stuck_id} exceeded max_item_attempts"
-            state.mark_exhausted(reason)
-            state.save(cwd)
-            return LoopResult(ExitCode.EXHAUSTED, reason)
+        # v2: per-item fuse + cascade run before PM sees the todolist so that
+        # PM and the attempt-limit check never operate on abandoned-but-live
+        # items. `_fuse` turns over-limit items abandoned; `_cascade` closes
+        # the downstream DAG and downgrades stranded qa/dev pairs.
+        fused = _fuse(cwd, todolist, config.limits.max_item_attempts, state.cycle)
+        cascaded = _cascade(cwd, todolist, state.cycle)
+        if fused or cascaded:
+            for iid, reason_txt in fused + cascaded:
+                state.abandoned_events.append(
+                    {
+                        "cycle": state.cycle,
+                        "item_id": iid,
+                        "reason": reason_txt,
+                        "at": _utcnow_iso(),
+                    }
+                )
+            sw.scheduler_write(cwd, todolist)
+            # re-parse so later checks see canonical on-disk state
+            todolist = parse_todolist(cwd)
 
         decision = pm_agent.decide(todolist)
         state.record_decision(decision)
 
         if decision.next == "done":
-            if todolist.items and all(it.status == "done" for it in todolist.items):
+            exit_code, reason = _classify_terminal(todolist, decision)
+            if exit_code == ExitCode.SUCCESS:
                 state.save(cwd)
-                return LoopResult(ExitCode.SUCCESS, decision.reason or "all done")
-            # PM said done but items remain non-done → we're exhausting with
-            # nothing actionable left. Persist that so `resume` knows not to
-            # silently re-enter the loop.
-            reason = decision.reason or "no actionable items"
+                return LoopResult(exit_code, reason)
+            if exit_code == ExitCode.PARTIAL_SUCCESS:
+                state.save(cwd)
+                return LoopResult(exit_code, reason)
+            # EXHAUSTED — nothing actionable left but some items still open
             state.mark_exhausted(reason)
             state.save(cwd)
             return LoopResult(ExitCode.EXHAUSTED, reason)
@@ -244,15 +257,92 @@ def _null_result(msg: str) -> RunResult:
     )
 
 
-def _item_over_attempt_limit(todolist: Todolist, limit: int) -> str | None:
-    for it in todolist.items:
-        if it.status == "done":
+def _item_failures(item: Item) -> int:
+    """Number of failed (pending-result) attempts in an item's attempt_log."""
+    return sum(1 for a in item.attempt_log if a.result == "pending")
+
+
+def _fuse(cwd: Path, tl: Todolist, max_attempts: int, cycle: int) -> list[tuple[str, str]]:
+    """Mark items whose attempt_log has ≥ max_attempts failures as abandoned.
+
+    Returns list of (item_id, reason) for each newly abandoned item. The
+    todolist is mutated in place; caller is responsible for scheduler_write.
+    Skips already-terminal items so repeated passes are idempotent.
+    """
+    newly: list[tuple[str, str]] = []
+    for it in tl.items:
+        if it.status in {"done", "abandoned"}:
             continue
-        # failed attempts = attempt_log entries whose result == "pending"
-        failures = sum(1 for a in it.attempt_log if a.result == "pending")
-        if failures >= limit:
-            return it.id
-    return None
+        failures = _item_failures(it)
+        if failures < max_attempts:
+            continue
+        reason = f"exceeded max_item_attempts ({failures}/{max_attempts})"
+        if sw.mark_abandoned(tl, it.id, reason, cycle):
+            newly.append((it.id, reason))
+    return newly
+
+
+def _cascade(cwd: Path, tl: Todolist, cycle: int) -> list[tuple[str, str]]:
+    """Cascade ``abandoned`` through downstream deps; downgrade stranded qa-dev.
+
+    Fixed-point iteration: anything whose dep is abandoned becomes abandoned
+    itself. Independent DAG branches survive. After propagation, any qa item
+    already in ``abandoned`` causes its paired ``ready_for_qa`` dev to roll
+    back to ``pending`` (give retry-and-fuse another shot before final fuse).
+    Returns list of (item_id, reason) for newly abandoned items.
+    """
+    newly: list[tuple[str, str]] = []
+    abandoned = {it.id for it in tl.items if it.status == "abandoned"}
+
+    changed = True
+    while changed:
+        changed = False
+        for it in tl.items:
+            if it.status in {"done", "abandoned"}:
+                continue
+            bad = [d for d in it.dependencies if d in abandoned]
+            if not bad:
+                continue
+            reason = f"cascade: dep(s) abandoned: {', '.join(bad)}"
+            if sw.mark_abandoned(tl, it.id, reason, cycle):
+                abandoned.add(it.id)
+                newly.append((it.id, reason))
+                changed = True
+
+    # qa abandoned → downgrade reviewed dev back to pending
+    for it in tl.items:
+        if it.type != "qa" or it.status != "abandoned":
+            continue
+        dev_id = _reviewed_dev_id(it, tl)
+        if not dev_id:
+            continue
+        dev = tl.by_id(dev_id)
+        if dev is None or dev.status != "ready_for_qa":
+            continue
+        sw.downgrade_reviewed_dev(
+            tl, dev_id, cycle, f"qa {it.id} abandoned"
+        )
+    return newly
+
+
+def _classify_terminal(
+    tl: Todolist, decision: Decision
+) -> tuple["ExitCode", str]:
+    """Map PM's ``done`` decision to a concrete ExitCode + reason.
+
+    * all items done → SUCCESS
+    * all items {done, abandoned} with ≥1 abandoned → PARTIAL_SUCCESS
+    * anything else → EXHAUSTED (PM said done but items remain live)
+    """
+    if not tl.items:
+        return ExitCode.SUCCESS, decision.reason or "empty todolist"
+    statuses = {it.status for it in tl.items}
+    if statuses == {"done"}:
+        return ExitCode.SUCCESS, decision.reason or "all items done"
+    if statuses <= {"done", "abandoned"}:
+        n = sum(1 for it in tl.items if it.status == "abandoned")
+        return ExitCode.PARTIAL_SUCCESS, f"{n} item(s) abandoned, rest done"
+    return ExitCode.EXHAUSTED, decision.reason or "no actionable items"
 
 
 def _wipe_agentloop_state(cwd: Path) -> None:
