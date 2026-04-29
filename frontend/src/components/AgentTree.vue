@@ -15,6 +15,7 @@
       </div>
 
       <div class="px-2">
+        <AgentLoopRecentPanel />
         <UnseenTasksPanel />
       </div>
 
@@ -104,6 +105,7 @@
 import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import AgentGroup from './AgentGroup.vue'
+import AgentLoopRecentPanel from './AgentLoopRecentPanel.vue'
 import UnseenTasksPanel from './UnseenTasksPanel.vue'
 
 const store = useAgentStore()

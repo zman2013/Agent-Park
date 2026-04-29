@@ -4,6 +4,12 @@
     <div class="flex items-center px-6 py-1 border-b border-gray-800 text-xs text-gray-600 shrink-0 font-mono overflow-hidden">
       <span v-if="sessionId" class="text-gray-700 mr-1">session:</span>
       <span v-if="sessionId" class="text-gray-500 select-all">{{ sessionId }}</span>
+      <button
+        v-if="matchedAgentLoop"
+        @click="openAgentLoop"
+        class="ml-3 text-blue-400 hover:text-blue-300 transition-colors"
+        title="切换到 AgentLoop 面板"
+      >查看 AgentLoop →</button>
       <span class="flex-1"></span>
       <template v-if="task.num_turns">
         <span class="text-gray-600">累计 <span class="text-gray-400">{{ task.num_turns }}</span> turns</span>
@@ -67,6 +73,20 @@ const props = defineProps({
 const store = useAgentStore()
 
 const sessionId = computed(() => store.taskSessions[props.task.id] || null)
+
+// Match an active agentloop to the current task's agent cwd, if any.
+const matchedAgentLoop = computed(() => {
+  const agent = store.agents.find(a => a.id === props.task.agent_id)
+  const cwd = agent?.cwd
+  if (!cwd) return null
+  return (store.agentloops || []).find(l => l.cwd === cwd) || null
+})
+
+function openAgentLoop() {
+  if (matchedAgentLoop.value) {
+    store.selectAgentLoop(matchedAgentLoop.value.loop_id)
+  }
+}
 
 // Token usage display helpers
 function shortModel(name) {

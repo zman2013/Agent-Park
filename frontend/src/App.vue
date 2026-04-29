@@ -23,7 +23,10 @@
 
     <!-- Center Panel -->
     <div class="flex-1 flex flex-col min-w-0 overflow-hidden">
-      <template v-if="fileContentViewVisible && fileBrowserState.selectedFile">
+      <template v-if="store.selectedAgentLoopId">
+        <AgentLoopPanel :loop-id="store.selectedAgentLoopId" @close="onAgentLoopClose" />
+      </template>
+      <template v-else-if="fileContentViewVisible && fileBrowserState.selectedFile">
         <FileContentView
           :agent-id="fileBrowserState.agentId"
           :file-path="fileBrowserState.selectedFile"
@@ -37,7 +40,7 @@
       <div v-else class="flex-1 flex items-center justify-center text-gray-600 text-sm">
         Select a task or create a new one to get started
       </div>
-      <ChatInput v-if="store.currentTask" :task="store.currentTask" />
+      <ChatInput v-if="store.currentTask && !store.selectedAgentLoopId" :task="store.currentTask" />
       <TerminalPanel
         :visible="terminalVisible"
         :cwd="currentAgentCwd"
@@ -106,6 +109,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from './stores/agentStore'
 import { useWebSocket } from './composables/useWebSocket'
 import AgentTree from './components/AgentTree.vue'
+import AgentLoopPanel from './components/AgentLoopPanel.vue'
 import ChatView from './components/ChatView.vue'
 import ChatInput from './components/ChatInput.vue'
 import ToastContainer from './components/ToastContainer.vue'
@@ -263,6 +267,10 @@ function onRecentFileSelect({ path }) {
   fileBrowserState.value.selectedFile = path
   fileBrowserState.value.fileSize = 0
   fileContentViewVisible.value = true
+}
+
+function onAgentLoopClose() {
+  store.clearSelectedAgentLoop()
 }
 
 // ── Event handlers ────────────────────────────────────────────────────────────
