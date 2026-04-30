@@ -550,11 +550,20 @@ export const useAgentStore = defineStore('agent', () => {
 
   // ── AgentLoop actions ──────────────────────────────────────────────────────
 
+  // Monotonic seq for fetchAgentLoops. 3-second polling doesn't await the
+  // previous request, so a slow response could land after a faster one and
+  // roll agentloopStatusSnapshot back from a finished status to 'running' —
+  // which would re-fire the transition notification on the next normal poll.
+  // We keep only the latest request's result.
+  let fetchAgentLoopsSeq = 0
+
   async function fetchAgentLoops() {
+    const mySeq = ++fetchAgentLoopsSeq
     try {
       const res = await fetch('/api/agentloops?include_dismissed=true')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
+      if (mySeq !== fetchAgentLoopsSeq) return  // stale response, drop it
       const next = Array.isArray(data) ? data : []
       // Detect running → finished transitions so we can flash the tab title
       // like task_status does. Skip the very first poll: entries loaded from
