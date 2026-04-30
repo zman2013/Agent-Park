@@ -272,15 +272,15 @@ def _next_sequence(runs_dir: Path) -> int:
 def _child_env() -> dict[str, str]:
     """Env for spawned agent CLIs.
 
-    Strips CLAUDECODE / CLAUDE_CODE_* — those are injected by an enclosing
-    Claude Code session and trip its nested-session guard, which aborts the
-    child `claude` before it can do anything. agentloop deliberately spawns a
-    new session, so the markers must not be inherited even if the caller was
-    itself launched from inside Claude Code.
+    Strips just the nested-session markers that the parent Claude Code CLI
+    stamps into its environment — those trip the child ``claude`` process's
+    nested-session guard and abort it before it can do anything. All other
+    ``CLAUDE_CODE_*`` variables (``_USE_BEDROCK``, ``_USE_MANTLE``,
+    ``_MAX_OUTPUT_TOKENS`` …) carry legitimate backend auth / routing config
+    and must be preserved, otherwise Bedrock/Vertex-AI setups lose their
+    routing and fall back to public API (or fail entirely).
     """
     env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
-    for k in list(env.keys()):
-        if k.startswith("CLAUDE_CODE"):
-            env.pop(k, None)
+    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
+        env.pop(marker, None)
     return env
