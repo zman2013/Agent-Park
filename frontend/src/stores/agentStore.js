@@ -598,6 +598,7 @@ export const useAgentStore = defineStore('agent', () => {
           cwd: entry.cwd,
           design_path: entry.design_path || null,
           source_task_id: entry.source_task_id || null,
+          workspace: entry.workspace || null,
         }),
       })
       if (!res.ok) {

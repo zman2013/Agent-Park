@@ -366,11 +366,13 @@ def start(
                 "-m",
                 "agentloop",
                 "run",
-                # Pass the original design path (its parent is the project
-                # root) — passing `design_in_ws` would make the CLI treat the
-                # workspace dir as the project root and nest another
-                # `.agentloop/workspaces/<slug>/` inside it.
+                # Pass the original design path, but pin the project root
+                # explicitly — otherwise the CLI would derive it from
+                # design.parent, which breaks when design.md lives in a
+                # subdirectory of cwd (e.g. cwd/docs/design.md) or outside.
                 str(design_target),
+                "--project-root",
+                str(cwd_path),
                 "--workspace",
                 slug,
             ],

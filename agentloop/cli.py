@@ -38,6 +38,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Workspace slug under <cwd>/.agentloop/workspaces/. "
         "Auto-generated from timestamp + design stem if omitted.",
     )
+    p_run.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        dest="project_root",
+        help="Project root for workspace persistence. Defaults to design.parent "
+        "— set explicitly when design.md lives in a subdirectory (e.g. docs/).",
+    )
     p_run.add_argument("-v", "--verbose", action="store_true")
 
     p_resume = sub.add_parser("resume", help="Continue an exhausted run with extra budget.")
@@ -49,6 +57,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Workspace slug to resume. Required when >1 workspace exists.",
     )
+    p_resume.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        dest="project_root",
+        help="Project root override (see `agentloop run --project-root`).",
+    )
     p_resume.add_argument("-v", "--verbose", action="store_true")
 
     p_status = sub.add_parser("status", help="Show current project progress.")
@@ -57,6 +72,13 @@ def main(argv: list[str] | None = None) -> int:
         "--workspace",
         default=None,
         help="Workspace slug to inspect. Required when >1 workspace exists.",
+    )
+    p_status.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        dest="project_root",
+        help="Project root override (see `agentloop run --project-root`).",
     )
 
     args = parser.parse_args(argv)
@@ -77,31 +99,35 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def _resolve_project_root(design: Path) -> Path:
+def _resolve_project_root(design: Path, override: Path | None = None) -> Path:
+    if override is not None:
+        return override.resolve()
     return (design.parent if design.is_file() else design).resolve()
 
 
-def _resolve_workspace_for_run(design: Path, slug: str | None) -> WorkspacePaths:
-    project_root = _resolve_project_root(design)
+def _resolve_workspace_for_run(
+    design: Path, slug: str | None, project_root: Path | None = None
+) -> WorkspacePaths:
+    root = _resolve_project_root(design, project_root)
     if slug is None:
         slug = generate_slug(design)
-    return WorkspacePaths.for_workspace(project_root, slug)
+    return WorkspacePaths.for_workspace(root, slug)
 
 
 def _resolve_workspace_for_existing(
-    design: Path, slug: str | None
+    design: Path, slug: str | None, project_root: Path | None = None
 ) -> WorkspacePaths | None:
     """Pick the workspace for resume/status. Returns None on ambiguous choice."""
-    project_root = _resolve_project_root(design)
+    root = _resolve_project_root(design, project_root)
     if slug is not None:
-        return WorkspacePaths.for_workspace(project_root, slug)
+        return WorkspacePaths.for_workspace(root, slug)
 
-    existing = list_workspaces(project_root)
+    existing = list_workspaces(root)
 
     if len(existing) == 1:
-        return WorkspacePaths.for_workspace(project_root, existing[0])
+        return WorkspacePaths.for_workspace(root, existing[0])
     if not existing:
-        print(f"[agentloop] no workspace found under {project_root}", file=sys.stderr)
+        print(f"[agentloop] no workspace found under {root}", file=sys.stderr)
         return None
     # >1 workspace — force explicit pick.
     print(
@@ -114,7 +140,7 @@ def _resolve_workspace_for_existing(
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
-    ws = _resolve_workspace_for_run(args.design, args.workspace)
+    ws = _resolve_workspace_for_run(args.design, args.workspace, args.project_root)
     result = scheduler.run(
         args.design,
         fresh=args.fresh,
@@ -127,7 +153,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
-    ws = _resolve_workspace_for_existing(args.design, args.workspace)
+    ws = _resolve_workspace_for_existing(args.design, args.workspace, args.project_root)
     if ws is None:
         return 2
     state = LoopState.load_or_init(ws)
@@ -152,7 +178,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    ws = _resolve_workspace_for_existing(args.design, args.workspace)
+    ws = _resolve_workspace_for_existing(args.design, args.workspace, args.project_root)
     if ws is None:
         return 2
     state = LoopState.load_or_init(ws)
