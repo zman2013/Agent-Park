@@ -572,15 +572,25 @@ def _classify_terminal(
 
 
 def _wipe_agentloop_state(ws: WorkspacePaths) -> None:
-    """Wipe the current workspace's run state, preserving shared config.toml.
+    """Wipe the current workspace's run state, preserving its config.toml.
 
     ``--fresh`` resets this workspace's todolist, state.json, and runs logs
-    without erasing the project-level ``<cwd>/.agentloop/config.toml`` nor
-    any other workspace under ``<cwd>/.agentloop/workspaces/``.
+    without erasing its per-workspace ``config.toml`` (seeded by the CLI /
+    manager before the run) nor any sibling workspace under
+    ``<cwd>/.agentloop/workspaces/``.
     """
-    # Blow away the whole workspace dir, then recreate empty. design.md
-    # symlink inside is recreated by the caller before re-running.
     ws_dir = ws.workspace_dir
-    if ws_dir.exists():
-        shutil.rmtree(ws_dir)
-    ws_dir.mkdir(parents=True, exist_ok=True)
+    if not ws_dir.exists():
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        return
+    # Preserve config.toml across the wipe — it was seeded just before the
+    # run starts (either by the CLI or agentloop_manager), and naively
+    # rmtree-ing the whole workspace would drop the freshly-applied
+    # per-workspace limits/backend overrides.
+    for child in ws_dir.iterdir():
+        if child.name == ws.config_file.name:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
