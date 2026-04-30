@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
+import { notify } from '../utils/titleNotify'
 
 export const useAgentStore = defineStore('agent', () => {
   const agents = ref([])
@@ -31,6 +32,10 @@ export const useAgentStore = defineStore('agent', () => {
   const selectedAgentLoopId = ref(null)
   // Full list of non-dismissed agentloops (for both sidebar "recent" and task-header link lookup)
   const agentloops = ref([])
+  // Snapshot of last poll's loop_id → status, used to detect running →
+  // finished transitions in fetchAgentLoops so we can flash the tab title.
+  // null before the first poll completes so we don't fire on initial load.
+  const agentloopStatusSnapshot = ref(null)
   // Detailed snapshot for the currently selected agentloop (state + todolist + runs)
   const agentloopSnapshot = ref(null)
   // Run log for the currently viewed cycle
@@ -545,12 +550,48 @@ export const useAgentStore = defineStore('agent', () => {
 
   // ── AgentLoop actions ──────────────────────────────────────────────────────
 
+  // Monotonic seq for fetchAgentLoops. 3-second polling doesn't await the
+  // previous request, so a slow response could land after a faster one and
+  // roll agentloopStatusSnapshot back from a finished status to 'running' —
+  // which would re-fire the transition notification on the next normal poll.
+  // We keep only the latest request's result.
+  let fetchAgentLoopsSeq = 0
+
   async function fetchAgentLoops() {
+    const mySeq = ++fetchAgentLoopsSeq
     try {
       const res = await fetch('/api/agentloops?include_dismissed=true')
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      agentloops.value = Array.isArray(data) ? data : []
+      if (mySeq !== fetchAgentLoopsSeq) return  // stale response, drop it
+      const next = Array.isArray(data) ? data : []
+      // Detect running → finished transitions so we can flash the tab title
+      // like task_status does. Skip the very first poll: entries loaded from
+      // the registry that were already finished before the user opened the
+      // page shouldn't fire a fresh notification.
+      const prevMap = agentloopStatusSnapshot.value
+      const isFirstPoll = prevMap === null
+      const nextMap = {}
+      for (const loop of next) {
+        const id = loop.loop_id
+        if (!id) continue
+        nextMap[id] = loop.status
+        if (isFirstPoll) continue
+        const prev = prevMap[id]
+        if (prev === 'running' && loop.status && loop.status !== 'running') {
+          const label = `${loop.cwd_basename || 'loop'} / ${loop.workspace || '?'}`
+          const titleMap = {
+            done: 'AgentLoop 完成',
+            exhausted: 'AgentLoop 耗尽',
+            partial: 'AgentLoop 完成（有未完成项）',
+            stopped: 'AgentLoop 已停止',
+          }
+          notify(titleMap[loop.status] || 'AgentLoop 结束', label)
+          addToast(`AgentLoop ${loop.status}: ${label}`, loop.status === 'done' ? 'success' : 'warning')
+        }
+      }
+      agentloopStatusSnapshot.value = nextMap
+      agentloops.value = next
     } catch (e) {
       // silent — avoid toast spam on every poll failure
     }
