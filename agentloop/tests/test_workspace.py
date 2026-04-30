@@ -29,9 +29,7 @@ def test_workspace_paths_point_under_slug_dir(tmp_path: Path):
     assert ws.todolist == base / "todolist.md"
     assert ws.runs_dir == base / "runs"
     assert ws.design == base / "design.md"
-    # subprocess cwd stays at project root — that's where config.toml lives and
-    # agents need project-level git access
-    assert ws.subprocess_cwd == tmp_path.resolve()
+    assert ws.config_file == base / "config.toml"
 
 
 def test_two_workspaces_same_cwd_are_isolated(tmp_path: Path):
@@ -40,7 +38,16 @@ def test_two_workspaces_same_cwd_are_isolated(tmp_path: Path):
     assert a.state_file != b.state_file
     assert a.todolist != b.todolist
     assert a.runs_dir != b.runs_dir
-    assert a.subprocess_cwd == b.subprocess_cwd  # same project root
+    assert a.workspace_dir != b.workspace_dir
+
+
+def test_from_workspace_dir_uses_basename_as_slug(tmp_path: Path):
+    wd = tmp_path / AGENTLOOP_DIR / WORKSPACES_SUBDIR / "ws-c"
+    wd.mkdir(parents=True)
+    ws = WorkspacePaths.from_workspace_dir(wd)
+    assert ws.workspace_dir == wd.resolve()
+    assert ws.slug == "ws-c"
+    assert ws.state_file == wd.resolve() / "state.json"
 
 
 def test_for_workspace_rejects_empty_slug(tmp_path: Path):
@@ -135,26 +142,23 @@ def test_todolist_write_isolated_per_workspace(tmp_path: Path):
 
 
 def test_wipe_workspace_preserves_siblings_and_config(tmp_path: Path):
-    # set up: two workspaces + shared config.toml
-    config = tmp_path / AGENTLOOP_DIR / "config.toml"
-    config.parent.mkdir()
-    config.write_text("[limits]\nmax_cycles=9\n", encoding="utf-8")
-
+    # set up: two workspaces with their own per-workspace config.toml
     ws_a = WorkspacePaths.for_workspace(tmp_path, "ws-a")
     ws_b = WorkspacePaths.for_workspace(tmp_path, "ws-b")
     ws_a.workspace_dir.mkdir(parents=True)
     ws_b.workspace_dir.mkdir(parents=True)
     (ws_a.state_file).write_text("{}", encoding="utf-8")
     (ws_b.state_file).write_text("{}", encoding="utf-8")
+    ws_b.config_file.write_text("[limits]\nmax_cycles=9\n", encoding="utf-8")
 
     _wipe_agentloop_state(ws_a)
 
-    # ws_a gone (then recreated empty); ws_b + config intact
+    # ws_a gone (then recreated empty); ws_b + its config intact
     assert ws_a.workspace_dir.exists()
     assert not ws_a.state_file.exists()
     assert ws_b.state_file.exists()
-    assert config.exists()
-    assert "max_cycles=9" in config.read_text(encoding="utf-8")
+    assert ws_b.config_file.exists()
+    assert "max_cycles=9" in ws_b.config_file.read_text(encoding="utf-8")
 
 
 # ---------- loop_id stability (via server manager) ----------

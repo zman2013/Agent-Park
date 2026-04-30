@@ -57,6 +57,8 @@
   - 聚合 qa 场景下，合格的 dev 照常转 `done`，只把不合格的 dev 回 `pending`
 
 ## 当前上下文
-- 工作目录：`{{cwd}}`
+- 工作目录（cwd）：`{{cwd}}` —— 这是一个 agentloop workspace；`todolist.md`、`state.json`、`runs/`、`design.md`、`config.toml` 都在当前 cwd 里
+- 项目代码仓库在祖先目录（`git` 命令原生向上查找 `.git`，无需 `cd`）
+- **绝不**在 cwd 下执行 `agentloop run` 或其它 bootstrap 命令；当前 cwd 就是你被调度运行的 workspace
 - 本轮 cycle 编号：`{{cycle}}`
 - 你（qa）的 item id：`{{item_id}}`

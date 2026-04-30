@@ -48,8 +48,10 @@ def run_agent(
 
     ``role`` / ``item_id`` are used only for log filenames and (optional)
     telemetry; the actual instructions come from ``prompt``. Runs logs are
-    written to ``ws.runs_dir`` while the subprocess cwd is ``ws.subprocess_cwd``
-    (the project root — agents need project-level git access and config.toml).
+    written to ``ws.runs_dir``. The subprocess cwd is ``ws.workspace_dir``
+    itself, so agents see todolist.md / state.json / config.toml / design.md
+    in their own working directory; git operations reach the enclosing repo
+    via normal ancestor discovery.
     """
     if backend.cmd is None:
         raise ValueError(f"role {role!r} has no backend cmd (code-version?)")
@@ -75,7 +77,8 @@ def run_agent(
     try:
         proc = subprocess.Popen(
             args,
-            cwd=str(ws.subprocess_cwd),
+            cwd=str(ws.workspace_dir),
+            env=_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -264,3 +267,20 @@ def _next_sequence(runs_dir: Path) -> int:
         if n > max_seen:
             max_seen = n
     return max_seen + 1
+
+
+def _child_env() -> dict[str, str]:
+    """Env for spawned agent CLIs.
+
+    Strips CLAUDECODE / CLAUDE_CODE_* — those are injected by an enclosing
+    Claude Code session and trip its nested-session guard, which aborts the
+    child `claude` before it can do anything. agentloop deliberately spawns a
+    new session, so the markers must not be inherited even if the caller was
+    itself launched from inside Claude Code.
+    """
+    env = os.environ.copy()
+    env.pop("CLAUDECODE", None)
+    for k in list(env.keys()):
+        if k.startswith("CLAUDE_CODE"):
+            env.pop(k, None)
+    return env

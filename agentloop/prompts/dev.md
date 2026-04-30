@@ -36,6 +36,9 @@
 - PM 下一轮可能仍会指派（带上你的失败说明），也可能进入 exhausted
 
 ## 当前上下文
-- 工作目录：`{{cwd}}`
+- 工作目录（cwd）：`{{cwd}}` —— 这是一个 agentloop workspace；`todolist.md`、`state.json`、`runs/`、`design.md`、`config.toml` 都在当前 cwd 里
+- 项目代码仓库在祖先目录（`git` 命令无需 `cd`，原生向上查找 `.git` 即可）
+- 修改项目源文件请用相对/绝对路径，**不要** `cd` 到其它目录再重启 agentloop
+- **绝不**在 cwd 下执行 `agentloop run` 或其它 bootstrap 命令；当前 cwd 就是你被调度运行的 workspace
 - 本轮 cycle 编号：`{{cycle}}`
 - 你的 item id：`{{item_id}}`

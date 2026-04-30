@@ -3,7 +3,7 @@
 Resolution order (later overrides earlier):
     1. Built-in defaults (planner = cco, dev/qa = ccs, pm = code-version)
     2. ``~/.agentloop/config.toml`` (global fallback)
-    3. ``<cwd>/.agentloop/config.toml`` (project level)
+    3. ``<workspace_dir>/config.toml`` (per-workspace, the primary knob)
     4. CLI flags (applied by caller)
 """
 from __future__ import annotations
@@ -17,9 +17,7 @@ except ModuleNotFoundError:  # pragma: no cover - 3.10 fallback
     import tomli as tomllib  # type: ignore
 
 from .state import Limits
-
-CONFIG_FILE = "config.toml"
-STATE_DIR = ".agentloop"
+from .workspace import CONFIG_FILE, AGENTLOOP_DIR
 
 
 @dataclass
@@ -51,10 +49,16 @@ class AgentConfig:
             raise KeyError(f"unknown role: {role}") from e
 
     @classmethod
-    def load(cls, cwd: Path) -> "AgentConfig":
+    def load(cls, workspace_dir: Path) -> "AgentConfig":
+        """Load config, layering user global → workspace-local.
+
+        ``workspace_dir`` is the absolute path of the workspace (``<project>/
+        .agentloop/workspaces/<slug>/``). Its ``config.toml`` overrides any
+        global values from ``~/.agentloop/config.toml``.
+        """
         config = cls()
         config._merge_from(_user_config_path())
-        config._merge_from(cwd / STATE_DIR / CONFIG_FILE)
+        config._merge_from(Path(workspace_dir) / CONFIG_FILE)
         return config
 
     def _merge_from(self, path: Path) -> None:
@@ -98,4 +102,38 @@ class AgentConfig:
 
 
 def _user_config_path() -> Path:
-    return Path.home() / STATE_DIR / CONFIG_FILE
+    return Path.home() / AGENTLOOP_DIR / CONFIG_FILE
+
+
+def seed_workspace_config(workspace_dir: Path, *, template: Path | None = None) -> Path | None:
+    """Ensure ``workspace_dir/config.toml`` exists, seeding from a fallback chain.
+
+    Fallback order for the template:
+    1. Explicit ``template`` argument (CLI flag)
+    2. ``~/.agentloop/config.toml`` (user global)
+    3. No file created — loader falls back to built-in defaults
+
+    Idempotent: if the destination already exists it's left untouched so hand
+    edits survive. Returns the path that was written, or ``None`` if nothing
+    was written (either no template available or destination already existed).
+    """
+    dest = Path(workspace_dir) / CONFIG_FILE
+    if dest.exists():
+        return None
+
+    source: Path | None = None
+    if template is not None:
+        t = Path(template)
+        if t.is_file():
+            source = t
+    if source is None:
+        user = _user_config_path()
+        if user.is_file():
+            source = user
+
+    if source is None:
+        return None
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(source.read_bytes())
+    return dest

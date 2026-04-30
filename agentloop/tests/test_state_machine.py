@@ -582,9 +582,7 @@ def test_config_loads_new_convergence_limits(tmp_path: Path):
     """
     from agentloop.config import AgentConfig
 
-    state_dir = tmp_path / ".agentloop"
-    state_dir.mkdir()
-    (state_dir / "config.toml").write_text(
+    (tmp_path / "config.toml").write_text(
         "[limits]\n"
         "max_cycles = 50\n"
         "max_planner_attempts = 7\n"

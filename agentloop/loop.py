@@ -58,8 +58,8 @@ def run(
     """Run or resume the scheduler.
 
     ``ws`` — workspace resolved by the CLI or agentloop manager. state/todolist
-    /runs live under ``ws.workspace_dir``; subprocesses are launched in
-    ``ws.subprocess_cwd`` (the project root).
+    /runs live under ``ws.workspace_dir``, which is also the subprocess cwd for
+    all agent invocations.
     """
     if not design_path.exists():
         return LoopResult(ExitCode.ERROR, f"design not found: {design_path}")
@@ -68,7 +68,7 @@ def run(
         _wipe_agentloop_state(ws)
 
     state = LoopState.load_or_init(ws)
-    config = AgentConfig.load(ws.project_root)
+    config = AgentConfig.load(ws.workspace_dir)
     if review_plan is not None:
         config.review_plan = review_plan
     if max_cycles is not None:
