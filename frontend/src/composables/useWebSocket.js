@@ -1,5 +1,6 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
+import { notify } from '../utils/titleNotify'
 
 const CHUNK_FLUSH_INTERVAL_MS = 100
 const HEARTBEAT_TIMEOUT_MS = 45000
@@ -136,52 +137,6 @@ export function useWebSocket() {
     }
   }
 
-  // ── Title-flash fallback for non-secure contexts (HTTP remote IP) ──
-  const originalTitle = document.title
-  let titleFlashTimer = null
-
-  function startTitleFlash(alertText) {
-    stopTitleFlash()
-    let show = true
-    titleFlashTimer = setInterval(() => {
-      document.title = show ? alertText : originalTitle
-      show = !show
-    }, 800)
-    // Stop flashing when user comes back to the tab
-    const onFocus = () => {
-      stopTitleFlash()
-      window.removeEventListener('focus', onFocus)
-    }
-    window.addEventListener('focus', onFocus)
-  }
-
-  function stopTitleFlash() {
-    if (titleFlashTimer) {
-      clearInterval(titleFlashTimer)
-      titleFlashTimer = null
-      document.title = originalTitle
-    }
-  }
-
-  function sendBrowserNotify(title, body) {
-    // Native Notification (only works in secure context: HTTPS / localhost)
-    if (
-      'Notification' in window &&
-      Notification.permission === 'granted' &&
-      document.hidden
-    ) {
-      const n = new Notification(title, { body })
-      n.onclick = () => {
-        window.focus()
-        n.close()
-      }
-    }
-    // Title flash fallback (works everywhere, only when tab is hidden)
-    if (document.hidden) {
-      startTitleFlash(`【${title}】${body}`)
-    }
-  }
-
   function handleMessage(data) {
     switch (data.type) {
       case 'state_sync': {
@@ -212,13 +167,13 @@ export function useWebSocket() {
         const taskName = store.tasks[data.task_id]?.name || data.task_id
         if (data.status === 'success') {
           store.addToast(`Task completed`, 'success')
-          sendBrowserNotify('任务完成', taskName)
+          notify('任务完成', taskName)
         } else if (data.status === 'failed') {
           store.addToast(`Task failed`, 'error')
-          sendBrowserNotify('任务失败', taskName)
+          notify('任务失败', taskName)
         } else if (data.status === 'waiting') {
           store.addToast(`Agent is waiting for your input`, 'warning')
-          sendBrowserNotify('等待输入', taskName)
+          notify('等待输入', taskName)
         }
         break
       }
