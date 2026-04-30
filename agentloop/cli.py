@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -205,29 +206,79 @@ def _resolve_workspace_for_existing(args: argparse.Namespace) -> WorkspacePaths 
     return None
 
 
+def _link_or_copy_design(link: Path, target: Path) -> None:
+    """Expose ``target`` as ``link`` inside the workspace.
+
+    The subprocess cwd is the workspace dir, so every prompt that says
+    "design.md is in cwd" assumes this file exists. Mirrors
+    ``server/agentloop_manager.start``'s pattern: try symlink first, fall
+    back to copy2 on FS that rejects symlinks (Windows without privilege,
+    restricted chroots). Skips when ``link`` already resolves to ``target``
+    — avoids (a) disturbing an open fd on reused workspaces and (b) the
+    self-referential symlink case when callers pass the workspace-local path.
+
+    If both symlink and copy fail AND there is no existing ``link``, we
+    surface the error but don't abort — the scheduler will immediately raise
+    "design not found" when it tries to read the missing file, which is a
+    clearer signal than failing here. If the link already existed and the
+    replacement fails, we leave the old content in place rather than
+    deleting it and leaving the workspace without a design.md.
+    """
+    try:
+        current = link.resolve(strict=True)
+    except OSError:
+        current = None
+    if current == target:
+        return
+
+    tmp = link.with_name(link.name + ".tmp")
+    if tmp.is_symlink() or tmp.exists():
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+    try:
+        tmp.symlink_to(target)
+    except OSError:
+        try:
+            shutil.copy2(target, tmp)
+        except OSError as e:
+            print(
+                f"[agentloop] warning: could not stage design.md in workspace "
+                f"(symlink/copy failed: {e}); leaving existing link untouched",
+                file=sys.stderr,
+            )
+            return
+
+    try:
+        tmp.replace(link)
+    except OSError as e:
+        print(
+            f"[agentloop] warning: could not move staged design.md into place: {e}",
+            file=sys.stderr,
+        )
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     ws = _resolve_workspace_for_run(args)
     if ws is None:
         return 2
     ws.workspace_dir.mkdir(parents=True, exist_ok=True)
-    seed_workspace_config(ws.workspace_dir, template=getattr(args, "config_template", None))
+    try:
+        seed_workspace_config(ws.workspace_dir, template=getattr(args, "config_template", None))
+    except FileNotFoundError as e:
+        print(f"[agentloop] {e}", file=sys.stderr)
+        return 2
     # Resolve the design path to absolute — subprocess cwd is ws.workspace_dir,
     # so any relative path the user typed (``agentloop run design.md``) would
     # otherwise be unreachable by the planner / dev / qa agents.
     design_abs = Path(args.design).resolve()
-    # Mirror the agent-park flow: expose the design as ``<ws>/design.md`` so
-    # prompts that say "design.md is in cwd" are actually true in plain CLI
-    # mode too. Skip when the link already points at design_abs, or when the
-    # user passed the workspace-local copy itself (avoid creating a
-    # self-referential symlink that would fail design_path.exists() on rerun).
-    link = ws.design
-    if link.resolve(strict=False) != design_abs:
-        try:
-            if link.is_symlink() or link.exists():
-                link.unlink()
-            link.symlink_to(design_abs)
-        except OSError as e:
-            print(f"[agentloop] warning: failed to symlink design.md into workspace: {e}", file=sys.stderr)
+    _link_or_copy_design(ws.design, design_abs)
     result = scheduler.run(
         design_abs,
         fresh=args.fresh,

@@ -116,6 +116,11 @@ def seed_workspace_config(workspace_dir: Path, *, template: Path | None = None) 
     Idempotent: if the destination already exists it's left untouched so hand
     edits survive. Returns the path that was written, or ``None`` if nothing
     was written (either no template available or destination already existed).
+
+    Raises ``FileNotFoundError`` when the caller explicitly passed ``template``
+    but the path doesn't resolve to a file — silently falling back to defaults
+    in that case lets budget-sensitive limits/models diverge from the user's
+    intent without any signal.
     """
     dest = Path(workspace_dir) / CONFIG_FILE
     if dest.exists():
@@ -124,8 +129,11 @@ def seed_workspace_config(workspace_dir: Path, *, template: Path | None = None) 
     source: Path | None = None
     if template is not None:
         t = Path(template)
-        if t.is_file():
-            source = t
+        if not t.is_file():
+            raise FileNotFoundError(
+                f"--config template not found or not a regular file: {t}"
+            )
+        source = t
     if source is None:
         user = _user_config_path()
         if user.is_file():
