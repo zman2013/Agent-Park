@@ -1046,10 +1046,21 @@ def _read_proc_start_time(pid: int) -> int | None:
         return None
 
 def _clean_env() -> dict[str, str]:
-    """Return a copy of os.environ with virtualenv vars stripped."""
+    """Return a copy of os.environ with virtualenv and Claude Code session
+    markers stripped.
+
+    Only the nested-session marker keys (CLAUDECODE / CLAUDE_CODE_ENTRYPOINT /
+    CLAUDE_CODE_SSE_PORT) are stripped — other CLAUDE_CODE_* vars
+    (``_USE_BEDROCK``, ``_USE_MANTLE``, ``_MAX_OUTPUT_TOKENS`` …) carry
+    legitimate backend auth / routing config and must be preserved, otherwise
+    Bedrock/Vertex-AI setups lose their routing and fall back to public API
+    (or fail entirely).
+    """
     env = os.environ.copy()
     venv = env.pop("VIRTUAL_ENV", None)
     env.pop("VIRTUAL_ENV_PROMPT", None)
+    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
+        env.pop(marker, None)
     if venv:
         venv_bin = os.path.join(venv, "bin")
         path_parts = env.get("PATH", "").split(os.pathsep)
