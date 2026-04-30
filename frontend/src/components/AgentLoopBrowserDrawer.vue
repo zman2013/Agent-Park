@@ -96,7 +96,7 @@
 </template>
 
 <script setup>
-import { computed, ref, watch, nextTick } from 'vue'
+import { computed, ref, watch, nextTick, onBeforeUnmount } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import { agentloopStatusColor } from '../utils/agentloopStatus'
 
@@ -235,5 +235,12 @@ watch(() => props.open, async (v) => {
   } else {
     window.removeEventListener('keydown', onKeydown)
   }
+})
+
+// Safety net: if the component is unmounted while still open (e.g. parent
+// loop view destroyed), the watcher's false branch never runs — remove here
+// so the listener doesn't leak across remounts.
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown)
 })
 </script>
