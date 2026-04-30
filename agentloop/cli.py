@@ -213,9 +213,18 @@ def _link_or_copy_design(link: Path, target: Path) -> None:
     "design.md is in cwd" assumes this file exists. Mirrors
     ``server/agentloop_manager.start``'s pattern: try symlink first, fall
     back to copy2 on FS that rejects symlinks (Windows without privilege,
-    restricted chroots). Skips when ``link`` already resolves to ``target``
-    — avoids (a) disturbing an open fd on reused workspaces and (b) the
-    self-referential symlink case when callers pass the workspace-local path.
+    restricted chroots).
+
+    Two self-link guards, both necessary:
+      * If ``link`` already resolves to ``target``, nothing to do — avoids
+        disturbing an open fd on reused workspaces.
+      * If ``link`` path *equals* ``target`` path (user passed the workspace-
+        local design path, possibly before the file exists), we cannot
+        symlink or copy-from-self; just leave whatever's there. Without this
+        guard, a missing ``link`` would fall through to ``symlink_to(target)``
+        and create a self-referential loop — the scheduler then errors out
+        with "design not found" and the workspace is wedged until manually
+        cleaned up.
 
     If both symlink and copy fail AND there is no existing ``link``, we
     surface the error but don't abort — the scheduler will immediately raise
@@ -224,6 +233,8 @@ def _link_or_copy_design(link: Path, target: Path) -> None:
     replacement fails, we leave the old content in place rather than
     deleting it and leaving the workspace without a design.md.
     """
+    if link == target:
+        return
     try:
         current = link.resolve(strict=True)
     except OSError:
