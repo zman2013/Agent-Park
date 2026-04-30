@@ -194,6 +194,10 @@ function handleClick(loop) {
 
 async function handleStart(loop) {
   await store.startAgentLoop(loop.loop_id)
+  // Restart should behave like a row click: jump into the loop detail view
+  // and close the drawer so the user can watch progress.
+  store.selectAgentLoop(loop.loop_id)
+  emit('close')
 }
 
 function formatTimeRange(loop) {
