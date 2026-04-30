@@ -84,7 +84,9 @@ def run(
     todolist_path = ws.todolist
     if not todolist_path.exists():
         logger.info("no todolist — running planner")
-        planner_result = _run_planner_with_retry(ws, config, state, todolist_path)
+        planner_result = _run_planner_with_retry(
+            ws, config, state, todolist_path, design_path
+        )
         if planner_result is not None:
             return planner_result
 
@@ -300,6 +302,7 @@ def _run_planner_with_retry(
     config: AgentConfig,
     state: LoopState,
     todolist_path: Path,
+    design_path: Path,
 ) -> LoopResult | None:
     """Run planner up to limits.max_planner_attempts; return LoopResult on fatal, else None.
 
@@ -311,7 +314,7 @@ def _run_planner_with_retry(
     last_error = ""
     for attempt in range(config.limits.max_planner_attempts):
         state.planner_attempts = attempt + 1
-        result = planner_agent.run(ws, config.planner)
+        result = planner_agent.run(ws, config.planner, design_path)
         state.record_cost(result.cost_cny)
         after = parse_todolist(ws)
         try:

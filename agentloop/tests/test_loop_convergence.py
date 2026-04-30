@@ -552,7 +552,7 @@ def test_planner_retry_exhausts(tmp_path: Path, monkeypatch):
 
     calls = {"n": 0}
 
-    def failing_planner(ws_arg, cfg) -> RunResult:
+    def failing_planner(ws_arg, cfg, design_arg) -> RunResult:
         calls["n"] += 1
         # Leave no todolist file (simulate total failure).
         return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1, cost_cny=0.0, success=False, errors=["boom"])
