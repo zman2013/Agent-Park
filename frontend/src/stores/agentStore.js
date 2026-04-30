@@ -99,8 +99,11 @@ export const useAgentStore = defineStore('agent', () => {
 
     // Lazy-loaded messages: when the server sent a lightweight task
     // (messages_loaded === false), don't overwrite messages we already
-    // have locally. Only merge messages when the server explicitly
-    // provides them (messages_loaded !== false).
+    // have locally — but DO invalidate the loaded flag so the next
+    // access refetches from /api/tasks/{id}. This matters after a
+    // WS reconnect: a task that was previously loaded may have grown
+    // new messages while we were disconnected, and the lightweight
+    // state_sync payload no longer carries them.
     const sourceHasMessages = source.messages_loaded !== false
     if (sourceHasMessages) {
       const existingMessages = new Map((target.messages || []).map(message => [message.id, message]))
@@ -109,7 +112,7 @@ export const useAgentStore = defineStore('agent', () => {
         return existing ? mergeMessage(existing, message) : cloneMessage(message)
       })
       target.messages_loaded = true
-    } else if (target.messages_loaded === undefined) {
+    } else {
       target.messages = target.messages || []
       target.messages_loaded = false
     }
@@ -172,6 +175,15 @@ export const useAgentStore = defineStore('agent', () => {
     // Sync sessions
     if (data.sessions) {
       Object.assign(taskSessions.value, data.sessions)
+    }
+    // If the task the user is actively viewing was invalidated by a
+    // lightweight sync (e.g. WS reconnect after messages grew), eagerly
+    // refetch so the visible transcript is not silently stale.
+    if (currentTaskId.value) {
+      const current = tasks.value[currentTaskId.value]
+      if (current && !current.messages_loaded) {
+        loadTaskMessages(currentTaskId.value)
+      }
     }
     // Add any running tasks to unseenTaskIds (regardless of current selection)
     for (const [id, task] of Object.entries(tasks.value)) {
