@@ -4,7 +4,15 @@
     <div class="flex items-center gap-3 px-6 py-2 border-b border-gray-800 text-xs shrink-0 font-mono">
       <span class="text-gray-600">loop:</span>
       <span class="text-gray-400 truncate" :title="snap?.cwd || ''">{{ snap?.cwd || loopId }}</span>
-      <span v-if="snap?.workspace" class="text-gray-600 truncate" :title="`workspace: ${snap.workspace}`">/ {{ snap.workspace }}</span>
+      <button
+        v-if="snap?.workspace"
+        class="text-gray-600 hover:text-gray-300 transition-colors truncate flex items-center gap-1"
+        :title="`workspace: ${snap.workspace} — 点击查看该项目下所有 workspace`"
+        @click="browserOpen = true"
+      >
+        <span class="truncate">/ {{ snap.workspace }}</span>
+        <span class="text-gray-500 text-[10px]">▾</span>
+      </button>
       <span class="flex-1"></span>
       <template v-if="snap">
         <span class="text-gray-600">cycle</span>
@@ -104,6 +112,12 @@
         </template>
       </div>
     </div>
+
+    <AgentLoopBrowserDrawer
+      :open="browserOpen"
+      :cwd-filter="snap?.cwd || null"
+      @close="browserOpen = false"
+    />
   </div>
 </template>
 
@@ -111,6 +125,8 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
 import StreamJsonRenderer from './StreamJsonRenderer.vue'
+import AgentLoopBrowserDrawer from './AgentLoopBrowserDrawer.vue'
+import { agentloopStatusColor } from '../utils/agentloopStatus'
 
 const props = defineProps({
   loopId: { type: String, required: true },
@@ -123,6 +139,7 @@ const store = useAgentStore()
 const selectedCycle = ref(null)
 const stopping = ref(false)
 const starting = ref(false)
+const browserOpen = ref(false)
 
 const snap = computed(() => store.agentloopSnapshot)
 const runLog = computed(() => store.agentloopRunLog)
@@ -137,15 +154,7 @@ const selectedRun = computed(() =>
 const selectedRunActor = computed(() => selectedRun.value?.actor || '')
 const selectedRunItemId = computed(() => selectedRun.value?.item_id || '')
 
-const statusClass = computed(() => {
-  switch (snap.value?.status) {
-    case 'running': return 'text-yellow-400'
-    case 'done': return 'text-green-400'
-    case 'exhausted': return 'text-orange-400'
-    case 'stopped': return 'text-gray-500'
-    default: return 'text-gray-500'
-  }
-})
+const statusClass = computed(() => agentloopStatusColor(snap.value?.status))
 
 function itemStatusClass(item) {
   switch (item.status) {

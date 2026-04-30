@@ -28,6 +28,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted } from 'vue'
 import { useAgentStore } from '../stores/agentStore'
+import { agentloopStatusColor } from '../utils/agentloopStatus'
 
 const store = useAgentStore()
 
@@ -50,13 +51,7 @@ function selected(loop) {
 }
 
 function statusClass(loop) {
-  switch (loop.status) {
-    case 'running': return 'text-yellow-400'
-    case 'done': return 'text-green-500'
-    case 'exhausted': return 'text-orange-400'
-    case 'stopped': return 'text-gray-500'
-    default: return 'text-gray-600'
-  }
+  return agentloopStatusColor(loop.status)
 }
 
 function loopLabel(loop) {
