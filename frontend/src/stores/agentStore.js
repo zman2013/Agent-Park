@@ -106,11 +106,22 @@ export const useAgentStore = defineStore('agent', () => {
     // state_sync payload no longer carries them.
     const sourceHasMessages = source.messages_loaded !== false
     if (sourceHasMessages) {
+      // Preserve locally-appended messages (e.g. a user prompt or
+      // streaming agent reply that landed between selectTask and the
+      // /api/tasks/{id} response) by keeping any target message whose
+      // id is not present in source. Source order wins as the
+      // server-authoritative history; local-only entries are appended
+      // after, preserving their chronological arrival order.
+      const sourceIds = new Set((source.messages || []).map(m => m.id))
       const existingMessages = new Map((target.messages || []).map(message => [message.id, message]))
-      target.messages = (source.messages || []).map((message) => {
+      const merged = (source.messages || []).map((message) => {
         const existing = existingMessages.get(message.id)
         return existing ? mergeMessage(existing, message) : cloneMessage(message)
       })
+      for (const m of (target.messages || [])) {
+        if (!sourceIds.has(m.id)) merged.push(m)
+      }
+      target.messages = merged
       target.messages_loaded = true
     } else {
       target.messages = target.messages || []
