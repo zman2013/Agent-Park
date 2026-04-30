@@ -124,19 +124,43 @@ def _workspace_from_dir_arg(wd: Path) -> WorkspacePaths | None:
         return None
 
 
+def _default_project_root(design: Path | None) -> Path:
+    """Pick the default project root when neither ``--project-root`` nor
+    ``--workspace-dir`` was given.
+
+    Prefer ``design.parent`` so ``agentloop run /other/repo/design.md`` from
+    an unrelated cwd still anchors the workspace under ``/other/repo`` (agents
+    need ancestor-based git/project context). But if ``design`` actually lives
+    inside ``<root>/.agentloop/workspaces/<slug>/`` — the nested-bootstrap
+    trap that caused us to drop design-parent defaults in the first place —
+    walk up to the real project root that contains the ``.agentloop`` dir.
+    Fall back to ``cwd`` when there is no design path yet.
+    """
+    if design is None:
+        return Path.cwd()
+    parent = Path(design).resolve().parent
+    # Look for an ancestor segment named AGENTLOOP_DIR. If found, the real
+    # project root is that segment's parent — prevents a workspace from being
+    # mistaken for a new project root when the design.md was passed via a
+    # symlink inside the workspace.
+    ancestors = [parent, *parent.parents]
+    for p in ancestors:
+        if p.name == AGENTLOOP_DIR:
+            return p.parent
+    return parent
+
+
 def _resolve_workspace_for_run(args: argparse.Namespace) -> WorkspacePaths | None:
     """Pick the workspace for `run`.
 
     Precedence:
-        1. ``--workspace-dir <abs>`` — direct; no slug math.
+        1. ``--workspace-dir <abs>`` — direct; slug-shaped path required.
         2. ``--project-root <p>`` + optional ``--workspace <slug>`` — compose;
            auto-generate the slug from design stem when omitted.
-        3. Neither → default project root is the current working directory
-           (where the user invoked ``agentloop``). We deliberately *do not*
-           fall back to ``design.parent`` — that's what caused the
-           nested-bootstrap incident, since passing a design from inside a
-           workspace symlink made the workspace itself look like a new
-           project root.
+        3. Neither → default project root derived from the design path (see
+           :func:`_default_project_root`), with an explicit guard against the
+           nested-bootstrap scenario where the design lives inside an existing
+           workspace.
     """
     wd = getattr(args, "workspace_dir", None)
     if wd is not None:
@@ -144,7 +168,7 @@ def _resolve_workspace_for_run(args: argparse.Namespace) -> WorkspacePaths | Non
 
     project_root = getattr(args, "project_root", None)
     if project_root is None:
-        project_root = Path.cwd()
+        project_root = _default_project_root(args.design)
     slug = args.workspace or generate_slug(args.design)
     return WorkspacePaths.for_workspace(Path(project_root), slug)
 
@@ -157,7 +181,7 @@ def _resolve_workspace_for_existing(args: argparse.Namespace) -> WorkspacePaths 
 
     project_root = getattr(args, "project_root", None)
     if project_root is None:
-        project_root = Path.cwd()
+        project_root = _default_project_root(getattr(args, "design", None))
 
     root = Path(project_root).resolve()
     slug = args.workspace
