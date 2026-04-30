@@ -11,6 +11,8 @@ from .config import AgentConfig, seed_workspace_config
 from .state import LoopState
 from .todolist import parse as parse_todolist
 from .workspace import (
+    AGENTLOOP_DIR,
+    WORKSPACES_SUBDIR,
     WorkspacePaths,
     generate_slug,
     list_workspaces,
@@ -94,6 +96,34 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _workspace_from_dir_arg(wd: Path) -> WorkspacePaths | None:
+    """Build a WorkspacePaths from ``--workspace-dir``, rejecting paths that
+    aren't shaped like ``<project>/.agentloop/workspaces/<slug>``.
+
+    ``--fresh`` routes the resolved workspace dir into ``_wipe_agentloop_state``
+    which deletes nearly everything inside it; without this gate a mistyped
+    ``agentloop run --fresh --workspace-dir /home/user`` would blow away
+    arbitrary directories. We mirror the confinement that the slug-based
+    ``for_workspace`` composer gives us for free: the parent must be
+    ``.agentloop/workspaces`` and the basename must pass slug validation.
+    """
+    resolved = Path(wd).resolve()
+    parent = resolved.parent
+    grandparent = parent.parent
+    if parent.name != WORKSPACES_SUBDIR or grandparent.name != AGENTLOOP_DIR:
+        print(
+            "[agentloop] --workspace-dir must point inside "
+            f"<project>/{AGENTLOOP_DIR}/{WORKSPACES_SUBDIR}/<slug>; got {resolved}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return WorkspacePaths.for_workspace(grandparent.parent, resolved.name)
+    except ValueError as e:
+        print(f"[agentloop] invalid workspace slug in --workspace-dir: {e}", file=sys.stderr)
+        return None
+
+
 def _resolve_workspace_for_run(args: argparse.Namespace) -> WorkspacePaths | None:
     """Pick the workspace for `run`.
 
@@ -110,7 +140,7 @@ def _resolve_workspace_for_run(args: argparse.Namespace) -> WorkspacePaths | Non
     """
     wd = getattr(args, "workspace_dir", None)
     if wd is not None:
-        return WorkspacePaths.from_workspace_dir(wd)
+        return _workspace_from_dir_arg(wd)
 
     project_root = getattr(args, "project_root", None)
     if project_root is None:
@@ -123,7 +153,7 @@ def _resolve_workspace_for_existing(args: argparse.Namespace) -> WorkspacePaths 
     """Pick the workspace for resume/status. Returns None on ambiguous choice."""
     wd = getattr(args, "workspace_dir", None)
     if wd is not None:
-        return WorkspacePaths.from_workspace_dir(wd)
+        return _workspace_from_dir_arg(wd)
 
     project_root = getattr(args, "project_root", None)
     if project_root is None:
@@ -161,15 +191,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     design_abs = Path(args.design).resolve()
     # Mirror the agent-park flow: expose the design as ``<ws>/design.md`` so
     # prompts that say "design.md is in cwd" are actually true in plain CLI
-    # mode too. Idempotent; we replace a pre-existing symlink to keep the
-    # target fresh across runs.
-    try:
-        link = ws.design
-        if link.is_symlink() or link.exists():
-            link.unlink()
-        link.symlink_to(design_abs)
-    except OSError as e:
-        print(f"[agentloop] warning: failed to symlink design.md into workspace: {e}", file=sys.stderr)
+    # mode too. Skip when the link already points at design_abs, or when the
+    # user passed the workspace-local copy itself (avoid creating a
+    # self-referential symlink that would fail design_path.exists() on rerun).
+    link = ws.design
+    if link.resolve(strict=False) != design_abs:
+        try:
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(design_abs)
+        except OSError as e:
+            print(f"[agentloop] warning: failed to symlink design.md into workspace: {e}", file=sys.stderr)
     result = scheduler.run(
         design_abs,
         fresh=args.fresh,
