@@ -101,8 +101,12 @@ def _resolve_workspace_for_run(args: argparse.Namespace) -> WorkspacePaths | Non
         1. ``--workspace-dir <abs>`` — direct; no slug math.
         2. ``--project-root <p>`` + optional ``--workspace <slug>`` — compose;
            auto-generate the slug from design stem when omitted.
-        3. Neither → error (we no longer derive project_root from design.parent;
-           see nested-bootstrap incident).
+        3. Neither → default project root is the current working directory
+           (where the user invoked ``agentloop``). We deliberately *do not*
+           fall back to ``design.parent`` — that's what caused the
+           nested-bootstrap incident, since passing a design from inside a
+           workspace symlink made the workspace itself look like a new
+           project root.
     """
     wd = getattr(args, "workspace_dir", None)
     if wd is not None:
@@ -110,11 +114,7 @@ def _resolve_workspace_for_run(args: argparse.Namespace) -> WorkspacePaths | Non
 
     project_root = getattr(args, "project_root", None)
     if project_root is None:
-        print(
-            "[agentloop] must specify either --workspace-dir or --project-root",
-            file=sys.stderr,
-        )
-        return None
+        project_root = Path.cwd()
     slug = args.workspace or generate_slug(args.design)
     return WorkspacePaths.for_workspace(Path(project_root), slug)
 
@@ -127,11 +127,7 @@ def _resolve_workspace_for_existing(args: argparse.Namespace) -> WorkspacePaths 
 
     project_root = getattr(args, "project_root", None)
     if project_root is None:
-        print(
-            "[agentloop] must specify either --workspace-dir or --project-root",
-            file=sys.stderr,
-        )
-        return None
+        project_root = Path.cwd()
 
     root = Path(project_root).resolve()
     slug = args.workspace
