@@ -3,7 +3,9 @@
     <!-- Top bar: cwd + cycle + cost + status + actions -->
     <div class="flex items-center gap-3 px-6 py-2 border-b border-gray-800 text-xs shrink-0 font-mono">
       <span class="text-gray-600">loop:</span>
-      <span class="text-gray-400 truncate flex-1" :title="snap?.cwd || ''">{{ snap?.cwd || loopId }}</span>
+      <span class="text-gray-400 truncate" :title="snap?.cwd || ''">{{ snap?.cwd || loopId }}</span>
+      <span v-if="snap?.workspace" class="text-gray-600 truncate" :title="`workspace: ${snap.workspace}`">/ {{ snap.workspace }}</span>
+      <span class="flex-1"></span>
       <template v-if="snap">
         <span class="text-gray-600">cycle</span>
         <span class="text-gray-300 tabular-nums">{{ snap.cycle || 0 }}</span>

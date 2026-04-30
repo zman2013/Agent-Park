@@ -13,6 +13,11 @@ from agentloop.todolist import (
     parse as parse_todolist,
 )
 from agentloop.validator import ValidationError, validate_transition
+from agentloop.workspace import WorkspacePaths
+
+
+def _ws(tmp_path: Path, slug: str = "test-ws") -> WorkspacePaths:
+    return WorkspacePaths.for_workspace(tmp_path, slug)
 
 
 # ---------- fixtures ---------------------------------------------------
@@ -212,10 +217,10 @@ def test_startup_health_exhausts_on_dep_cycle(tmp_path: Path):
         _dev("T-001", deps=["T-002"]),
         _dev("T-002", deps=["T-001"]),
     )
-    write_todolist(tmp_path, tl)
+    write_todolist(_ws(tmp_path), tl)
 
     state = LoopState()
-    _startup_health(tmp_path, state)
+    _startup_health(_ws(tmp_path), state)
     assert state.exhausted_reason is not None
     assert "dependency cycle" in state.exhausted_reason
 
@@ -226,10 +231,10 @@ def test_startup_health_exhausts_on_dangling_dep(tmp_path: Path):
     from agentloop.todolist import write as write_todolist
 
     tl = _tl(_dev("T-001", deps=["T-999"]))
-    write_todolist(tmp_path, tl)
+    write_todolist(_ws(tmp_path), tl)
 
     state = LoopState()
-    _startup_health(tmp_path, state)
+    _startup_health(_ws(tmp_path), state)
     assert state.exhausted_reason is not None
     assert "dangling" in state.exhausted_reason
 
@@ -240,14 +245,14 @@ def test_startup_health_resets_stale_doing(tmp_path: Path):
     from agentloop.todolist import write as write_todolist
 
     tl = _tl(_dev("T-001", status="doing"), _dev("T-002"))
-    write_todolist(tmp_path, tl)
+    write_todolist(_ws(tmp_path), tl)
 
     state = LoopState()
-    _startup_health(tmp_path, state)
+    _startup_health(_ws(tmp_path), state)
     assert state.exhausted_reason is None
 
     # Re-parse from disk — stale reset must persist
-    reloaded = parse_todolist(tmp_path)
+    reloaded = parse_todolist(_ws(tmp_path))
     assert reloaded.by_id("T-001").status == "pending"
     assert any(
         ev.get("kind") == "stale_doing_reconciled"
@@ -261,7 +266,7 @@ def test_startup_health_noop_on_empty_todolist(tmp_path: Path):
 
     state = LoopState()
     # no todolist.md present
-    _startup_health(tmp_path, state)
+    _startup_health(_ws(tmp_path), state)
     assert state.exhausted_reason is None
 
 
@@ -276,8 +281,9 @@ def test_scheduler_write_rejects_invalid_shape(tmp_path: Path):
     the guardrail, the bad write is rejected and the on-disk todolist stays
     consistent.
     """
+    ws = _ws(tmp_path)
     good = _tl(_dev("T-001", status="pending"))
-    sw.scheduler_write(tmp_path, good)  # seed disk
+    sw.scheduler_write(ws, good)  # seed disk
 
     bad = Todolist(
         metadata={"project": "test"},
@@ -285,33 +291,35 @@ def test_scheduler_write_rejects_invalid_shape(tmp_path: Path):
                Item(id="T-001", type="qa", status="pending", title="dup")],
     )
     with pytest.raises(ValidationError, match="duplicate item id"):
-        sw.scheduler_write(tmp_path, bad)
+        sw.scheduler_write(ws, bad)
 
     # disk untouched: still the good state
-    reloaded = parse_todolist(tmp_path)
+    reloaded = parse_todolist(ws)
     assert len(reloaded.items) == 1
     assert reloaded.by_id("T-001").status == "pending"
 
 
 def test_scheduler_write_rejects_bogus_status(tmp_path: Path):
+    ws = _ws(tmp_path)
     good = _tl(_dev("T-001"))
-    sw.scheduler_write(tmp_path, good)
+    sw.scheduler_write(ws, good)
 
     bad = Todolist(
         metadata={"project": "test"},
         items=[Item(id="T-001", type="dev", status="bogus", title="x")],
     )
     with pytest.raises(ValidationError, match="invalid status"):
-        sw.scheduler_write(tmp_path, bad)
+        sw.scheduler_write(ws, bad)
 
 
 def test_scheduler_write_allows_valid_pending_to_abandoned(tmp_path: Path):
     """Normal scheduler mutations (fuse/cascade) must still pass."""
+    ws = _ws(tmp_path)
     good = _tl(_dev("T-001", status="pending"))
-    sw.scheduler_write(tmp_path, good)
+    sw.scheduler_write(ws, good)
 
     sw.mark_abandoned(good, "T-001", "exceeded limit", cycle=5)
-    sw.scheduler_write(tmp_path, good)  # should not raise
+    sw.scheduler_write(ws, good)  # should not raise
 
-    reloaded = parse_todolist(tmp_path)
+    reloaded = parse_todolist(ws)
     assert reloaded.by_id("T-001").status == "abandoned"

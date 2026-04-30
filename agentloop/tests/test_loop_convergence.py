@@ -10,6 +10,11 @@ from agentloop.agents import pm as pm_agent
 from agentloop.loop import ExitCode, _cascade, _classify_terminal, _fuse
 from agentloop.state import Decision
 from agentloop.todolist import Attempt, Item, Todolist
+from agentloop.workspace import WorkspacePaths
+
+
+def _ws(tmp_path: Path, slug: str = "test-ws") -> WorkspacePaths:
+    return WorkspacePaths.for_workspace(tmp_path, slug)
 
 
 # ---------- fixtures ---------------------------------------------------
@@ -132,11 +137,12 @@ def test_loop_persists_downgrade_only_cascade(tmp_path: Path, monkeypatch):
     from agentloop.agents.base import RunResult
     from agentloop.todolist import TODOLIST_FILE, parse as parse_tl, write as write_tl
 
+    ws = _ws(tmp_path)
     tl = _tl(
         _dev("T-001", status="ready_for_qa"),
         _qa("T-002", source="follows T-001", status="abandoned"),
     )
-    write_tl(tmp_path, tl)
+    write_tl(ws, tl)
     design_path = tmp_path / "design.md"
     design_path.write_text("# design\n", encoding="utf-8")
 
@@ -175,7 +181,7 @@ def test_loop_persists_downgrade_only_cascade(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("agentloop.loop.dev_agent.run", spy_dev)
     monkeypatch.setattr("agentloop.loop.qa_agent.run", spy_qa)
 
-    scheduler.run(design_path, max_cycles=10)
+    scheduler.run(design_path, max_cycles=10, ws=ws)
     # The dev agent must have observed T-001 at ``pending``, never the
     # stale ``ready_for_qa`` that would leak through an unpersisted cascade.
     assert observed_status.get("T-001") == "pending", observed_status
@@ -333,24 +339,25 @@ def test_reconcile_idempotent_digest(tmp_path: Path):
     from agentloop.todolist import write as write_todolist
 
     tl = _tl(_dev("T-001", status="doing"))
-    write_todolist(tmp_path, tl)
+    ws = _ws(tmp_path)
+    write_todolist(ws, tl)
     decision = Decision(next="dev", item_id="T-001", reason="x")
     result = RunResult(
         stream_json_path=Path("/dev/null"), duration_sec=0.0,
         cost_cny=0.0, success=False, errors=["agent stalled after 180s idle"],
     )
 
-    _reconcile(tmp_path, tl, decision, result, cycle=3)
+    _reconcile(ws, tl, decision, result, cycle=3)
     assert tl.by_id("T-001").status == "pending"
     assert len(tl.by_id("T-001").attempt_log) == 1
     assert "stalled" in tl.by_id("T-001").attempt_log[-1].notes
 
     # same cycle + same notes → no-op
-    _reconcile(tmp_path, tl, decision, result, cycle=3)
+    _reconcile(ws, tl, decision, result, cycle=3)
     assert len(tl.by_id("T-001").attempt_log) == 1
 
     # next cycle → appended
-    _reconcile(tmp_path, tl, decision, result, cycle=4)
+    _reconcile(ws, tl, decision, result, cycle=4)
     assert len(tl.by_id("T-001").attempt_log) == 2
 
 
@@ -423,7 +430,8 @@ def test_orphan_dev_auto_qa_created(tmp_path: Path, monkeypatch):
 
     tl = _tl(_dev("T-001", status="ready_for_qa"))
     from agentloop.todolist import write as write_todolist
-    write_todolist(tmp_path, tl)
+    ws = _ws(tmp_path)
+    write_todolist(ws, tl)
 
     # Build a design file so loop.run proceeds past planner phase.
     design_path = tmp_path / "design.md"
@@ -431,7 +439,7 @@ def test_orphan_dev_auto_qa_created(tmp_path: Path, monkeypatch):
 
     calls = {"qa": 0, "dev": 0}
 
-    def fake_qa_run(cwd: Path, item_id: str, cycle: int, cfg) -> RunResult:
+    def fake_qa_run(cwd, item_id: str, cycle: int, cfg) -> RunResult:
         # QA marks the reviewed dev done + itself done
         from agentloop.todolist import parse as parse_tl, write as write_tl
         tl = parse_tl(cwd)
@@ -450,12 +458,12 @@ def test_orphan_dev_auto_qa_created(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("agentloop.loop.qa_agent.run", fake_qa_run)
     monkeypatch.setattr("agentloop.loop.dev_agent.run", fake_dev_run)
 
-    result = scheduler.run(design_path, max_cycles=5)
+    result = scheduler.run(design_path, max_cycles=5, ws=ws)
     assert result.code == scheduler.ExitCode.SUCCESS, result.reason
     assert calls["qa"] == 1
     # After QA pass: T-001 done + dynamic T-002 done → 2 items total
     from agentloop.todolist import parse as parse_tl
-    tl2 = parse_tl(tmp_path)
+    tl2 = parse_tl(ws)
     assert len(tl2.items) == 2
     assert tl2.by_id("T-002") is not None  # dynamic qa
     assert tl2.by_id("T-002").status == "done"
@@ -476,11 +484,12 @@ def test_per_item_failure_does_not_kill_loop(tmp_path: Path, monkeypatch):
         _dev("T-001"),            # will fail 5x and get fused
         _dev("T-010"),            # independent: will pass
     )
-    write_todolist(tmp_path, tl)
+    ws = _ws(tmp_path)
+    write_todolist(ws, tl)
     design_path = tmp_path / "design.md"
     design_path.write_text("# design\n", encoding="utf-8")
 
-    def fake_dev_run(cwd: Path, item_id: str, cycle: int, cfg) -> RunResult:
+    def fake_dev_run(cwd, item_id: str, cycle: int, cfg) -> RunResult:
         from agentloop.todolist import parse as parse_tl, write as write_tl, Attempt
         tl = parse_tl(cwd)
         item = tl.by_id(item_id)
@@ -493,7 +502,7 @@ def test_per_item_failure_does_not_kill_loop(tmp_path: Path, monkeypatch):
         write_tl(cwd, tl)
         return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1, cost_cny=0.0, success=True, errors=[])
 
-    def fake_qa_run(cwd: Path, item_id: str, cycle: int, cfg) -> RunResult:
+    def fake_qa_run(cwd, item_id: str, cycle: int, cfg) -> RunResult:
         from agentloop.todolist import parse as parse_tl, write as write_tl
         tl = parse_tl(cwd)
         qa = tl.by_id(item_id)
@@ -511,11 +520,11 @@ def test_per_item_failure_does_not_kill_loop(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("agentloop.loop.dev_agent.run", fake_dev_run)
     monkeypatch.setattr("agentloop.loop.qa_agent.run", fake_qa_run)
 
-    result = scheduler.run(design_path, max_cycles=30)
+    result = scheduler.run(design_path, max_cycles=30, ws=ws)
     assert result.code == scheduler.ExitCode.PARTIAL_SUCCESS, result.reason
 
     from agentloop.todolist import parse as parse_tl
-    tl2 = parse_tl(tmp_path)
+    tl2 = parse_tl(ws)
     assert tl2.by_id("T-001").status == "abandoned"
     assert tl2.by_id("T-010").status == "done"
 
@@ -539,10 +548,11 @@ def test_planner_retry_exhausts(tmp_path: Path, monkeypatch):
 
     design_path = tmp_path / "design.md"
     design_path.write_text("# design\n", encoding="utf-8")
+    ws = _ws(tmp_path)
 
     calls = {"n": 0}
 
-    def failing_planner(cwd: Path, cfg) -> RunResult:
+    def failing_planner(ws_arg, cfg) -> RunResult:
         calls["n"] += 1
         # Leave no todolist file (simulate total failure).
         return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1, cost_cny=0.0, success=False, errors=["boom"])
@@ -558,7 +568,7 @@ def test_planner_retry_exhausts(tmp_path: Path, monkeypatch):
         return c
 
     monkeypatch.setattr("agentloop.loop.AgentConfig.load", patched_load)
-    result = scheduler.run(design_path)
+    result = scheduler.run(design_path, ws=ws)
     assert result.code == scheduler.ExitCode.ERROR
     assert calls["n"] == 3
 
@@ -572,11 +582,12 @@ def test_dep_cycle_exhausts_immediately(tmp_path: Path):
         _dev("T-001", deps=["T-002"]),
         _dev("T-002", deps=["T-001"]),
     )
-    write_todolist(tmp_path, tl)
+    ws = _ws(tmp_path)
+    write_todolist(ws, tl)
     design_path = tmp_path / "design.md"
     design_path.write_text("# design\n", encoding="utf-8")
 
-    result = scheduler.run(design_path)
+    result = scheduler.run(design_path, ws=ws)
     assert result.code == scheduler.ExitCode.EXHAUSTED
     assert "cycle" in result.reason
 
@@ -589,11 +600,12 @@ def test_stall_killed_doing_recovered(tmp_path: Path, monkeypatch):
     from agentloop.todolist import write as write_todolist, parse as parse_tl
 
     tl = _tl(_dev("T-001", status="doing"))
-    write_todolist(tmp_path, tl)
+    ws = _ws(tmp_path)
+    write_todolist(ws, tl)
     design_path = tmp_path / "design.md"
     design_path.write_text("# design\n", encoding="utf-8")
 
-    def fake_dev_run(cwd: Path, item_id: str, cycle: int, cfg) -> RunResult:
+    def fake_dev_run(cwd, item_id: str, cycle: int, cfg) -> RunResult:
         from agentloop.todolist import Attempt
         tl = parse_tl(cwd)
         item = tl.by_id(item_id)
@@ -603,7 +615,7 @@ def test_stall_killed_doing_recovered(tmp_path: Path, monkeypatch):
         wt(cwd, tl)
         return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1, cost_cny=0.0, success=True, errors=[])
 
-    def fake_qa_run(cwd: Path, item_id: str, cycle: int, cfg) -> RunResult:
+    def fake_qa_run(cwd, item_id: str, cycle: int, cfg) -> RunResult:
         tl = parse_tl(cwd)
         qa = tl.by_id(item_id)
         from agentloop.validator import _reviewed_dev_ids
@@ -619,7 +631,7 @@ def test_stall_killed_doing_recovered(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("agentloop.loop.dev_agent.run", fake_dev_run)
     monkeypatch.setattr("agentloop.loop.qa_agent.run", fake_qa_run)
 
-    result = scheduler.run(design_path, max_cycles=10)
+    result = scheduler.run(design_path, max_cycles=10, ws=ws)
     assert result.code == scheduler.ExitCode.SUCCESS
-    tl2 = parse_tl(tmp_path)
+    tl2 = parse_tl(ws)
     assert tl2.by_id("T-001").status == "done"

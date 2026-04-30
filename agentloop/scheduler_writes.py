@@ -28,6 +28,7 @@ from .todolist import (
     write as write_todolist,
 )
 from .validator import validate_transition
+from .workspace import WorkspacePaths
 
 
 SCHEDULER = "scheduler"
@@ -40,7 +41,7 @@ def _utcnow() -> str:
 # ----- persistence --------------------------------------------------------
 
 
-def scheduler_write(cwd: Path, tl: Todolist) -> None:
+def scheduler_write(ws: WorkspacePaths, tl: Todolist) -> None:
     """Persist ``tl`` to disk via the same renderer as agents use.
 
     Runs the scheduler-actor validator first so structural corruption (duplicate
@@ -51,11 +52,11 @@ def scheduler_write(cwd: Path, tl: Todolist) -> None:
     shape-only check by passing an empty Todolist.
     """
     try:
-        before = parse_todolist(cwd)
+        before = parse_todolist(ws)
     except Exception:  # noqa: BLE001 — treat unreadable file as "no prior state"
         before = Todolist(metadata={}, items=[])
     validate_transition(before, tl, SCHEDULER, None)
-    write_todolist(cwd, tl)
+    write_todolist(ws, tl)
 
 
 # ----- single-item mutators ----------------------------------------------

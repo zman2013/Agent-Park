@@ -11,6 +11,7 @@ import pytest
 
 from agentloop.agents.base import run_agent
 from agentloop.config import AgentBackend
+from agentloop.workspace import WorkspacePaths
 
 
 def _make_fake_cli(tmp_path: Path, name: str, script: str) -> str:
@@ -20,10 +21,10 @@ def _make_fake_cli(tmp_path: Path, name: str, script: str) -> str:
     return str(path)
 
 
-def _run_dir(tmp_path: Path) -> Path:
-    d = tmp_path / "work"
-    d.mkdir()
-    return d
+def _run_ws(tmp_path: Path) -> WorkspacePaths:
+    ws = WorkspacePaths.for_workspace(tmp_path, "test-ws")
+    ws.runs_dir.mkdir(parents=True, exist_ok=True)
+    return ws
 
 
 def test_normal_exit_success(tmp_path: Path) -> None:
@@ -36,7 +37,7 @@ def test_normal_exit_success(tmp_path: Path) -> None:
         f'echo \'{result_line}\'\nexit 0\n',
     )
     backend = AgentBackend(cmd=cli, stall_timeout_sec=10, timeout_sec=10)
-    res = run_agent("dev", _run_dir(tmp_path), "T-1", backend, "prompt")
+    res = run_agent("dev", _run_ws(tmp_path), "T-1", backend, "prompt")
     assert res.success is True
     assert res.result_text == "hello"
     assert res.num_turns == 1
@@ -51,7 +52,7 @@ def test_stall_detected_and_killed(tmp_path: Path) -> None:
     )
     backend = AgentBackend(cmd=cli, stall_timeout_sec=2, timeout_sec=60)
     t0 = time.monotonic()
-    res = run_agent("qa", _run_dir(tmp_path), "T-1", backend, "prompt")
+    res = run_agent("qa", _run_ws(tmp_path), "T-1", backend, "prompt")
     elapsed = time.monotonic() - t0
     assert res.success is False
     assert res.errors is not None
@@ -68,7 +69,7 @@ def test_absolute_timeout_when_no_stall(tmp_path: Path) -> None:
     )
     backend = AgentBackend(cmd=cli, stall_timeout_sec=10, timeout_sec=2)
     t0 = time.monotonic()
-    res = run_agent("dev", _run_dir(tmp_path), None, backend, "prompt")
+    res = run_agent("dev", _run_ws(tmp_path), None, backend, "prompt")
     elapsed = time.monotonic() - t0
     assert res.success is False
     assert res.errors is not None
@@ -87,7 +88,7 @@ def test_kill_reaches_child_processes(tmp_path: Path) -> None:
         'wait\n',
     )
     backend = AgentBackend(cmd=cli, stall_timeout_sec=2, timeout_sec=60)
-    run_agent("dev", _run_dir(tmp_path), None, backend, "prompt")
+    run_agent("dev", _run_ws(tmp_path), None, backend, "prompt")
     assert pid_file.exists()
     child_pid = int(pid_file.read_text().strip())
     # give the kernel a moment to reap; a zombie (State: Z) also counts as dead

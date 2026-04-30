@@ -2,10 +2,13 @@
 
 agentloop is a separate CLI under ``agentloop/`` that drives a
 planner/PM/dev/qa pipeline against a ``design.md`` file inside a target cwd.
-Its state is fully persisted on disk (``.agentloop/state.json``,
-``todolist.md``, ``.agentloop/runs/*.jsonl``). This module spawns those
-processes detached from any agent-park task, tracks them in a registry,
-recovers orphans on restart, and serves snapshots to the UI.
+Each run lives in its own workspace at
+``<cwd>/.agentloop/workspaces/<slug>/`` (state.json, todolist.md, runs/,
+stdout.log, design.md symlink).
+
+This module spawns those processes detached from any agent-park task, tracks
+them in a registry, recovers orphans on restart, and serves snapshots to the
+UI.
 """
 from __future__ import annotations
 
@@ -17,28 +20,48 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from agentloop.workspace import (
+    AGENTLOOP_DIR,
+    DESIGN_FILE,
+    RUNS_SUBDIR,
+    STATE_FILE,
+    STDOUT_LOG,
+    TODOLIST_FILE,
+    WORKSPACES_SUBDIR,
+    WorkspacePaths,
+    generate_slug,
+)
 
 logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 REGISTRY_FILE = DATA_DIR / "agentloops.json"
 
-AGENTLOOP_DIR = ".agentloop"
-STATE_FILE = "state.json"
-TODOLIST_FILE = "todolist.md"
-RUNS_DIR = "runs"
-STDOUT_LOG = "stdout.log"
-
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _loop_id(cwd: str) -> str:
-    return hashlib.sha256(cwd.encode("utf-8")).hexdigest()[:8]
+def _loop_id(cwd: str, slug: str) -> str:
+    """Stable 8-char id derived from cwd + workspace slug."""
+    key = f"{cwd}\n{slug}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+
+
+def _entry_workspace(entry: dict[str, Any]) -> WorkspacePaths:
+    """Build a WorkspacePaths for an existing registry entry."""
+    slug = entry.get("workspace")
+    if not slug:
+        raise ValueError(
+            f"registry entry {entry.get('loop_id')!r} has no 'workspace' field; "
+            f"run the data/agentloops.json migration to add workspace + workspace_dir"
+        )
+    return WorkspacePaths.for_workspace(Path(entry["cwd"]), slug)
 
 
 def _load_registry() -> list[dict[str, Any]]:
@@ -97,9 +120,6 @@ def _pid_alive(pid: int) -> bool:
     """
     if pid <= 0:
         return False
-    # Non-blocking reap: collects our own child if it has already exited, so
-    # subsequent probes see ProcessLookupError. Safe no-op if pid is not our
-    # direct child (raises ChildProcessError).
     try:
         reaped_pid, _ = os.waitpid(pid, os.WNOHANG)
         if reaped_pid == pid:
@@ -114,17 +134,12 @@ def _pid_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Process exists under another uid; can't introspect /proc status
-        # reliably, assume alive.
         return True
 
-    # Filter zombies via /proc (Linux-only; this project targets Linux per
-    # CLAUDE.md). Other platforms fall through and report alive.
     try:
         with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
             for line in f:
                 if line.startswith("State:"):
-                    # e.g. "State:\tZ (zombie)"
                     parts = line.split()
                     if len(parts) >= 2 and parts[1] == "Z":
                         return False
@@ -135,25 +150,16 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _proc_start_time(pid: int) -> int | None:
-    """Return pid's start time in clock ticks since boot, or None.
-
-    Used to defeat PID reuse: we persist start_time at spawn and re-check it
-    before signaling. /proc/<pid>/stat field 22 is starttime on Linux.
-    Reading as bytes avoids UnicodeDecodeError on unusual comm names.
-    """
+    """Return pid's start time in clock ticks since boot, or None."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as f:
             data = f.read()
     except (FileNotFoundError, OSError):
         return None
-    # comm is wrapped in parens and may contain spaces/parens itself; split
-    # after the last ')'.
     rparen = data.rfind(b")")
     if rparen < 0:
         return None
     fields = data[rparen + 2:].split()
-    # After comm we have state(1), ppid(2), ...; starttime is field 22 overall,
-    # i.e. index 19 in this tail (0-based after state).
     if len(fields) < 20:
         return None
     try:
@@ -167,14 +173,13 @@ def _pid_matches(pid: int, expected_start_time: int | None) -> bool:
     if not _pid_alive(pid):
         return False
     if expected_start_time is None:
-        # Legacy entries predate start_time tracking; fall back to liveness only.
         return True
     current = _proc_start_time(pid)
     return current is not None and current == expected_start_time
 
 
-def _read_state(cwd: Path) -> dict[str, Any] | None:
-    state_path = cwd / AGENTLOOP_DIR / STATE_FILE
+def _read_state(ws: WorkspacePaths) -> dict[str, Any] | None:
+    state_path = ws.state_file
     if not state_path.exists():
         return None
     try:
@@ -184,19 +189,7 @@ def _read_state(cwd: Path) -> dict[str, Any] | None:
 
 
 def _derive_status_from_state(state: dict[str, Any] | None) -> str:
-    """Infer a finished loop's status from its state.json.
-
-    The agentloop CLI (``agentloop/loop.py``) returns ExitCode.SUCCESS without
-    setting ``exhausted_reason`` when PM decides ``done`` and every todolist
-    item is done. When PM decides ``done`` but items remain, the loop now
-    calls ``mark_exhausted`` with reason ``"no actionable items"`` before
-    exiting — so ``exhausted_reason`` reliably distinguishes success from
-    exhaustion, and ``last_decision.next == "done"`` alone is insufficient.
-
-    v2 adds ``partial``: PM decided ``done`` and no items remain live, but
-    ``abandoned_events`` is non-empty — some items fused out even though the
-    rest completed cleanly.
-    """
+    """Infer a finished loop's status from its state.json."""
     if not state:
         return "unknown"
     if state.get("exhausted_reason"):
@@ -206,8 +199,6 @@ def _derive_status_from_state(state: dict[str, Any] | None) -> str:
         if state.get("abandoned_events"):
             return "partial"
         return "done"
-    # Process gone but state shows neither done nor exhausted — likely crash
-    # or manual kill.
     return "stopped"
 
 
@@ -218,68 +209,104 @@ def start(
     cwd: str | Path,
     design_path: str | Path | None = None,
     source_task_id: str | None = None,
+    workspace: str | None = None,
 ) -> dict[str, Any]:
     """Spawn an agentloop process detached from the current session.
 
-    Returns the registry entry. The caller should poll ``list_recent`` or
-    ``get_snapshot`` for progress.
+    If ``workspace`` is omitted, a timestamp-derived slug is generated. On
+    slug collision (same UTC second, rare) a 4-char uuid suffix is appended;
+    after 5 retries the call fails with RuntimeError.
     """
     cwd_path = Path(str(cwd)).resolve()
     if not cwd_path.is_dir():
         raise ValueError(f"cwd does not exist or is not a directory: {cwd_path}")
 
-    design = Path(str(design_path)) if design_path else cwd_path / "design.md"
+    design = Path(str(design_path)) if design_path else cwd_path / DESIGN_FILE
     if not design.is_absolute():
         design = (cwd_path / design).resolve()
     if not design.is_file():
         raise ValueError(f"design file not found: {design}")
+    design_target = design.resolve()
 
-    loop_id = _loop_id(str(cwd_path))
+    # Allocate a workspace slug and its directory. If the caller supplied one
+    # verbatim and it already exists, reject — we never overwrite an existing
+    # workspace silently (could stomp running loop's state).
+    slug = workspace
+    if slug:
+        ws = WorkspacePaths.for_workspace(cwd_path, slug)
+        try:
+            ws.workspace_dir.mkdir(parents=True, exist_ok=False)
+        except FileExistsError as e:
+            raise ValueError(f"workspace already exists: {ws.workspace_dir}") from e
+    else:
+        base = generate_slug(design_target)
+        for attempt in range(5):
+            candidate = base if attempt == 0 else f"{base}-{uuid.uuid4().hex[:4]}"
+            ws = WorkspacePaths.for_workspace(cwd_path, candidate)
+            try:
+                ws.workspace_dir.mkdir(parents=True, exist_ok=False)
+                slug = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise RuntimeError(
+                f"could not allocate a unique workspace slug under {cwd_path}"
+            )
 
-    # If an entry already exists and its pid is alive, return as-is (idempotent).
+    # Idempotency: if a caller passed an explicit slug that matches an already-
+    # running entry, return it rather than double-launching. (Auto-generated
+    # slugs are globally unique so this only matters with ``workspace=...``.)
+    loop_id = _loop_id(str(cwd_path), slug)
     existing = _find(loop_id)
     if existing and existing.get("status") == "running":
         pid = existing.get("pid")
         expected_st = existing.get("pid_start_time")
         if pid and _pid_matches(int(pid), expected_st):
-            logger.info("agentloop already running for %s (pid=%s)", cwd_path, pid)
+            logger.info(
+                "agentloop already running for %s/%s (pid=%s)",
+                cwd_path, slug, pid,
+            )
             return existing
 
-    # agentloop CLI assumes cwd == design.parent (loop.py:54 `cwd = design_path.parent`).
-    # When the caller's design sits outside cwd (e.g. /home/.../plans/*.md), the CLI
-    # would otherwise resolve state/runs/todolist into the design's directory, not the
-    # cwd we registered here. Symlink design into cwd/design.md so both the CLI and
-    # planner's `{cwd}/design.md` prompt find the same file.
-    design_in_cwd = cwd_path / "design.md"
-    target = design.resolve()
-    if design_in_cwd.is_symlink():
-        if design_in_cwd.resolve() != target:
-            raise ValueError(
-                f"{design_in_cwd} already exists as a symlink pointing elsewhere; "
-                f"refusing to overwrite"
-            )
-    elif design_in_cwd.exists():
-        if design_in_cwd.resolve() != target:
-            raise ValueError(
-                f"{design_in_cwd} already exists as a real file; "
-                f"refusing to overwrite (move or remove it first)"
-            )
-    else:
-        design_in_cwd.symlink_to(target)
-    launch_design = design_in_cwd
+    # Put the design symlink inside the workspace dir. The CLI reads it from
+    # ws.design, the planner agent template resolves {{cwd}} to workspace_dir.
+    # Subprocess cwd stays at project root (so it can still read project files,
+    # config, run git commands).
+    design_in_ws = ws.design
+    try:
+        design_in_ws.symlink_to(design_target)
+    except OSError:
+        # Cross-device or unsupported symlink target → fall back to copy.
+        import shutil as _sh
+        _sh.copy2(design_target, design_in_ws)
+        logger.warning(
+            "symlink %s → %s failed; copied instead (design edits won't propagate)",
+            design_in_ws, design_target,
+        )
 
-    (cwd_path / AGENTLOOP_DIR).mkdir(exist_ok=True)
-    stdout_log = cwd_path / AGENTLOOP_DIR / STDOUT_LOG
+    stdout_log = ws.stdout_log
+    stdout_log.parent.mkdir(parents=True, exist_ok=True)
     log_fp = open(stdout_log, "ab", buffering=0)
 
     # Launch with start_new_session=True so the child lives beyond us.
-    # agentloop is importable via `python -m agentloop` from the repo root.
     repo_root = Path(__file__).resolve().parent.parent
-    env = {**os.environ, "PYTHONPATH": str(repo_root) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(repo_root) + os.pathsep + os.environ.get("PYTHONPATH", ""),
+    }
 
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "agentloop", "run", str(launch_design)],
+            [
+                sys.executable,
+                "-m",
+                "agentloop",
+                "run",
+                str(design_in_ws),
+                "--workspace",
+                slug,
+            ],
             cwd=str(cwd_path),
             stdout=log_fp,
             stderr=subprocess.STDOUT,
@@ -288,15 +315,14 @@ def start(
             env=env,
         )
     finally:
-        # Close our copy of the fd — the child has its own inherited copy and
-        # will keep writing. Leaving this open leaks a descriptor per start()
-        # and eventually trips ulimit -n.
         log_fp.close()
 
     entry = {
         "loop_id": loop_id,
         "cwd": str(cwd_path),
-        "design_path": str(design),
+        "workspace": slug,
+        "workspace_dir": str(ws.workspace_dir),
+        "design_path": str(design_target),
         "pid": proc.pid,
         "pid_start_time": _proc_start_time(proc.pid),
         "started_at": _utcnow(),
@@ -306,7 +332,10 @@ def start(
         "last_seen_cycle": 0,
     }
     _upsert(entry)
-    logger.info("Started agentloop pid=%s loop_id=%s cwd=%s", proc.pid, loop_id, cwd_path)
+    logger.info(
+        "Started agentloop pid=%s loop_id=%s cwd=%s workspace=%s",
+        proc.pid, loop_id, cwd_path, slug,
+    )
     return entry
 
 
@@ -316,12 +345,8 @@ def stop(loop_id: str, timeout_sec: float = 10.0) -> dict[str, Any] | None:
         return None
     pid = int(entry.get("pid") or 0)
     expected_st = entry.get("pid_start_time")
-    # Guard against PID reuse: only signal when the live pid still matches
-    # the start_time we recorded at spawn. If it doesn't match, the original
-    # process is gone and this pid now belongs to something unrelated.
     if pid and _pid_matches(pid, expected_st):
         try:
-            # Signal the process group (we used start_new_session=True).
             pgid = os.getpgid(pid)
             os.killpg(pgid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError):
@@ -354,8 +379,8 @@ def _refresh_status(entry: dict[str, Any]) -> dict[str, Any]:
     """Reconcile an entry's ``status`` field with actual process/state on disk."""
     pid = int(entry.get("pid") or 0)
     expected_st = entry.get("pid_start_time")
-    cwd_path = Path(entry["cwd"])
-    state = _read_state(cwd_path)
+    ws = _entry_workspace(entry)
+    state = _read_state(ws)
 
     if entry.get("status") == "running":
         if not _pid_matches(pid, expected_st):
@@ -363,7 +388,6 @@ def _refresh_status(entry: dict[str, Any]) -> dict[str, Any]:
             _update_fields(entry["loop_id"], status=derived, stopped_at=_utcnow())
             entry["status"] = derived
 
-    # keep last_seen_cycle roughly fresh
     if state:
         cycle = int(state.get("cycle", 0))
         if cycle != entry.get("last_seen_cycle"):
@@ -383,13 +407,12 @@ def list_all(*, include_dismissed: bool = True) -> list[dict[str, Any]]:
             continue
         summary = _summary(entry)
         result.append(summary)
-    # newest first by started_at
     result.sort(key=lambda e: e.get("started_at", ""), reverse=True)
     return result
 
 
 def list_recent(limit: int = 5, days: int = 7) -> list[dict[str, Any]]:
-    """Sidebar 'recent updates' list: non-dismissed, within N days, most recent first."""
+    """Sidebar 'recent updates' list."""
     cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
     out: list[dict[str, Any]] = []
     for e in list_all(include_dismissed=False):
@@ -414,10 +437,10 @@ def get_snapshot(loop_id: str) -> dict[str, Any] | None:
         return None
     entry = _refresh_status(entry)
     summary = _summary(entry)
-    cwd_path = Path(entry["cwd"])
-    summary["state"] = _read_state(cwd_path)
-    summary["todolist"] = _read_todolist(cwd_path)
-    summary["runs"] = _list_runs(cwd_path)
+    ws = _entry_workspace(entry)
+    summary["state"] = _read_state(ws)
+    summary["todolist"] = _read_todolist(ws)
+    summary["runs"] = _list_runs(ws)
     return summary
 
 
@@ -425,8 +448,8 @@ def get_run_log(loop_id: str, cycle: int) -> list[dict[str, Any]] | None:
     entry = _find(loop_id)
     if not entry:
         return None
-    cwd_path = Path(entry["cwd"])
-    runs_dir = cwd_path / AGENTLOOP_DIR / RUNS_DIR
+    ws = _entry_workspace(entry)
+    runs_dir = ws.runs_dir
     if not runs_dir.is_dir():
         return None
     prefix = f"{cycle:03d}-"
@@ -463,7 +486,8 @@ def restore_orphan_loops() -> list[str]:
         if _pid_matches(pid, expected_st):
             logger.info("Re-claimed orphan agentloop pid=%s loop_id=%s", pid, loop_id)
             continue
-        state = _read_state(Path(entry["cwd"]))
+        ws = _entry_workspace(entry)
+        state = _read_state(ws)
         derived = _derive_status_from_state(state)
         _update_fields(loop_id, status=derived, stopped_at=_utcnow())
         results.append(loop_id)
@@ -476,8 +500,8 @@ def restore_orphan_loops() -> list[str]:
 def _summary(entry: dict[str, Any]) -> dict[str, Any]:
     """Shallow-copy the entry and tack on a small state summary."""
     out = dict(entry)
-    cwd_path = Path(entry["cwd"])
-    state = _read_state(cwd_path)
+    ws = _entry_workspace(entry)
+    state = _read_state(ws)
     if state:
         out["cycle"] = int(state.get("cycle", 0))
         out["total_cost_cny"] = float(state.get("total_cost_cny", 0.0))
@@ -486,20 +510,20 @@ def _summary(entry: dict[str, Any]) -> dict[str, Any]:
         out["cycle"] = 0
         out["total_cost_cny"] = 0.0
         out["exhausted_reason"] = None
-    out["cwd_basename"] = cwd_path.name
+    out["cwd_basename"] = Path(entry["cwd"]).name
     return out
 
 
-def _read_todolist(cwd: Path) -> dict[str, Any]:
+def _read_todolist(ws: WorkspacePaths) -> dict[str, Any]:
     """Parse todolist.md using agentloop's own parser, returning a JSON dict."""
     try:
         from agentloop.todolist import parse as parse_todolist
     except ImportError:
         return {"metadata": {}, "items": []}
     try:
-        tl = parse_todolist(cwd)
+        tl = parse_todolist(ws)
     except Exception:
-        logger.exception("Failed to parse todolist for %s", cwd)
+        logger.exception("Failed to parse todolist for %s", ws.todolist)
         return {"metadata": {}, "items": []}
     items = []
     for it in tl.items:
@@ -522,8 +546,8 @@ def _read_todolist(cwd: Path) -> dict[str, Any]:
     return {"metadata": dict(tl.metadata), "items": items}
 
 
-def _list_runs(cwd: Path) -> list[dict[str, Any]]:
-    runs_dir = cwd / AGENTLOOP_DIR / RUNS_DIR
+def _list_runs(ws: WorkspacePaths) -> list[dict[str, Any]]:
+    runs_dir = ws.runs_dir
     if not runs_dir.is_dir():
         return []
     result: list[dict[str, Any]] = []
@@ -531,7 +555,6 @@ def _list_runs(cwd: Path) -> list[dict[str, Any]]:
         name = p.name
         if not name.endswith(".jsonl"):
             continue
-        # filename format: NNN-<actor>[-<item_id>].jsonl
         stem = name[:-6]
         parts = stem.split("-", 2)
         try:

@@ -1,20 +1,21 @@
-"""LoopState — persisted state for the scheduler (``.agentloop/state.json``).
+"""LoopState — persisted state for the scheduler.
 
 Holds only the fields the scheduler needs for termination and exhaustion
 checks. The todolist.md file is the authoritative source for item state; this
 file only tracks cycle count, accumulated cost, the last PM decision (for
 three-in-a-row detection), and bookkeeping like rollbacks.
+
+Persistence location is decided by :class:`agentloop.workspace.WorkspacePaths`:
+``<cwd>/.agentloop/workspaces/<slug>/state.json``.
 """
 from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
-STATE_DIR = ".agentloop"
-STATE_FILE = "state.json"
+from .workspace import WorkspacePaths
 
 
 @dataclass
@@ -53,8 +54,8 @@ class LoopState:
     # ----- persistence ---------------------------------------------------
 
     @classmethod
-    def load_or_init(cls, cwd: Path) -> "LoopState":
-        path = cwd / STATE_DIR / STATE_FILE
+    def load_or_init(cls, ws: WorkspacePaths) -> "LoopState":
+        path = ws.state_file
         if not path.exists():
             return cls(started_at=_utcnow())
         try:
@@ -81,8 +82,8 @@ class LoopState:
             planner_attempts=int(data.get("planner_attempts", 0)),
         )
 
-    def save(self, cwd: Path) -> None:
-        path = cwd / STATE_DIR / STATE_FILE
+    def save(self, ws: WorkspacePaths) -> None:
+        path = ws.state_file
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "cycle": self.cycle,
