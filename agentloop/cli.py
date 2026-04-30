@@ -128,26 +128,28 @@ def _default_project_root(design: Path | None) -> Path:
     """Pick the default project root when neither ``--project-root`` nor
     ``--workspace-dir`` was given.
 
-    Prefer ``design.parent`` so ``agentloop run /other/repo/design.md`` from
-    an unrelated cwd still anchors the workspace under ``/other/repo`` (agents
-    need ancestor-based git/project context). But if ``design`` actually lives
-    inside ``<root>/.agentloop/workspaces/<slug>/`` — the nested-bootstrap
-    trap that caused us to drop design-parent defaults in the first place —
-    walk up to the real project root that contains the ``.agentloop`` dir.
-    Fall back to ``cwd`` when there is no design path yet.
+    Prefer the design path's directory so ``agentloop run /other/repo/design.md``
+    from an unrelated cwd still anchors the workspace under ``/other/repo``
+    (agents need ancestor-based git/project context). If ``design`` is itself
+    a directory (``agentloop status .``), treat it as the candidate root
+    directly — the old resolver accepted this shape and callers rely on it.
+    If the candidate lives inside ``<root>/.agentloop/workspaces/<slug>/`` —
+    the nested-bootstrap trap that originally motivated dropping design-based
+    defaults — walk up to the real project root that contains ``.agentloop``.
+    Fall back to ``cwd`` only when no design path is available.
     """
     if design is None:
         return Path.cwd()
-    parent = Path(design).resolve().parent
+    resolved = Path(design).resolve()
+    candidate = resolved if resolved.is_dir() else resolved.parent
     # Look for an ancestor segment named AGENTLOOP_DIR. If found, the real
     # project root is that segment's parent — prevents a workspace from being
     # mistaken for a new project root when the design.md was passed via a
     # symlink inside the workspace.
-    ancestors = [parent, *parent.parents]
-    for p in ancestors:
+    for p in (candidate, *candidate.parents):
         if p.name == AGENTLOOP_DIR:
             return p.parent
-    return parent
+    return candidate
 
 
 def _resolve_workspace_for_run(args: argparse.Namespace) -> WorkspacePaths | None:
