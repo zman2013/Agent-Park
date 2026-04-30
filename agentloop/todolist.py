@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+from .workspace import WorkspacePaths
+
 TODOLIST_FILE = "todolist.md"
 
 _HEADER_RE = re.compile(
@@ -107,8 +109,8 @@ class Todolist:
 # ----- parse --------------------------------------------------------------
 
 
-def parse(cwd: Path) -> Todolist:
-    path = cwd / TODOLIST_FILE
+def parse(ws: WorkspacePaths) -> Todolist:
+    path = ws.todolist
     if not path.exists():
         return Todolist()
     return parse_text(path.read_text(encoding="utf-8"))
@@ -315,9 +317,11 @@ def _parse_list(value: str) -> list[str]:
 # ----- write --------------------------------------------------------------
 
 
-def write(cwd: Path, todolist: Todolist) -> None:
+def write(ws: WorkspacePaths, todolist: Todolist) -> None:
     text = render(todolist)
-    (cwd / TODOLIST_FILE).write_text(text, encoding="utf-8")
+    path = ws.todolist
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
 def render(todolist: Todolist) -> str:

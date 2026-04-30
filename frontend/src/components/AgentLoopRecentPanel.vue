@@ -13,7 +13,7 @@
         @click="handleClick(loop)"
       >
         <span class="text-xs flex-shrink-0" :class="statusClass(loop)">●</span>
-        <span class="truncate flex-1 text-gray-300" :title="loop.cwd">{{ loop.cwd_basename || 'loop' }}</span>
+        <span class="truncate flex-1 text-gray-300" :title="loopTitle(loop)">{{ loopLabel(loop) }}</span>
         <span class="text-xs text-gray-600 flex-shrink-0 tabular-nums" :title="`累计成本 ¥${(loop.total_cost_cny || 0).toFixed(2)}`">c{{ loop.cycle || 0 }}</span>
         <button
           class="text-gray-600 hover:text-gray-300 text-xs flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity"
@@ -57,6 +57,17 @@ function statusClass(loop) {
     case 'stopped': return 'text-gray-500'
     default: return 'text-gray-600'
   }
+}
+
+function loopLabel(loop) {
+  const base = loop.cwd_basename || 'loop'
+  const ws = loop.workspace || '?'
+  return `${base} / ${ws}`
+}
+
+function loopTitle(loop) {
+  const ws = loop.workspace || '?'
+  return `${loop.cwd}\nworkspace: ${ws}`
 }
 
 function handleClick(loop) {

@@ -28,6 +28,7 @@ from . import scheduler_writes as sw
 from .state import Decision, LoopState
 from .todolist import Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
 from .validator import ValidationError, _reviewed_dev_ids, validate_transition
+from .workspace import WorkspacePaths
 
 logger = logging.getLogger(__name__)
 
@@ -52,16 +53,22 @@ def run(
     review_plan: bool | None = None,
     max_cycles: int | None = None,
     max_cost_cny: float | None = None,
+    ws: WorkspacePaths,
 ) -> LoopResult:
-    cwd = design_path.parent.resolve()
+    """Run or resume the scheduler.
+
+    ``ws`` — workspace resolved by the CLI or agentloop manager. state/todolist
+    /runs live under ``ws.workspace_dir``; subprocesses are launched in
+    ``ws.subprocess_cwd`` (the project root).
+    """
     if not design_path.exists():
         return LoopResult(ExitCode.ERROR, f"design not found: {design_path}")
 
     if fresh:
-        _wipe_agentloop_state(cwd)
+        _wipe_agentloop_state(ws)
 
-    state = LoopState.load_or_init(cwd)
-    config = AgentConfig.load(cwd)
+    state = LoopState.load_or_init(ws)
+    config = AgentConfig.load(ws.project_root)
     if review_plan is not None:
         config.review_plan = review_plan
     if max_cycles is not None:
@@ -74,10 +81,12 @@ def run(
         return LoopResult(ExitCode.EXHAUSTED, state.exhausted_reason)
 
     # --- phase 0: planner ------------------------------------------------
-    todolist_path = cwd / TODOLIST_FILE
+    todolist_path = ws.todolist
     if not todolist_path.exists():
         logger.info("no todolist — running planner")
-        planner_result = _run_planner_with_retry(cwd, config, state, todolist_path)
+        planner_result = _run_planner_with_retry(
+            ws, config, state, todolist_path, design_path
+        )
         if planner_result is not None:
             return planner_result
 
@@ -88,22 +97,22 @@ def run(
                 pass
 
     # --- phase 1: scheduling loop ---------------------------------------
-    _startup_health(cwd, state)
+    _startup_health(ws, state)
 
     while True:
-        todolist = parse_todolist(cwd)
+        todolist = parse_todolist(ws)
 
         if reason := state.should_exit(config.limits):
             state.mark_exhausted(reason)
-            state.save(cwd)
+            state.save(ws)
             return LoopResult(ExitCode.EXHAUSTED, reason)
 
         # v2: per-item fuse + cascade run before PM sees the todolist so that
         # PM and the attempt-limit check never operate on abandoned-but-live
         # items. `_fuse` turns over-limit items abandoned; `_cascade` closes
         # the downstream DAG and downgrades stranded qa/dev pairs.
-        fused = _fuse(cwd, todolist, config.limits.max_item_attempts, state.cycle)
-        cascaded, downgraded = _cascade(cwd, todolist, state.cycle)
+        fused = _fuse(ws, todolist, config.limits.max_item_attempts, state.cycle)
+        cascaded, downgraded = _cascade(ws, todolist, state.cycle)
         if fused or cascaded or downgraded:
             for iid, reason_txt in fused + cascaded:
                 state.abandoned_events.append(
@@ -124,9 +133,9 @@ def run(
                         "at": _utcnow_iso(),
                     }
                 )
-            sw.scheduler_write(cwd, todolist)
+            sw.scheduler_write(ws, todolist)
             # re-parse so later checks see canonical on-disk state
-            todolist = parse_todolist(cwd)
+            todolist = parse_todolist(ws)
 
         decision = pm_agent.decide(todolist)
 
@@ -135,7 +144,7 @@ def run(
             dev_id = _extract_dev_id_from_reason(decision.reason)
             if dev_id and todolist.by_id(dev_id):
                 new_qa = sw.create_dynamic_qa(todolist, dev_id, state.cycle)
-                sw.scheduler_write(cwd, todolist)
+                sw.scheduler_write(ws, todolist)
                 state.scheduler_events.append(
                     {
                         "cycle": state.cycle,
@@ -145,7 +154,7 @@ def run(
                         "at": _utcnow_iso(),
                     }
                 )
-                todolist = parse_todolist(cwd)
+                todolist = parse_todolist(ws)
                 decision = pm_agent.decide(todolist)
 
         state.record_decision(decision)
@@ -153,14 +162,14 @@ def run(
         if decision.next == "done":
             exit_code, reason = _classify_terminal(todolist, decision)
             if exit_code == ExitCode.SUCCESS:
-                state.save(cwd)
+                state.save(ws)
                 return LoopResult(exit_code, reason)
             if exit_code == ExitCode.PARTIAL_SUCCESS:
-                state.save(cwd)
+                state.save(ws)
                 return LoopResult(exit_code, reason)
             # EXHAUSTED — nothing actionable left but some items still open
             state.mark_exhausted(reason)
-            state.save(cwd)
+            state.save(ws)
             return LoopResult(ExitCode.EXHAUSTED, reason)
 
         # v2: removed the "3 consecutive identical PM decisions" early exit.
@@ -177,23 +186,23 @@ def run(
 
         before_text = todolist_path.read_text(encoding="utf-8") if todolist_path.exists() else ""
         before_tl = todolist
-        result = _dispatch(decision, cwd, state.cycle + 1, config)
+        result = _dispatch(decision, ws, state.cycle + 1, config)
         state.record_cost(result.cost_cny)
 
-        after = parse_todolist(cwd)
+        after = parse_todolist(ws)
         try:
             validate_transition(before_tl, after, decision.next, decision.item_id)
         except ValidationError as e:
             logger.warning("validation failed: %s — rolling back todolist", e)
             todolist_path.write_text(before_text, encoding="utf-8")
             state.record_rollback(decision.next, decision.item_id, str(e))
-            after = parse_todolist(cwd)
+            after = parse_todolist(ws)
 
         # v2: reconcile — if the dispatched agent failed to advance the item
         # (stalled, crashed, or silently exited without a state change),
         # scheduler writes a pending attempt so the fuse counter moves.
         if not _decision_advanced(before_tl, after, decision):
-            _reconcile(cwd, after, decision, result, state.cycle + 1)
+            _reconcile(ws, after, decision, result, state.cycle + 1)
 
         # v2: fingerprint stuck check — drives real structural progress even
         # when individual cycles look like they make headway via attempt_log
@@ -207,17 +216,17 @@ def run(
             )
             state.mark_exhausted(reason)
             state.cycle += 1
-            state.save(cwd)
+            state.save(ws)
             return LoopResult(ExitCode.EXHAUSTED, reason)
 
         state.cycle += 1
-        state.save(cwd)
+        state.save(ws)
 
 
 # ----- helpers ------------------------------------------------------------
 
 
-def _startup_health(cwd: Path, state: LoopState) -> None:
+def _startup_health(ws: WorkspacePaths, state: LoopState) -> None:
     """Run once before entering the main loop.
 
     * Dep cycles / dangling deps → mark exhausted immediately (these are
@@ -226,7 +235,7 @@ def _startup_health(cwd: Path, state: LoopState) -> None:
       ``pending`` via a scheduler-write. We do this before any PM decision
       so PM never sees ``doing`` (Inv-D).
     """
-    tl = parse_todolist(cwd)
+    tl = parse_todolist(ws)
     if not tl.items:
         return
     cycles = sw.find_dep_cycles(tl)
@@ -234,17 +243,17 @@ def _startup_health(cwd: Path, state: LoopState) -> None:
         state.mark_exhausted(
             "dependency cycle: " + " | ".join("→".join(c) for c in cycles)
         )
-        state.save(cwd)
+        state.save(ws)
         return
     dangling = sw.find_dangling_deps(tl)
     if dangling:
         pairs = ", ".join(f"{a} → {b}" for a, b in dangling)
         state.mark_exhausted(f"dangling dependencies: {pairs}")
-        state.save(cwd)
+        state.save(ws)
         return
     reset = sw.stale_doing_reconcile(tl, boot_cycle=state.cycle)
     if reset:
-        sw.scheduler_write(cwd, tl)
+        sw.scheduler_write(ws, tl)
         state.scheduler_events.append(
             {
                 "cycle": state.cycle,
@@ -253,7 +262,7 @@ def _startup_health(cwd: Path, state: LoopState) -> None:
                 "at": _utcnow_iso(),
             }
         )
-        state.save(cwd)
+        state.save(ws)
 
 
 def _utcnow_iso() -> str:
@@ -263,18 +272,18 @@ def _utcnow_iso() -> str:
 
 def _dispatch(
     decision: Decision,
-    cwd: Path,
+    ws: WorkspacePaths,
     cycle: int,
     config: AgentConfig,
 ) -> RunResult:
     if decision.next == "dev":
         if decision.item_id is None:
             return _null_result("dev decision without item_id")
-        return dev_agent.run(cwd, decision.item_id, cycle, config.dev)
+        return dev_agent.run(ws, decision.item_id, cycle, config.dev)
     if decision.next == "qa":
         if decision.item_id is None:
             return _null_result("qa decision without item_id")
-        return qa_agent.run(cwd, decision.item_id, cycle, config.qa)
+        return qa_agent.run(ws, decision.item_id, cycle, config.qa)
     return _null_result(f"unknown decision.next={decision.next!r}")
 
 
@@ -289,10 +298,11 @@ def _null_result(msg: str) -> RunResult:
 
 
 def _run_planner_with_retry(
-    cwd: Path,
+    ws: WorkspacePaths,
     config: AgentConfig,
     state: LoopState,
     todolist_path: Path,
+    design_path: Path,
 ) -> LoopResult | None:
     """Run planner up to limits.max_planner_attempts; return LoopResult on fatal, else None.
 
@@ -304,13 +314,13 @@ def _run_planner_with_retry(
     last_error = ""
     for attempt in range(config.limits.max_planner_attempts):
         state.planner_attempts = attempt + 1
-        result = planner_agent.run(cwd, config.planner)
+        result = planner_agent.run(ws, config.planner, design_path)
         state.record_cost(result.cost_cny)
-        after = parse_todolist(cwd)
+        after = parse_todolist(ws)
         try:
             validate_transition(before, after, "planner", None)
             if result.success:
-                state.save(cwd)
+                state.save(ws)
                 return None
             last_error = "planner failed (non-zero exit or stream error)"
         except ValidationError as e:
@@ -327,7 +337,7 @@ def _run_planner_with_retry(
 
     reason = f"planner failed {config.limits.max_planner_attempts} times: {last_error}"
     state.mark_exhausted(reason)
-    state.save(cwd)
+    state.save(ws)
     return LoopResult(ExitCode.ERROR, reason)
 
 
@@ -410,7 +420,7 @@ def _classify_run_failure(result: RunResult) -> str:
     return "reconcile: agent failed"
 
 
-def _reconcile(cwd: Path, tl: Todolist, decision: Decision, result: RunResult, cycle: int) -> None:
+def _reconcile(ws: WorkspacePaths, tl: Todolist, decision: Decision, result: RunResult, cycle: int) -> None:
     """Normalize an un-advanced dispatched item and append a pending attempt.
 
     Called after validator has run (so any rollback is already applied). The
@@ -435,7 +445,7 @@ def _reconcile(cwd: Path, tl: Todolist, decision: Decision, result: RunResult, c
     if sw.append_scheduler_attempt(item, cycle, "pending", note):
         mutated = True
     if mutated:
-        sw.scheduler_write(cwd, tl)
+        sw.scheduler_write(ws, tl)
 
 
 def _fingerprint(tl: Todolist) -> str:
@@ -471,7 +481,7 @@ def _item_failures(item: Item) -> int:
     return sum(1 for a in item.attempt_log if a.result == "pending")
 
 
-def _fuse(cwd: Path, tl: Todolist, max_attempts: int, cycle: int) -> list[tuple[str, str]]:
+def _fuse(ws: WorkspacePaths | Path, tl: Todolist, max_attempts: int, cycle: int) -> list[tuple[str, str]]:
     """Mark items whose attempt_log has ≥ max_attempts failures as abandoned.
 
     Returns list of (item_id, reason) for each newly abandoned item. The
@@ -492,7 +502,7 @@ def _fuse(cwd: Path, tl: Todolist, max_attempts: int, cycle: int) -> list[tuple[
 
 
 def _cascade(
-    cwd: Path, tl: Todolist, cycle: int
+    ws: WorkspacePaths | Path, tl: Todolist, cycle: int
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
     """Cascade ``abandoned`` through downstream deps; downgrade stranded qa-dev.
 
@@ -561,21 +571,16 @@ def _classify_terminal(
     return ExitCode.EXHAUSTED, decision.reason or "no actionable items"
 
 
-def _wipe_agentloop_state(cwd: Path) -> None:
-    """Wipe run state but preserve user config.toml.
+def _wipe_agentloop_state(ws: WorkspacePaths) -> None:
+    """Wipe the current workspace's run state, preserving shared config.toml.
 
-    `--fresh` should reset the loop's work (todolist, state.json, runs logs)
-    without erasing the user's backend/limits configuration.
+    ``--fresh`` resets this workspace's todolist, state.json, and runs logs
+    without erasing the project-level ``<cwd>/.agentloop/config.toml`` nor
+    any other workspace under ``<cwd>/.agentloop/workspaces/``.
     """
-    state_dir = cwd / ".agentloop"
-    if state_dir.exists():
-        for child in state_dir.iterdir():
-            if child.name == "config.toml":
-                continue
-            if child.is_dir():
-                shutil.rmtree(child)
-            else:
-                child.unlink()
-    todolist = cwd / TODOLIST_FILE
-    if todolist.exists():
-        todolist.unlink()
+    # Blow away the whole workspace dir, then recreate empty. design.md
+    # symlink inside is recreated by the caller before re-running.
+    ws_dir = ws.workspace_dir
+    if ws_dir.exists():
+        shutil.rmtree(ws_dir)
+    ws_dir.mkdir(parents=True, exist_ok=True)

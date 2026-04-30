@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import AgentBackend
+from ..workspace import WorkspacePaths
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +39,7 @@ class RunResult:
 
 def run_agent(
     role: str,
-    cwd: Path,
+    ws: "WorkspacePaths",
     item_id: str | None,
     backend: AgentBackend,
     prompt: str,
@@ -46,12 +47,14 @@ def run_agent(
     """Spawn the backend CLI and capture its stream-json output.
 
     ``role`` / ``item_id`` are used only for log filenames and (optional)
-    telemetry; the actual instructions come from ``prompt``.
+    telemetry; the actual instructions come from ``prompt``. Runs logs are
+    written to ``ws.runs_dir`` while the subprocess cwd is ``ws.subprocess_cwd``
+    (the project root — agents need project-level git access and config.toml).
     """
     if backend.cmd is None:
         raise ValueError(f"role {role!r} has no backend cmd (code-version?)")
 
-    runs_dir = cwd / ".agentloop" / "runs"
+    runs_dir = ws.runs_dir
     runs_dir.mkdir(parents=True, exist_ok=True)
     seq = _next_sequence(runs_dir)
     suffix = f"-{item_id}" if item_id else ""
@@ -72,7 +75,7 @@ def run_agent(
     try:
         proc = subprocess.Popen(
             args,
-            cwd=str(cwd),
+            cwd=str(ws.subprocess_cwd),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,

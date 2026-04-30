@@ -487,11 +487,24 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
-  // Find any agentloop (including dismissed) registered for the given cwd.
-  // Used by TaskItem / ChatView to keep an entry point visible after dismiss.
+  // Find an agentloop (including dismissed) registered for the given cwd.
+  // Returns the most recently started entry so TaskItem / ChatView have a
+  // single obvious button target when a cwd has multiple workspaces.
   function findAgentLoopByCwd(cwd) {
     if (!cwd) return null
-    return (agentloops.value || []).find(l => l.cwd === cwd) || null
+    const matches = findAgentLoopsByCwd(cwd)
+    return matches[0] || null
+  }
+
+  // All agentloops (including dismissed) registered for the given cwd, sorted
+  // newest-first. Callers that need to offer a switcher (multi-workspace UI)
+  // use this; single-entry consumers stay on findAgentLoopByCwd.
+  function findAgentLoopsByCwd(cwd) {
+    if (!cwd) return []
+    return (agentloops.value || [])
+      .filter(l => l.cwd === cwd)
+      .slice()
+      .sort((a, b) => (b.started_at || '').localeCompare(a.started_at || ''))
   }
 
   async function fetchAgentLoopSnapshot(loopId) {
@@ -585,6 +598,7 @@ export const useAgentStore = defineStore('agent', () => {
           cwd: entry.cwd,
           design_path: entry.design_path || null,
           source_task_id: entry.source_task_id || null,
+          workspace: entry.workspace || null,
         }),
       })
       if (!res.ok) {
@@ -667,5 +681,6 @@ export const useAgentStore = defineStore('agent', () => {
     stopAgentLoop,
     startAgentLoop,
     findAgentLoopByCwd,
+    findAgentLoopsByCwd,
   }
 })

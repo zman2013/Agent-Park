@@ -22,3 +22,6 @@ config.json
 # Beads issue tracker (contains personal/company info)
 .beads/
 
+# AgentLoop runtime workspaces
+.agentloop/
+

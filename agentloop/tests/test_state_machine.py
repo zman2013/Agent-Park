@@ -17,6 +17,11 @@ from agentloop.todolist import (
     trim_attempt_log,
 )
 from agentloop.validator import ValidationError, validate_transition
+from agentloop.workspace import WorkspacePaths
+
+
+def _ws(tmp_path: Path, slug: str = "test-ws") -> WorkspacePaths:
+    return WorkspacePaths.for_workspace(tmp_path, slug)
 
 
 # ---------- fixtures ----------------------------------------------------
@@ -404,10 +409,11 @@ def test_loopstate_stuck_pm():
 
 
 def test_loopstate_persist_round_trip(tmp_path: Path):
+    ws = _ws(tmp_path)
     s = LoopState(cycle=5, total_cost_cny=42.5)
     s.record_decision(Decision(next="dev", item_id="T-003", reason="foo"))
-    s.save(tmp_path)
-    loaded = LoopState.load_or_init(tmp_path)
+    s.save(ws)
+    loaded = LoopState.load_or_init(ws)
     assert loaded.cycle == 5
     assert loaded.total_cost_cny == 42.5
     assert loaded.last_decision is not None
@@ -415,21 +421,22 @@ def test_loopstate_persist_round_trip(tmp_path: Path):
 
 
 def test_loopstate_resume_after_exhaust(tmp_path: Path):
+    ws = _ws(tmp_path)
     s = LoopState(cycle=3)
     s.mark_exhausted("max_cycles reached (3)")
-    s.save(tmp_path)
-    loaded = LoopState.load_or_init(tmp_path)
+    s.save(ws)
+    loaded = LoopState.load_or_init(ws)
     assert loaded.exhausted_reason is not None
     # clear exhaustion for resume
     loaded.exhausted_reason = None
     assert loaded.should_exit(Limits(max_cycles=10)) is None
 
 
-def test_state_load_legacy_json_no_new_fields(tmp_path: Path):
-    """LoopState must tolerate state.json files written by v1 (no new fields)."""
-    state_dir = tmp_path / ".agentloop"
-    state_dir.mkdir()
-    legacy = {
+def test_state_load_tolerates_missing_fields(tmp_path: Path):
+    """LoopState must tolerate state.json files without the newer v2 fields."""
+    ws = _ws(tmp_path)
+    ws.workspace_dir.mkdir(parents=True)
+    minimal = {
         "cycle": 7,
         "total_cost_cny": 3.5,
         "last_decision": {"next": "dev", "item_id": "T-003", "reason": "x"},
@@ -438,8 +445,8 @@ def test_state_load_legacy_json_no_new_fields(tmp_path: Path):
         "exhausted_reason": None,
         "rollbacks": [],
     }
-    (state_dir / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
-    loaded = LoopState.load_or_init(tmp_path)
+    ws.state_file.write_text(json.dumps(minimal), encoding="utf-8")
+    loaded = LoopState.load_or_init(ws)
     assert loaded.cycle == 7
     assert loaded.fingerprint_history == []
     assert loaded.abandoned_events == []
@@ -448,13 +455,14 @@ def test_state_load_legacy_json_no_new_fields(tmp_path: Path):
 
 
 def test_state_new_fields_persist_round_trip(tmp_path: Path):
+    ws = _ws(tmp_path)
     s = LoopState()
     s.fingerprint_history = ["abc", "def"]
     s.abandoned_events = [{"item_id": "T-001", "cycle": 3}]
     s.scheduler_events = [{"kind": "stale_doing_reconciled", "ids": ["T-007"]}]
     s.planner_attempts = 2
-    s.save(tmp_path)
-    loaded = LoopState.load_or_init(tmp_path)
+    s.save(ws)
+    loaded = LoopState.load_or_init(ws)
     assert loaded.fingerprint_history == ["abc", "def"]
     assert loaded.abandoned_events == [{"item_id": "T-001", "cycle": 3}]
     assert loaded.scheduler_events == [{"kind": "stale_doing_reconciled", "ids": ["T-007"]}]
@@ -514,47 +522,53 @@ def test_rollback_preserves_before_text(tmp_path: Path):
     We simulate the loop.run rollback branch: write `before`, invoke the
     agent (which we fake by writing an illegal state), then revert.
     """
-    from agentloop.todolist import TODOLIST_FILE, parse, write as write_todolist
+    from agentloop.todolist import parse, write as write_todolist
 
+    ws = _ws(tmp_path)
     before_tl = _tl(_dev("T-001"))
-    write_todolist(tmp_path, before_tl)
-    original_text = (tmp_path / TODOLIST_FILE).read_text(encoding="utf-8")
+    write_todolist(ws, before_tl)
+    original_text = ws.todolist.read_text(encoding="utf-8")
 
     # simulate an illegal dev write (pending → done direct)
     illegal = _tl(_dev("T-001", status="done"))
-    write_todolist(tmp_path, illegal)
+    write_todolist(ws, illegal)
 
-    after = parse(tmp_path)
+    after = parse(ws)
     with pytest.raises(ValidationError):
         validate_transition(before_tl, after, "dev", "T-001")
 
     # caller restores
-    (tmp_path / TODOLIST_FILE).write_text(original_text, encoding="utf-8")
-    restored = parse(tmp_path)
+    ws.todolist.write_text(original_text, encoding="utf-8")
+    restored = parse(ws)
     assert restored.by_id("T-001").status == "pending"
 
 
 def test_fresh_wipes_state_but_keeps_config(tmp_path: Path):
     """--fresh must reset runs/state/todolist but preserve user config.toml."""
     from agentloop.loop import _wipe_agentloop_state
-    from agentloop.todolist import TODOLIST_FILE
 
-    state_dir = tmp_path / ".agentloop"
-    state_dir.mkdir()
-    (state_dir / "config.toml").write_text('[limits]\nmax_cycles = 99\n', encoding="utf-8")
-    (state_dir / "state.json").write_text('{"cycle": 5}', encoding="utf-8")
-    runs = state_dir / "runs"
-    runs.mkdir()
-    (runs / "001-planner.jsonl").write_text("{}\n", encoding="utf-8")
-    (tmp_path / TODOLIST_FILE).write_text("# old\n", encoding="utf-8")
+    ws = _ws(tmp_path)
+    # shared project-level config.toml (not under the workspace)
+    project_agentloop = tmp_path / ".agentloop"
+    project_agentloop.mkdir()
+    (project_agentloop / "config.toml").write_text('[limits]\nmax_cycles = 99\n', encoding="utf-8")
 
-    _wipe_agentloop_state(tmp_path)
+    # populate workspace content
+    ws.workspace_dir.mkdir(parents=True)
+    ws.state_file.write_text('{"cycle": 5}', encoding="utf-8")
+    ws.runs_dir.mkdir()
+    (ws.runs_dir / "001-planner.jsonl").write_text("{}\n", encoding="utf-8")
+    ws.todolist.write_text("# old\n", encoding="utf-8")
 
-    assert (state_dir / "config.toml").exists()
-    assert 'max_cycles = 99' in (state_dir / "config.toml").read_text(encoding="utf-8")
-    assert not (state_dir / "state.json").exists()
-    assert not runs.exists()
-    assert not (tmp_path / TODOLIST_FILE).exists()
+    _wipe_agentloop_state(ws)
+
+    assert (project_agentloop / "config.toml").exists()
+    assert 'max_cycles = 99' in (project_agentloop / "config.toml").read_text(encoding="utf-8")
+    assert not ws.state_file.exists()
+    assert not ws.runs_dir.exists()
+    assert not ws.todolist.exists()
+    # workspace dir itself is recreated empty
+    assert ws.workspace_dir.exists()
 
 
 # ---------- config loading: new convergence knobs -----------------------

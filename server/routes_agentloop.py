@@ -13,6 +13,7 @@ class StartBody(BaseModel):
     cwd: str
     design_path: str | None = None
     source_task_id: str | None = None
+    workspace: str | None = None
 
 
 @router.get("")
@@ -32,6 +33,7 @@ async def start_loop(body: StartBody):
             cwd=body.cwd,
             design_path=body.design_path,
             source_task_id=body.source_task_id,
+            workspace=body.workspace,
         )
     except ValueError as e:
         raise HTTPException(400, str(e))

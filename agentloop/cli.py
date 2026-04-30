@@ -9,7 +9,12 @@ from pathlib import Path
 from . import loop as scheduler
 from .config import AgentConfig
 from .state import LoopState
-from .todolist import TODOLIST_FILE, parse as parse_todolist
+from .todolist import parse as parse_todolist
+from .workspace import (
+    WorkspacePaths,
+    generate_slug,
+    list_workspaces,
+)
 
 logger = logging.getLogger("agentloop")
 
@@ -23,20 +28,58 @@ def main(argv: list[str] | None = None) -> int:
 
     p_run = sub.add_parser("run", help="Run or resume a project.")
     p_run.add_argument("design", type=Path, help="Path to design.md")
-    p_run.add_argument("--fresh", action="store_true", help="Delete .agentloop/ and todolist.md, start over")
+    p_run.add_argument("--fresh", action="store_true", help="Delete this workspace's state, start over")
     p_run.add_argument("--review-plan", action="store_true", help="Pause after planner for human review")
     p_run.add_argument("--max-cycles", type=int, default=None)
     p_run.add_argument("--max-cost", type=float, default=None, dest="max_cost_cny")
+    p_run.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace slug under <cwd>/.agentloop/workspaces/. "
+        "Auto-generated from timestamp + design stem if omitted.",
+    )
+    p_run.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        dest="project_root",
+        help="Project root for workspace persistence. Defaults to design.parent "
+        "— set explicitly when design.md lives in a subdirectory (e.g. docs/).",
+    )
     p_run.add_argument("-v", "--verbose", action="store_true")
 
     p_resume = sub.add_parser("resume", help="Continue an exhausted run with extra budget.")
     p_resume.add_argument("design", type=Path, help="Path to design.md")
     p_resume.add_argument("--more-cycles", type=int, default=20)
     p_resume.add_argument("--more-cost", type=float, default=None)
+    p_resume.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace slug to resume. Required when >1 workspace exists.",
+    )
+    p_resume.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        dest="project_root",
+        help="Project root override (see `agentloop run --project-root`).",
+    )
     p_resume.add_argument("-v", "--verbose", action="store_true")
 
     p_status = sub.add_parser("status", help="Show current project progress.")
     p_status.add_argument("design", type=Path, help="Path to design.md (or its parent directory)")
+    p_status.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace slug to inspect. Required when >1 workspace exists.",
+    )
+    p_status.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        dest="project_root",
+        help="Project root override (see `agentloop run --project-root`).",
+    )
 
     args = parser.parse_args(argv)
 
@@ -56,29 +99,72 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _resolve_project_root(design: Path, override: Path | None = None) -> Path:
+    if override is not None:
+        return override.resolve()
+    return (design.parent if design.is_file() else design).resolve()
+
+
+def _resolve_workspace_for_run(
+    design: Path, slug: str | None, project_root: Path | None = None
+) -> WorkspacePaths:
+    root = _resolve_project_root(design, project_root)
+    if slug is None:
+        slug = generate_slug(design)
+    return WorkspacePaths.for_workspace(root, slug)
+
+
+def _resolve_workspace_for_existing(
+    design: Path, slug: str | None, project_root: Path | None = None
+) -> WorkspacePaths | None:
+    """Pick the workspace for resume/status. Returns None on ambiguous choice."""
+    root = _resolve_project_root(design, project_root)
+    if slug is not None:
+        return WorkspacePaths.for_workspace(root, slug)
+
+    existing = list_workspaces(root)
+
+    if len(existing) == 1:
+        return WorkspacePaths.for_workspace(root, existing[0])
+    if not existing:
+        print(f"[agentloop] no workspace found under {root}", file=sys.stderr)
+        return None
+    # >1 workspace — force explicit pick.
+    print(
+        "[agentloop] multiple workspaces found — pass --workspace SLUG to pick:",
+        file=sys.stderr,
+    )
+    for s in existing:
+        print(f"  {s}", file=sys.stderr)
+    return None
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
+    ws = _resolve_workspace_for_run(args.design, args.workspace, args.project_root)
     result = scheduler.run(
         args.design,
         fresh=args.fresh,
         review_plan=args.review_plan,
         max_cycles=args.max_cycles,
         max_cost_cny=args.max_cost_cny,
+        ws=ws,
     )
     return _report_result(result)
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
-    cwd = args.design.parent.resolve()
-    state = LoopState.load_or_init(cwd)
+    ws = _resolve_workspace_for_existing(args.design, args.workspace, args.project_root)
+    if ws is None:
+        return 2
+    state = LoopState.load_or_init(ws)
     if not state.exhausted_reason:
         print("[agentloop] project is not exhausted — use `agentloop run` instead.")
         return 2
 
-    config = AgentConfig.load(cwd)
+    config = AgentConfig.load(ws.project_root)
     # Clear exhaustion, raise limits.
     state.exhausted_reason = None
-    # bump cycles relative to current
-    state.save(cwd)
+    state.save(ws)
     new_max = state.cycle + args.more_cycles
     new_cost = (config.limits.max_cost_cny + args.more_cost) if args.more_cost else None
 
@@ -86,16 +172,20 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         args.design,
         max_cycles=new_max,
         max_cost_cny=new_cost,
+        ws=ws,
     )
     return _report_result(result)
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    cwd = args.design.parent.resolve() if args.design.is_file() else args.design.resolve()
-    state = LoopState.load_or_init(cwd)
-    todolist = parse_todolist(cwd)
+    ws = _resolve_workspace_for_existing(args.design, args.workspace, args.project_root)
+    if ws is None:
+        return 2
+    state = LoopState.load_or_init(ws)
+    todolist = parse_todolist(ws)
 
-    print(f"project:   {cwd}")
+    print(f"project:   {ws.project_root}")
+    print(f"workspace: {ws.slug}")
     print(f"cycles:    {state.cycle}")
     print(f"cost:      ¥{state.total_cost_cny:.2f}")
     print(f"rollbacks: {len(state.rollbacks)}")
