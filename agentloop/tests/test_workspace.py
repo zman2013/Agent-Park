@@ -48,6 +48,24 @@ def test_for_workspace_rejects_empty_slug(tmp_path: Path):
         WorkspacePaths.for_workspace(tmp_path, "")
 
 
+@pytest.mark.parametrize(
+    "bad_slug",
+    [
+        "../escape",
+        "foo/bar",
+        "/abs/path",
+        "..",
+        ".hidden",
+        "-leading-dash",
+        "has space",
+        "nul\x00byte",
+    ],
+)
+def test_for_workspace_rejects_unsafe_slug(tmp_path: Path, bad_slug: str):
+    with pytest.raises(ValueError):
+        WorkspacePaths.for_workspace(tmp_path, bad_slug)
+
+
 # ---------- slug generation ----------
 
 

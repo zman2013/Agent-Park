@@ -27,6 +27,26 @@ RUNS_SUBDIR = "runs"
 STDOUT_LOG = "stdout.log"
 DESIGN_FILE = "design.md"
 
+# Slug safety — accepted characters must keep the path confined to
+# ``<cwd>/.agentloop/workspaces/<slug>/``. The set is intentionally narrow:
+# letters/digits/underscore/dot/dash. Anything else (slashes, whitespace,
+# leading ``.``/``-``) is rejected so API-sourced slugs can't escape.
+_SAFE_SLUG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]*$")
+
+
+def _validate_slug(slug: str) -> None:
+    if not slug:
+        raise ValueError("workspace slug must be non-empty")
+    if not _SAFE_SLUG_RE.fullmatch(slug):
+        raise ValueError(
+            "workspace slug must match [A-Za-z0-9_][A-Za-z0-9._-]* — got "
+            f"{slug!r}"
+        )
+    if ".." in slug.split("."):
+        # Defensive: block ``..`` segments even if the regex technically lets
+        # repeated dots through.
+        raise ValueError(f"workspace slug must not contain '..' segments: {slug!r}")
+
 
 @dataclass(frozen=True)
 class WorkspacePaths:
@@ -73,8 +93,7 @@ class WorkspacePaths:
 
     @classmethod
     def for_workspace(cls, project_root: Path, slug: str) -> "WorkspacePaths":
-        if not slug:
-            raise ValueError("workspace slug must be non-empty")
+        _validate_slug(slug)
         return cls(project_root=Path(project_root).resolve(), slug=slug)
 
 
