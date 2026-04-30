@@ -284,21 +284,26 @@ class AppState:
         archived = [a for a in self.agents.values() if a.archived]
         all_agents = ordered + archived
 
-        # Lazy-load messages: strip `messages` from non-active tasks so the
-        # initial state_sync payload stays small. The frontend fetches full
-        # messages on demand via GET /api/tasks/{task_id}. Running/waiting
-        # tasks keep their messages so streaming continues without a gap.
+        # Lazy-load messages: for non-active tasks we exclude `messages`
+        # from Pydantic serialization entirely (not just clear it after
+        # dumping). Dumping then discarding would still pay the cost of
+        # serializing every historical message on the event loop, which
+        # is what this optimization exists to avoid. The frontend
+        # fetches full messages on demand via GET /api/tasks/{task_id};
+        # running/waiting tasks keep their messages so streaming
+        # continues without a gap.
+        active_statuses = ("running", "waiting")
         tasks_dump: dict[str, dict] = {}
         for tid, t in self.tasks.items():
-            dump = t.model_dump()
-            status = dump.get("status")
-            if hasattr(status, "value"):
-                status = status.value
-            if status not in ("running", "waiting"):
+            status = t.status
+            status_val = status.value if hasattr(status, "value") else status
+            if status_val in active_statuses:
+                dump = t.model_dump()
+                dump["messages_loaded"] = True
+            else:
+                dump = t.model_dump(exclude={"messages"})
                 dump["messages"] = []
                 dump["messages_loaded"] = False
-            else:
-                dump["messages_loaded"] = True
             tasks_dump[tid] = dump
 
         return {
