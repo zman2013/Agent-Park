@@ -81,6 +81,7 @@ export const useAgentStore = defineStore('agent', () => {
     return {
       ...task,
       messages: (task.messages || []).map(cloneMessage),
+      messages_loaded: task.messages_loaded !== false,
     }
   }
 
@@ -96,11 +97,22 @@ export const useAgentStore = defineStore('agent', () => {
     target.total_cost_cny = source.total_cost_cny ?? target.total_cost_cny ?? 0
     target.updated_at = source.updated_at
 
-    const existingMessages = new Map((target.messages || []).map(message => [message.id, message]))
-    target.messages = (source.messages || []).map((message) => {
-      const existing = existingMessages.get(message.id)
-      return existing ? mergeMessage(existing, message) : cloneMessage(message)
-    })
+    // Lazy-loaded messages: when the server sent a lightweight task
+    // (messages_loaded === false), don't overwrite messages we already
+    // have locally. Only merge messages when the server explicitly
+    // provides them (messages_loaded !== false).
+    const sourceHasMessages = source.messages_loaded !== false
+    if (sourceHasMessages) {
+      const existingMessages = new Map((target.messages || []).map(message => [message.id, message]))
+      target.messages = (source.messages || []).map((message) => {
+        const existing = existingMessages.get(message.id)
+        return existing ? mergeMessage(existing, message) : cloneMessage(message)
+      })
+      target.messages_loaded = true
+    } else if (target.messages_loaded === undefined) {
+      target.messages = target.messages || []
+      target.messages_loaded = false
+    }
 
     return target
   }
@@ -247,6 +259,10 @@ export const useAgentStore = defineStore('agent', () => {
     if (!task || task.status !== 'running') {
       dismissUnseenTask(taskId)
     }
+    // Lazy-load full messages if the state_sync gave us only metadata.
+    if (task && !task.messages_loaded) {
+      loadTaskMessages(taskId)
+    }
   }
 
   function dismissUnseenTask(taskId) {
@@ -312,6 +328,36 @@ export const useAgentStore = defineStore('agent', () => {
 
   function updateTaskSession(taskId, sessionId) {
     taskSessions.value[taskId] = sessionId
+  }
+
+  // Track in-flight lazy-load requests so concurrent selectTask() calls for
+  // the same task don't trigger duplicate fetches.
+  const _loadingTaskMessages = new Map()
+
+  async function loadTaskMessages(taskId, { force = false } = {}) {
+    const task = tasks.value[taskId]
+    if (!task) return
+    if (!force && task.messages_loaded) return
+    if (_loadingTaskMessages.has(taskId)) {
+      return _loadingTaskMessages.get(taskId)
+    }
+    const promise = (async () => {
+      try {
+        const res = await fetch(`/api/tasks/${taskId}`)
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        const full = await res.json()
+        const t = tasks.value[taskId]
+        if (!t) return
+        // Server returns full task; mark as loaded so mergeTask merges messages.
+        mergeTask(t, { ...full, messages_loaded: true })
+      } catch (e) {
+        addToast(`加载消息失败: ${e.message}`, 'error')
+      } finally {
+        _loadingTaskMessages.delete(taskId)
+      }
+    })()
+    _loadingTaskMessages.set(taskId, promise)
+    return promise
   }
 
   function addAgent(agent) {
@@ -666,6 +712,7 @@ export const useAgentStore = defineStore('agent', () => {
     replaceAgentTaskIds,
     updateTaskFields,
     updateTaskSession,
+    loadTaskMessages,
     addAgent,
     // agentloop
     selectedAgentLoopId,

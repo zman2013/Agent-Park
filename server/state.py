@@ -283,9 +283,27 @@ class AppState:
         # Include archived agents (not in _agent_order)
         archived = [a for a in self.agents.values() if a.archived]
         all_agents = ordered + archived
+
+        # Lazy-load messages: strip `messages` from non-active tasks so the
+        # initial state_sync payload stays small. The frontend fetches full
+        # messages on demand via GET /api/tasks/{task_id}. Running/waiting
+        # tasks keep their messages so streaming continues without a gap.
+        tasks_dump: dict[str, dict] = {}
+        for tid, t in self.tasks.items():
+            dump = t.model_dump()
+            status = dump.get("status")
+            if hasattr(status, "value"):
+                status = status.value
+            if status not in ("running", "waiting"):
+                dump["messages"] = []
+                dump["messages_loaded"] = False
+            else:
+                dump["messages_loaded"] = True
+            tasks_dump[tid] = dump
+
         return {
             "agents": [a.model_dump() for a in all_agents],
-            "tasks": {tid: t.model_dump() for tid, t in self.tasks.items()},
+            "tasks": tasks_dump,
             "sessions": sessions or {},
         }
 

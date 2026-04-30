@@ -33,7 +33,10 @@
       >复制对话</button>
     </div>
     <div ref="chatContainer" class="flex-1 overflow-auto p-6 space-y-3" @scroll="onScroll">
-      <div v-if="task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
+      <div v-if="!task.messages_loaded && task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
+        Loading messages…
+      </div>
+      <div v-else-if="task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
         No messages yet. Send a prompt to get started.
       </div>
       <div v-if="isLiveWindowing" class="text-gray-600 text-xs text-center">
@@ -193,12 +196,17 @@ function onScroll() {
 // Scroll to bottom and reset state when switching tasks (first open)
 watch(
   () => props.task?.id,
-  async () => {
+  async (tid) => {
     isAtBottom.value = true
     showAllHistory.value = false
+    // Lazy-load messages if the state_sync only gave us metadata.
+    if (tid && props.task && !props.task.messages_loaded) {
+      store.loadTaskMessages(tid)
+    }
     await nextTick()
     scrollToBottom()
-  }
+  },
+  { immediate: true }
 )
 
 // Scroll to bottom on initial mount
