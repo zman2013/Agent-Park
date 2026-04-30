@@ -576,19 +576,21 @@ def _wipe_agentloop_state(ws: WorkspacePaths) -> None:
 
     ``--fresh`` resets this workspace's todolist, state.json, and runs logs
     without erasing its per-workspace ``config.toml`` (seeded by the CLI /
-    manager before the run) nor any sibling workspace under
+    manager before the run), its ``design.md`` link (pointing at the real
+    spec the user passed in), nor any sibling workspace under
     ``<cwd>/.agentloop/workspaces/``.
     """
     ws_dir = ws.workspace_dir
     if not ws_dir.exists():
         ws_dir.mkdir(parents=True, exist_ok=True)
         return
-    # Preserve config.toml across the wipe — it was seeded just before the
-    # run starts (either by the CLI or agentloop_manager), and naively
-    # rmtree-ing the whole workspace would drop the freshly-applied
-    # per-workspace limits/backend overrides.
+    # Preserve config.toml and design.md across the wipe — both are put in
+    # place by the caller just before the run starts, and naively rmtree-ing
+    # the whole workspace would drop them (breaking per-workspace config
+    # overrides and making the spec unreachable from the subprocess cwd).
+    preserve = {ws.config_file.name, ws.design.name}
     for child in ws_dir.iterdir():
-        if child.name == ws.config_file.name:
+        if child.name in preserve:
             continue
         if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)

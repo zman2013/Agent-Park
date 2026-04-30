@@ -155,8 +155,23 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return 2
     ws.workspace_dir.mkdir(parents=True, exist_ok=True)
     seed_workspace_config(ws.workspace_dir, template=getattr(args, "config_template", None))
+    # Resolve the design path to absolute — subprocess cwd is ws.workspace_dir,
+    # so any relative path the user typed (``agentloop run design.md``) would
+    # otherwise be unreachable by the planner / dev / qa agents.
+    design_abs = Path(args.design).resolve()
+    # Mirror the agent-park flow: expose the design as ``<ws>/design.md`` so
+    # prompts that say "design.md is in cwd" are actually true in plain CLI
+    # mode too. Idempotent; we replace a pre-existing symlink to keep the
+    # target fresh across runs.
+    try:
+        link = ws.design
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(design_abs)
+    except OSError as e:
+        print(f"[agentloop] warning: failed to symlink design.md into workspace: {e}", file=sys.stderr)
     result = scheduler.run(
-        args.design,
+        design_abs,
         fresh=args.fresh,
         review_plan=args.review_plan,
         max_cycles=args.max_cycles,
@@ -183,7 +198,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     new_cost = (config.limits.max_cost_cny + args.more_cost) if args.more_cost else None
 
     result = scheduler.run(
-        args.design,
+        Path(args.design).resolve(),
         max_cycles=new_max,
         max_cost_cny=new_cost,
         ws=ws,
