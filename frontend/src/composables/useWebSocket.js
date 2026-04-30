@@ -286,7 +286,6 @@ export function useWebSocket() {
     clearReconnectTimer()
     clearHeartbeatTimer()
     connected.value = false
-    stopTitleFlash()
     window.removeEventListener('generate-summary', onGenerateSummaryEvent)
     if (ws) {
       const socket = ws
