@@ -53,15 +53,66 @@ def _loop_id(cwd: str, slug: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
 
 
-def _entry_workspace(entry: dict[str, Any]) -> WorkspacePaths:
-    """Build a WorkspacePaths for an existing registry entry."""
+class _LegacyWorkspacePaths:
+    """Pre-workspace layout adapter for registry entries without a ``workspace``.
+
+    Older ``data/agentloops.json`` rows predate multi-workspace support: state
+    and runs lived directly under ``<cwd>/.agentloop/`` and todolist.md in the
+    project root. We expose the same duck-typed attributes as
+    :class:`WorkspacePaths` so downstream helpers keep working without forcing
+    a registry migration.
+    """
+
+    def __init__(self, cwd: Path) -> None:
+        self.project_root = Path(cwd).resolve()
+        self.slug = ""
+
+    @property
+    def workspace_dir(self) -> Path:
+        return self.project_root / AGENTLOOP_DIR
+
+    @property
+    def subprocess_cwd(self) -> Path:
+        return self.project_root
+
+    @property
+    def state_file(self) -> Path:
+        return self.project_root / AGENTLOOP_DIR / STATE_FILE
+
+    @property
+    def todolist(self) -> Path:
+        return self.project_root / TODOLIST_FILE
+
+    @property
+    def runs_dir(self) -> Path:
+        return self.project_root / AGENTLOOP_DIR / RUNS_SUBDIR
+
+    @property
+    def design(self) -> Path:
+        return self.project_root / DESIGN_FILE
+
+    @property
+    def stdout_log(self) -> Path:
+        return self.project_root / AGENTLOOP_DIR / STDOUT_LOG
+
+
+def _entry_workspace(entry: dict[str, Any]) -> WorkspacePaths | _LegacyWorkspacePaths:
+    """Build a workspace-paths object for an existing registry entry.
+
+    Legacy entries (pre-workspace layout) fall back to
+    :class:`_LegacyWorkspacePaths` instead of raising — we still need to
+    surface them in ``list_all`` / ``get_snapshot`` / ``restore_orphan_loops``
+    during the upgrade window.
+    """
     slug = entry.get("workspace")
-    if not slug:
+    cwd = entry.get("cwd")
+    if not cwd:
         raise ValueError(
-            f"registry entry {entry.get('loop_id')!r} has no 'workspace' field; "
-            f"run the data/agentloops.json migration to add workspace + workspace_dir"
+            f"registry entry {entry.get('loop_id')!r} missing required 'cwd'"
         )
-    return WorkspacePaths.for_workspace(Path(entry["cwd"]), slug)
+    if not slug:
+        return _LegacyWorkspacePaths(Path(cwd))
+    return WorkspacePaths.for_workspace(Path(cwd), slug)
 
 
 def _load_registry() -> list[dict[str, Any]]:
@@ -228,16 +279,29 @@ def start(
         raise ValueError(f"design file not found: {design}")
     design_target = design.resolve()
 
-    # Allocate a workspace slug and its directory. If the caller supplied one
-    # verbatim and it already exists, reject — we never overwrite an existing
-    # workspace silently (could stomp running loop's state).
+    # Allocate a workspace slug. Two flows:
+    #   • explicit slug → honor idempotency first (running loop in same
+    #     workspace returns as-is); otherwise reuse or create the directory
+    #     so retries/restarts against a known slug work.
+    #   • auto slug → generate, then mkdir(exist_ok=False) with uuid retry
+    #     to guarantee a fresh directory.
     slug = workspace
     if slug:
         ws = WorkspacePaths.for_workspace(cwd_path, slug)
-        try:
-            ws.workspace_dir.mkdir(parents=True, exist_ok=False)
-        except FileExistsError as e:
-            raise ValueError(f"workspace already exists: {ws.workspace_dir}") from e
+        loop_id = _loop_id(str(cwd_path), slug)
+        existing = _find(loop_id)
+        if existing and existing.get("status") == "running":
+            pid = existing.get("pid")
+            expected_st = existing.get("pid_start_time")
+            if pid and _pid_matches(int(pid), expected_st):
+                logger.info(
+                    "agentloop already running for %s/%s (pid=%s)",
+                    cwd_path, slug, pid,
+                )
+                return existing
+        # Reuse or create the workspace dir. A prior stopped/exhausted run in
+        # the same slug stays on disk so restart flows can pick it up.
+        ws.workspace_dir.mkdir(parents=True, exist_ok=True)
     else:
         base = generate_slug(design_target)
         for attempt in range(5):
@@ -253,37 +317,36 @@ def start(
             raise RuntimeError(
                 f"could not allocate a unique workspace slug under {cwd_path}"
             )
-
-    # Idempotency: if a caller passed an explicit slug that matches an already-
-    # running entry, return it rather than double-launching. (Auto-generated
-    # slugs are globally unique so this only matters with ``workspace=...``.)
-    loop_id = _loop_id(str(cwd_path), slug)
-    existing = _find(loop_id)
-    if existing and existing.get("status") == "running":
-        pid = existing.get("pid")
-        expected_st = existing.get("pid_start_time")
-        if pid and _pid_matches(int(pid), expected_st):
-            logger.info(
-                "agentloop already running for %s/%s (pid=%s)",
-                cwd_path, slug, pid,
-            )
-            return existing
+        loop_id = _loop_id(str(cwd_path), slug)
 
     # Put the design symlink inside the workspace dir. The CLI reads it from
     # ws.design, the planner agent template resolves {{cwd}} to workspace_dir.
     # Subprocess cwd stays at project root (so it can still read project files,
     # config, run git commands).
     design_in_ws = ws.design
-    try:
-        design_in_ws.symlink_to(design_target)
-    except OSError:
-        # Cross-device or unsupported symlink target → fall back to copy.
-        import shutil as _sh
-        _sh.copy2(design_target, design_in_ws)
-        logger.warning(
-            "symlink %s → %s failed; copied instead (design edits won't propagate)",
-            design_in_ws, design_target,
-        )
+    if design_in_ws.exists() or design_in_ws.is_symlink():
+        # Reused workspace: only replace if the target changed to avoid
+        # disturbing an already-running loop's open fd.
+        try:
+            current = design_in_ws.resolve()
+        except OSError:
+            current = None
+        if current != design_target:
+            try:
+                design_in_ws.unlink()
+            except OSError:
+                pass
+    if not design_in_ws.exists() and not design_in_ws.is_symlink():
+        try:
+            design_in_ws.symlink_to(design_target)
+        except OSError:
+            # Cross-device or unsupported symlink target → fall back to copy.
+            import shutil as _sh
+            _sh.copy2(design_target, design_in_ws)
+            logger.warning(
+                "symlink %s → %s failed; copied instead (design edits won't propagate)",
+                design_in_ws, design_target,
+            )
 
     stdout_log = ws.stdout_log
     stdout_log.parent.mkdir(parents=True, exist_ok=True)
