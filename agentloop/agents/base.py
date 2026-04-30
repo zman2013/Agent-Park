@@ -48,8 +48,10 @@ def run_agent(
 
     ``role`` / ``item_id`` are used only for log filenames and (optional)
     telemetry; the actual instructions come from ``prompt``. Runs logs are
-    written to ``ws.runs_dir`` while the subprocess cwd is ``ws.subprocess_cwd``
-    (the project root — agents need project-level git access and config.toml).
+    written to ``ws.runs_dir``. The subprocess cwd is ``ws.workspace_dir``
+    itself, so agents see todolist.md / state.json / config.toml / design.md
+    in their own working directory; git operations reach the enclosing repo
+    via normal ancestor discovery.
     """
     if backend.cmd is None:
         raise ValueError(f"role {role!r} has no backend cmd (code-version?)")
@@ -75,7 +77,8 @@ def run_agent(
     try:
         proc = subprocess.Popen(
             args,
-            cwd=str(ws.subprocess_cwd),
+            cwd=str(ws.workspace_dir),
+            env=_child_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -264,3 +267,20 @@ def _next_sequence(runs_dir: Path) -> int:
         if n > max_seen:
             max_seen = n
     return max_seen + 1
+
+
+def _child_env() -> dict[str, str]:
+    """Env for spawned agent CLIs.
+
+    Strips just the nested-session markers that the parent Claude Code CLI
+    stamps into its environment — those trip the child ``claude`` process's
+    nested-session guard and abort it before it can do anything. All other
+    ``CLAUDE_CODE_*`` variables (``_USE_BEDROCK``, ``_USE_MANTLE``,
+    ``_MAX_OUTPUT_TOKENS`` …) carry legitimate backend auth / routing config
+    and must be preserved, otherwise Bedrock/Vertex-AI setups lose their
+    routing and fall back to public API (or fail entirely).
+    """
+    env = os.environ.copy()
+    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
+        env.pop(marker, None)
+    return env

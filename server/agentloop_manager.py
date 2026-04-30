@@ -36,6 +36,7 @@ from agentloop.workspace import (
     WorkspacePaths,
     generate_slug,
 )
+from agentloop.config import seed_workspace_config
 
 logger = logging.getLogger(__name__)
 
@@ -64,46 +65,47 @@ class _LegacyWorkspacePaths:
     """
 
     def __init__(self, cwd: Path) -> None:
-        self.project_root = Path(cwd).resolve()
+        self._cwd = Path(cwd).resolve()
         self.slug = ""
 
     @property
     def workspace_dir(self) -> Path:
-        return self.project_root / AGENTLOOP_DIR
-
-    @property
-    def subprocess_cwd(self) -> Path:
-        return self.project_root
+        return self._cwd / AGENTLOOP_DIR
 
     @property
     def state_file(self) -> Path:
-        return self.project_root / AGENTLOOP_DIR / STATE_FILE
+        return self._cwd / AGENTLOOP_DIR / STATE_FILE
 
     @property
     def todolist(self) -> Path:
-        return self.project_root / TODOLIST_FILE
+        return self._cwd / TODOLIST_FILE
 
     @property
     def runs_dir(self) -> Path:
-        return self.project_root / AGENTLOOP_DIR / RUNS_SUBDIR
+        return self._cwd / AGENTLOOP_DIR / RUNS_SUBDIR
 
     @property
     def design(self) -> Path:
-        return self.project_root / DESIGN_FILE
+        return self._cwd / DESIGN_FILE
 
     @property
     def stdout_log(self) -> Path:
-        return self.project_root / AGENTLOOP_DIR / STDOUT_LOG
+        return self._cwd / AGENTLOOP_DIR / STDOUT_LOG
 
 
 def _entry_workspace(entry: dict[str, Any]) -> WorkspacePaths | _LegacyWorkspacePaths:
     """Build a workspace-paths object for an existing registry entry.
 
-    Legacy entries (pre-workspace layout) fall back to
-    :class:`_LegacyWorkspacePaths` instead of raising — we still need to
-    surface them in ``list_all`` / ``get_snapshot`` / ``restore_orphan_loops``
-    during the upgrade window.
+    Preference order:
+    1. Explicit ``workspace_dir`` field (new entries) → direct construct.
+    2. ``cwd + workspace`` slug pair (current entries before this refactor) →
+       compose via :meth:`WorkspacePaths.for_workspace`.
+    3. ``cwd`` only → :class:`_LegacyWorkspacePaths` (pre-workspace layout).
     """
+    ws_dir = entry.get("workspace_dir")
+    if ws_dir:
+        return WorkspacePaths.from_workspace_dir(Path(ws_dir))
+
     slug = entry.get("workspace")
     cwd = entry.get("cwd")
     if not cwd:
@@ -348,6 +350,14 @@ def start(
                 design_in_ws, design_target,
             )
 
+    # Seed config.toml from the user global (or leave unseeded, in which case
+    # the loader falls back to built-in defaults). Idempotent — won't overwrite
+    # a hand-edited per-workspace config.
+    try:
+        seed_workspace_config(ws.workspace_dir)
+    except OSError:
+        logger.warning("failed to seed %s", ws.config_file)
+
     stdout_log = ws.stdout_log
     stdout_log.parent.mkdir(parents=True, exist_ok=True)
     log_fp = open(stdout_log, "ab", buffering=0)
@@ -366,15 +376,13 @@ def start(
                 "-m",
                 "agentloop",
                 "run",
-                # Pass the original design path, but pin the project root
-                # explicitly — otherwise the CLI would derive it from
-                # design.parent, which breaks when design.md lives in a
-                # subdirectory of cwd (e.g. cwd/docs/design.md) or outside.
+                # Pass the original design path and the absolute workspace dir.
+                # --workspace-dir is the authoritative pointer — the CLI no
+                # longer derives project_root from design.parent, which was the
+                # source of the nested-bootstrap bug.
                 str(design_target),
-                "--project-root",
-                str(cwd_path),
-                "--workspace",
-                slug,
+                "--workspace-dir",
+                str(ws.workspace_dir),
             ],
             cwd=str(cwd_path),
             stdout=log_fp,

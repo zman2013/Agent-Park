@@ -1,16 +1,19 @@
 """Workspace path resolution for agentloop.
 
 Single source of truth for where state.json / todolist.md / runs/ / stdout.log
-live, and which directory is the "project root" (for config.toml and as the
-subprocess cwd when we launch cco/ccs).
+/ design.md / config.toml live, and which directory is the subprocess cwd when
+we launch cco/ccs.
 
-Every loop has its own workspace directory at
-``<cwd>/.agentloop/workspaces/<slug>/`` containing state.json, todolist.md,
-runs/, stdout.log, and a design.md symlink. ``<cwd>/.agentloop/config.toml``
-stays shared across workspaces.
+Every loop has exactly one physical home:
+``<project>/.agentloop/workspaces/<slug>/``. Everything — state, todolist, runs
+logs, stdout log, design symlink, and per-workspace ``config.toml`` — lives
+inside it. The agent subprocess is spawned with this directory as its cwd; the
+git repository is discovered via normal ancestor search.
 
-Construct via :meth:`WorkspacePaths.for_workspace`; the rest of the code only
-sees the resolved file/directory paths.
+Construct via :meth:`WorkspacePaths.from_workspace_dir` when you already have
+the absolute directory (e.g. the CLI's ``--workspace-dir`` flag), or the
+convenience :meth:`WorkspacePaths.for_workspace` when you have a project root
+and slug.
 """
 from __future__ import annotations
 
@@ -26,6 +29,7 @@ TODOLIST_FILE = "todolist.md"
 RUNS_SUBDIR = "runs"
 STDOUT_LOG = "stdout.log"
 DESIGN_FILE = "design.md"
+CONFIG_FILE = "config.toml"
 
 # Slug safety — accepted characters must keep the path confined to
 # ``<cwd>/.agentloop/workspaces/<slug>/``. The set is intentionally narrow:
@@ -50,22 +54,15 @@ def _validate_slug(slug: str) -> None:
 
 @dataclass(frozen=True)
 class WorkspacePaths:
-    """Resolved paths for one agentloop run."""
+    """Resolved paths for one agentloop run.
 
-    project_root: Path
+    ``workspace_dir`` is the canonical root — the subprocess cwd and the
+    container for every file the loop reads/writes. ``slug`` is the directory
+    basename, kept around for logging and registry keys.
+    """
+
+    workspace_dir: Path
     slug: str
-
-    # ------- primary directories ------------------------------------------
-
-    @property
-    def workspace_dir(self) -> Path:
-        """Directory that holds state.json / todolist.md / runs/ / design.md."""
-        return self.project_root / AGENTLOOP_DIR / WORKSPACES_SUBDIR / self.slug
-
-    @property
-    def subprocess_cwd(self) -> Path:
-        """cwd to pass to cco/ccs subprocesses — always the project root."""
-        return self.project_root
 
     # ------- file paths ---------------------------------------------------
 
@@ -89,12 +86,37 @@ class WorkspacePaths:
     def stdout_log(self) -> Path:
         return self.workspace_dir / STDOUT_LOG
 
+    @property
+    def config_file(self) -> Path:
+        return self.workspace_dir / CONFIG_FILE
+
     # ------- constructors -------------------------------------------------
 
     @classmethod
+    def from_workspace_dir(cls, workspace_dir: Path) -> "WorkspacePaths":
+        """Build from the absolute workspace directory.
+
+        The slug is taken from the directory basename. No validation is applied
+        — callers that accept arbitrary paths should verify parentage
+        themselves; this constructor is for paths the caller already trusts.
+        """
+        wd = Path(workspace_dir).resolve()
+        return cls(workspace_dir=wd, slug=wd.name)
+
+    @classmethod
     def for_workspace(cls, project_root: Path, slug: str) -> "WorkspacePaths":
+        """Compose ``project_root/.agentloop/workspaces/<slug>`` and construct.
+
+        ``project_root`` is only used here to assemble the physical path; it is
+        not retained on the returned object. Once constructed the workspace
+        object knows nothing about which project it belongs to.
+        """
         _validate_slug(slug)
-        return cls(project_root=Path(project_root).resolve(), slug=slug)
+        root = Path(project_root).resolve()
+        return cls(
+            workspace_dir=root / AGENTLOOP_DIR / WORKSPACES_SUBDIR / slug,
+            slug=slug,
+        )
 
 
 # ---- slug generation / discovery --------------------------------------------

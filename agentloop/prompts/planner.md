@@ -40,7 +40,7 @@
 
 ```markdown
 ---
-project: <英文短名，取 cwd 目录名>
+project: <英文短名，可从 design.md 或项目上下文判断；若不确定，使用 design.md 文件名的 stem>
 design_doc: design.md
 created_at: <ISO8601 UTC，精确到秒>
 cycle: 0
