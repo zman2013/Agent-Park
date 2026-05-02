@@ -619,9 +619,24 @@ def _inject_feishu_into_workspace_config(config_file: Path) -> None:
             existing = config_file.read_text(encoding="utf-8")
         except OSError:
             return
-    # Coarse but sufficient guard — if the user already wrote a feishu
-    # section we don't want to double-inject or contradict their edits.
-    if "[summary.feishu]" in existing:
+    # Coarse but sufficient guard — if the user already filled in real feishu
+    # values we don't want to double-inject or contradict their edits. But an
+    # empty placeholder [summary.feishu] section (created by a template or
+    # prior partial write) should still trigger injection so that valid
+    # project-level config reaches the workspace.
+    if _has_populated_feishu_section(existing):
+        return
+
+    has_empty_feishu_section = "[summary.feishu]" in existing
+
+    if has_empty_feishu_section:
+        # Replace the existing (empty) [summary.feishu] section in place,
+        # rather than appending another one — TOML forbids redeclaration.
+        new_text = _replace_feishu_section(
+            existing, cli_path=cli_path, chat_id=chat_id, env_file=env_file
+        )
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(new_text, encoding="utf-8")
         return
 
     # Detect pre-existing [summary] table. TOML forbids redeclaring the same
@@ -665,6 +680,53 @@ def _inject_feishu_into_workspace_config(config_file: Path) -> None:
     new_text += "\n".join(block)
     config_file.parent.mkdir(parents=True, exist_ok=True)
     config_file.write_text(new_text, encoding="utf-8")
+
+
+def _has_populated_feishu_section(text: str) -> bool:
+    """True iff ``text`` contains a [summary.feishu] section whose ``cli_path``
+    and ``chat_id`` are both set to non-empty string literals.
+
+    An empty-placeholder section (e.g. ``cli_path = ""``) should NOT count as
+    populated — we want the injector to overwrite it with real values.
+    """
+    if "[summary.feishu]" not in text:
+        return False
+    # Slice from the [summary.feishu] header up to the next [table] header
+    # (or end of file) so we only inspect keys belonging to that section.
+    m = re.search(r"(?m)^\s*\[summary\.feishu\]\s*$", text)
+    if not m:
+        return False
+    start = m.end()
+    next_header = re.search(r"(?m)^\s*\[[^\]]+\]\s*$", text[start:])
+    section = text[start : start + next_header.start()] if next_header else text[start:]
+    cli = re.search(r'(?m)^\s*cli_path\s*=\s*"([^"]*)"', section)
+    chat = re.search(r'(?m)^\s*chat_id\s*=\s*"([^"]*)"', section)
+    return bool(cli and cli.group(1).strip() and chat and chat.group(1).strip())
+
+
+def _replace_feishu_section(
+    text: str, *, cli_path: str, chat_id: str, env_file: str
+) -> str:
+    """Replace an existing (empty) [summary.feishu] section body with populated
+    values. Preserves any content before the section header and after the
+    section ends (next [table] header or EOF).
+    """
+    m = re.search(r"(?m)^\s*\[summary\.feishu\]\s*$", text)
+    if not m:
+        return text  # guarded by caller, but be defensive
+    head = text[: m.end()]
+    tail_start = m.end()
+    next_header = re.search(r"(?m)^\s*\[[^\]]+\]\s*$", text[tail_start:])
+    tail = text[tail_start + next_header.start() :] if next_header else ""
+    body = (
+        "\n"
+        f'cli_path = "{cli_path}"\n'
+        f'chat_id = "{chat_id}"\n'
+        f'env_file = "{env_file}"\n'
+    )
+    if tail:
+        return head + body + ("\n" + tail if not tail.startswith("\n") else tail)
+    return head + body
 
 
 def _summary(entry: dict[str, Any]) -> dict[str, Any]:

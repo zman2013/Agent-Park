@@ -636,6 +636,14 @@ def _finalize(
     summary_md_text = ""
     summarizer_failure = ""
 
+    # Capture old mtime/size so we can detect a silent summarizer that doesn't
+    # rewrite summary.md. Without this, a stale summary.md from a previous run
+    # in the same (non-fresh) workspace would be treated as a success and
+    # Feishu/UI would publish outdated content.
+    pre_stat = summary_md_path.stat() if summary_md_path.exists() else None
+    pre_mtime_ns = pre_stat.st_mtime_ns if pre_stat else 0
+    pre_size = pre_stat.st_size if pre_stat else 0
+
     try:
         run_result = summary_agent.run(
             ws,
@@ -649,9 +657,22 @@ def _finalize(
         # the budget fuse (we're already past the exit decision).
         state.record_cost(run_result.cost_cny)
         state.save(ws)
-        if not summary_md_path.exists() or summary_md_path.stat().st_size == 0:
+        post_stat = summary_md_path.stat() if summary_md_path.exists() else None
+        if not post_stat or post_stat.st_size == 0:
             summarizer_failure = (
                 "summarizer did not produce summary.md"
+                + (f": {run_result.errors[0]}" if run_result.errors else "")
+            )
+        elif (
+            pre_stat
+            and post_stat.st_mtime_ns == pre_mtime_ns
+            and post_stat.st_size == pre_size
+        ):
+            # File exists but was never rewritten — stale content from a prior
+            # run. Treat as failure and emit fallback so downstream consumers
+            # don't republish outdated results.
+            summarizer_failure = (
+                "summarizer did not refresh summary.md"
                 + (f": {run_result.errors[0]}" if run_result.errors else "")
             )
     except Exception as e:  # noqa: BLE001 — terminal path, must not crash
