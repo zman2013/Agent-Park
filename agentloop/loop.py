@@ -80,7 +80,10 @@ def run(
 
     if state.exhausted_reason:
         # Resume needs explicit budget bump; by default we stay exhausted.
-        return _finalize(ws, config, state, LoopResult(ExitCode.EXHAUSTED, state.exhausted_reason))
+        # Skip _finalize here — summary/notification already ran when the loop
+        # first exhausted. Re-running would double-charge state.record_cost
+        # and send duplicate Feishu messages on every resume attempt.
+        return LoopResult(ExitCode.EXHAUSTED, state.exhausted_reason)
 
     # --- phase 0: planner ------------------------------------------------
     todolist_path = ws.todolist

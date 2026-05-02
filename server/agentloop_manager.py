@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -623,20 +624,41 @@ def _inject_feishu_into_workspace_config(config_file: Path) -> None:
     if "[summary.feishu]" in existing:
         return
 
-    block = [
-        "",
-        "# Injected by agentloop_manager from project config.json.",
-        "# Edit here to override for this workspace only.",
-        "[summary]",
-        "enabled = true",
-        "feishu_enabled = true",
-        "",
-        "[summary.feishu]",
-        f'cli_path = "{cli_path}"',
-        f'chat_id = "{chat_id}"',
-        f'env_file = "{env_file}"',
-        "",
-    ]
+    # Detect pre-existing [summary] table. TOML forbids redeclaring the same
+    # table, so appending a fresh [summary] block on top of an existing one
+    # produces a parse error; AgentConfig._merge_from() then silently drops
+    # the whole file on TOMLDecodeError, losing user limits/flags.
+    # Match [summary] as its own table (not [summary.feishu] or similar).
+    has_summary_table = bool(
+        re.search(r"(?m)^\s*\[summary\]\s*$", existing)
+    )
+
+    if has_summary_table:
+        block = [
+            "",
+            "# Injected by agentloop_manager from project config.json.",
+            "# Edit here to override for this workspace only.",
+            "[summary.feishu]",
+            f'cli_path = "{cli_path}"',
+            f'chat_id = "{chat_id}"',
+            f'env_file = "{env_file}"',
+            "",
+        ]
+    else:
+        block = [
+            "",
+            "# Injected by agentloop_manager from project config.json.",
+            "# Edit here to override for this workspace only.",
+            "[summary]",
+            "enabled = true",
+            "feishu_enabled = true",
+            "",
+            "[summary.feishu]",
+            f'cli_path = "{cli_path}"',
+            f'chat_id = "{chat_id}"',
+            f'env_file = "{env_file}"',
+            "",
+        ]
     new_text = existing
     if new_text and not new_text.endswith("\n"):
         new_text += "\n"
