@@ -22,8 +22,10 @@ from .agents import dev as dev_agent
 from .agents import planner as planner_agent
 from .agents import pm as pm_agent
 from .agents import qa as qa_agent
+from .agents import summarizer as summary_agent
 from .agents.base import RunResult
 from .config import AgentConfig
+from . import notify
 from . import scheduler_writes as sw
 from .state import Decision, LoopState
 from .todolist import Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
@@ -78,7 +80,7 @@ def run(
 
     if state.exhausted_reason:
         # Resume needs explicit budget bump; by default we stay exhausted.
-        return LoopResult(ExitCode.EXHAUSTED, state.exhausted_reason)
+        return _finalize(ws, config, state, LoopResult(ExitCode.EXHAUSTED, state.exhausted_reason))
 
     # --- phase 0: planner ------------------------------------------------
     todolist_path = ws.todolist
@@ -88,7 +90,7 @@ def run(
             ws, config, state, todolist_path, design_path
         )
         if planner_result is not None:
-            return planner_result
+            return _finalize(ws, config, state, planner_result)
 
         if config.review_plan:
             try:
@@ -105,7 +107,7 @@ def run(
         if reason := state.should_exit(config.limits):
             state.mark_exhausted(reason)
             state.save(ws)
-            return LoopResult(ExitCode.EXHAUSTED, reason)
+            return _finalize(ws, config, state, LoopResult(ExitCode.EXHAUSTED, reason))
 
         # v2: per-item fuse + cascade run before PM sees the todolist so that
         # PM and the attempt-limit check never operate on abandoned-but-live
@@ -163,14 +165,14 @@ def run(
             exit_code, reason = _classify_terminal(todolist, decision)
             if exit_code == ExitCode.SUCCESS:
                 state.save(ws)
-                return LoopResult(exit_code, reason)
+                return _finalize(ws, config, state, LoopResult(exit_code, reason))
             if exit_code == ExitCode.PARTIAL_SUCCESS:
                 state.save(ws)
-                return LoopResult(exit_code, reason)
+                return _finalize(ws, config, state, LoopResult(exit_code, reason))
             # EXHAUSTED — nothing actionable left but some items still open
             state.mark_exhausted(reason)
             state.save(ws)
-            return LoopResult(ExitCode.EXHAUSTED, reason)
+            return _finalize(ws, config, state, LoopResult(ExitCode.EXHAUSTED, reason))
 
         # v2: removed the "3 consecutive identical PM decisions" early exit.
         # PM is deterministic and will keep re-dispatching the head-of-queue
@@ -217,7 +219,7 @@ def run(
             state.mark_exhausted(reason)
             state.cycle += 1
             state.save(ws)
-            return LoopResult(ExitCode.EXHAUSTED, reason)
+            return _finalize(ws, config, state, LoopResult(ExitCode.EXHAUSTED, reason))
 
         state.cycle += 1
         state.save(ws)
@@ -596,3 +598,106 @@ def _wipe_agentloop_state(ws: WorkspacePaths) -> None:
             shutil.rmtree(child)
         else:
             child.unlink()
+
+
+# ----- terminal finalization ---------------------------------------------
+
+
+_EXIT_TAGS = {
+    ExitCode.SUCCESS: "SUCCESS",
+    ExitCode.PARTIAL_SUCCESS: "PARTIAL_SUCCESS",
+    ExitCode.EXHAUSTED: "EXHAUSTED",
+    ExitCode.ERROR: "ERROR",
+}
+
+
+def _finalize(
+    ws: WorkspacePaths,
+    config: AgentConfig,
+    state: LoopState,
+    result: LoopResult,
+) -> LoopResult:
+    """Run the terminal summary stage and Feishu notification.
+
+    Invoked from every ``run()`` return path. Never raises: summarizer or
+    notifier failures are logged but must not mutate the LoopResult we hand
+    back to the caller — by the time we get here the scheduling decision is
+    already final.
+    """
+    sc = config.summary_config
+    if not sc.enabled:
+        return result
+
+    exit_tag = _EXIT_TAGS.get(result.code, result.code.name)
+    summary_md_path = ws.workspace_dir / "summary.md"
+    summary_md_text = ""
+    summarizer_failure = ""
+
+    try:
+        run_result = summary_agent.run(
+            ws,
+            config.summary,
+            exit_tag=exit_tag,
+            exit_reason=result.reason,
+            cycle=state.cycle,
+            total_cost_cny=state.total_cost_cny,
+        )
+        # Summary cost is real spend; count it even though it doesn't feed
+        # the budget fuse (we're already past the exit decision).
+        state.record_cost(run_result.cost_cny)
+        state.save(ws)
+        if not summary_md_path.exists() or summary_md_path.stat().st_size == 0:
+            summarizer_failure = (
+                "summarizer did not produce summary.md"
+                + (f": {run_result.errors[0]}" if run_result.errors else "")
+            )
+    except Exception as e:  # noqa: BLE001 — terminal path, must not crash
+        logger.exception("summary agent crashed")
+        summarizer_failure = f"summary agent crashed: {e}"
+
+    if summarizer_failure:
+        try:
+            summary_agent.write_fallback(
+                ws,
+                exit_tag=exit_tag,
+                exit_reason=result.reason,
+                cycle=state.cycle,
+                total_cost_cny=state.total_cost_cny,
+                failure_note=summarizer_failure,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("fallback summary write failed")
+
+    try:
+        summary_md_text = summary_md_path.read_text(encoding="utf-8")
+    except OSError:
+        summary_md_text = ""
+
+    if sc.feishu_enabled and summary_md_text:
+        try:
+            design_name = ws.design.name if ws.design.exists() else "(missing)"
+            # cwd_basename isn't reachable from the workspace object; use the
+            # project root, which is the grandparent of
+            # ``<project>/.agentloop/workspaces/<slug>``.
+            try:
+                project_name = ws.workspace_dir.parent.parent.parent.name
+            except (AttributeError, IndexError):
+                project_name = ws.slug
+            message = notify.format_summary_card(
+                loop_slug=ws.slug,
+                project_name=project_name,
+                design_name=design_name,
+                exit_tag=exit_tag,
+                exit_reason=result.reason,
+                cycle=state.cycle,
+                total_cost_cny=state.total_cost_cny,
+                summary_md=summary_md_text,
+            )
+            notify.send_feishu_card(sc.feishu, message)
+        except Exception:  # noqa: BLE001
+            logger.exception("feishu summary notification failed")
+
+    return result
+
+
+

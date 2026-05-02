@@ -358,6 +358,15 @@ def start(
     except OSError:
         logger.warning("failed to seed %s", ws.config_file)
 
+    # Inject the project-level Feishu bot config into the workspace so the
+    # agentloop summary stage can notify on completion without requiring a
+    # second source of truth. Reuses ``wiki_ingest.feishu_notify`` — the same
+    # bot/chat serves both pipelines (see design in this PR).
+    try:
+        _inject_feishu_into_workspace_config(ws.config_file)
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to inject feishu config into %s", ws.config_file)
+
     stdout_log = ws.stdout_log
     stdout_log.parent.mkdir(parents=True, exist_ok=True)
     log_fp = open(stdout_log, "ab", buffering=0)
@@ -572,6 +581,68 @@ def restore_orphan_loops() -> list[str]:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+
+def _inject_feishu_into_workspace_config(config_file: Path) -> None:
+    """Write the project-level Feishu config into a workspace ``config.toml``.
+
+    Reuses ``wiki_ingest.feishu_notify`` from the project's ``config.json`` so
+    the same bot/chat serves both pipelines — the user only configures it once.
+
+    Idempotent and non-destructive:
+      * If the workspace config already has a ``[summary.feishu]`` section
+        with a non-empty ``cli_path``, we do nothing — respect hand edits.
+      * If the project config.json has no Feishu values configured, we do
+        nothing — otherwise agentloop would try to notify against an empty
+        chat_id and log warnings forever.
+      * Otherwise append a fresh ``[summary]`` + ``[summary.feishu]`` block.
+    """
+    from .config import wiki_ingest_config
+
+    wi = wiki_ingest_config()
+    feishu = wi.get("feishu_notify") or {}
+    cli_path = (feishu.get("cli_path") or "").strip()
+    chat_id = (feishu.get("chat_id") or "").strip()
+    env_file = (feishu.get("env_file") or "").strip()
+
+    # Only inject when the project has actually configured a bot. An
+    # "enabled: false" project config is a valid opt-out — we honor it by
+    # refusing to inject values that the user explicitly disabled.
+    project_enabled = bool(feishu.get("enabled"))
+    if not project_enabled or not cli_path or not chat_id:
+        return
+
+    existing = ""
+    if config_file.exists():
+        try:
+            existing = config_file.read_text(encoding="utf-8")
+        except OSError:
+            return
+    # Coarse but sufficient guard — if the user already wrote a feishu
+    # section we don't want to double-inject or contradict their edits.
+    if "[summary.feishu]" in existing:
+        return
+
+    block = [
+        "",
+        "# Injected by agentloop_manager from project config.json.",
+        "# Edit here to override for this workspace only.",
+        "[summary]",
+        "enabled = true",
+        "feishu_enabled = true",
+        "",
+        "[summary.feishu]",
+        f'cli_path = "{cli_path}"',
+        f'chat_id = "{chat_id}"',
+        f'env_file = "{env_file}"',
+        "",
+    ]
+    new_text = existing
+    if new_text and not new_text.endswith("\n"):
+        new_text += "\n"
+    new_text += "\n".join(block)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(new_text, encoding="utf-8")
 
 
 def _summary(entry: dict[str, Any]) -> dict[str, Any]:

@@ -34,13 +34,42 @@ class AgentBackend:
 
 
 @dataclass
+class FeishuConfig:
+    """Feishu bot CLI settings for summary notifications.
+
+    Mirrors the ``wiki_ingest.feishu_notify`` shape in the project-level
+    ``config.json`` so agentloop_manager can inject the same values into the
+    workspace ``config.toml`` without a second source of truth.
+    """
+
+    cli_path: str = ""
+    chat_id: str = ""
+    env_file: str = ""
+
+
+@dataclass
+class SummaryConfig:
+    """Terminal-phase summary settings.
+
+    Controls whether loop.run() spawns the summarizer agent after the PM/dev/qa
+    loop exits, and whether the resulting summary.md is pushed via Feishu.
+    """
+
+    enabled: bool = True
+    feishu_enabled: bool = True
+    feishu: FeishuConfig = field(default_factory=FeishuConfig)
+
+
+@dataclass
 class AgentConfig:
     limits: Limits = field(default_factory=Limits)
     planner: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="cco"))
     dev: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="ccs"))
     qa: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="ccs"))
+    summary: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="cco"))
     pm: AgentBackend = field(default_factory=lambda: AgentBackend(cmd=None, is_code=True))
     review_plan: bool = False
+    summary_config: SummaryConfig = field(default_factory=SummaryConfig)
 
     def backend_for(self, role: str) -> AgentBackend:
         try:
@@ -85,7 +114,7 @@ class AgentConfig:
             self.review_plan = bool(data["review_plan"])
 
         agents = data.get("agents", {})
-        for role in ("planner", "dev", "qa", "pm"):
+        for role in ("planner", "dev", "qa", "summary", "pm"):
             cfg = agents.get(role)
             if not cfg:
                 continue
@@ -99,6 +128,19 @@ class AgentConfig:
                 backend.timeout_sec = int(cfg["timeout_sec"])
             if "stall_timeout_sec" in cfg:
                 backend.stall_timeout_sec = int(cfg["stall_timeout_sec"])
+
+        summary = data.get("summary", {})
+        if "enabled" in summary:
+            self.summary_config.enabled = bool(summary["enabled"])
+        if "feishu_enabled" in summary:
+            self.summary_config.feishu_enabled = bool(summary["feishu_enabled"])
+        feishu = summary.get("feishu", {})
+        if "cli_path" in feishu:
+            self.summary_config.feishu.cli_path = str(feishu["cli_path"] or "")
+        if "chat_id" in feishu:
+            self.summary_config.feishu.chat_id = str(feishu["chat_id"] or "")
+        if "env_file" in feishu:
+            self.summary_config.feishu.env_file = str(feishu["env_file"] or "")
 
 
 def _user_config_path() -> Path:
