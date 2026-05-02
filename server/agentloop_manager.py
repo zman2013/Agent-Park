@@ -683,25 +683,40 @@ def _inject_feishu_into_workspace_config(config_file: Path) -> None:
 
 
 def _has_populated_feishu_section(text: str) -> bool:
-    """True iff ``text`` contains a [summary.feishu] section whose ``cli_path``
-    and ``chat_id`` are both set to non-empty string literals.
+    """True iff ``text`` contains a [summary.feishu] section that the user
+    appears to have managed themselves — we should NOT overwrite.
 
-    An empty-placeholder section (e.g. ``cli_path = ""``) should NOT count as
-    populated — we want the injector to overwrite it with real values.
+    Policy: only treat the section as a blank template placeholder
+    (overwrite-able) when BOTH ``cli_path`` and ``chat_id`` are present and
+    both parse to empty double-quoted strings (``"" ``). Anything else counts
+    as user-managed:
+      * a non-empty value in either key
+      * single-quoted values (``'...'`` — valid TOML, user-authored)
+      * only one of the two keys (deliberate partial config)
+      * any other form (multiline strings, numbers, etc.)
+    Matching the exact empty-double-quoted pair is narrow on purpose: it is
+    the canonical empty-template shape, and anything that deviates from it
+    is more likely intentional than accidental.
     """
     if "[summary.feishu]" not in text:
         return False
-    # Slice from the [summary.feishu] header up to the next [table] header
-    # (or end of file) so we only inspect keys belonging to that section.
     m = re.search(r"(?m)^\s*\[summary\.feishu\]\s*$", text)
     if not m:
         return False
     start = m.end()
     next_header = re.search(r"(?m)^\s*\[[^\]]+\]\s*$", text[start:])
     section = text[start : start + next_header.start()] if next_header else text[start:]
-    cli = re.search(r'(?m)^\s*cli_path\s*=\s*"([^"]*)"', section)
-    chat = re.search(r'(?m)^\s*chat_id\s*=\s*"([^"]*)"', section)
-    return bool(cli and cli.group(1).strip() and chat and chat.group(1).strip())
+    cli_key = re.search(r"(?m)^\s*cli_path\s*=\s*(.*)$", section)
+    chat_key = re.search(r"(?m)^\s*chat_id\s*=\s*(.*)$", section)
+    if not cli_key or not chat_key:
+        # At least one key missing — treat as user-managed (deliberate partial
+        # config) to avoid stomping on single-key edits.
+        return True
+    cli_val = cli_key.group(1).strip()
+    chat_val = chat_key.group(1).strip()
+    # Empty-template canonical shape: both values are exactly "".
+    is_blank_template = cli_val == '""' and chat_val == '""'
+    return not is_blank_template
 
 
 def _replace_feishu_section(
