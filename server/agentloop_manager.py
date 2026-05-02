@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -358,6 +359,15 @@ def start(
     except OSError:
         logger.warning("failed to seed %s", ws.config_file)
 
+    # Inject the project-level Feishu bot config into the workspace so the
+    # agentloop summary stage can notify on completion without requiring a
+    # second source of truth. Reuses ``wiki_ingest.feishu_notify`` — the same
+    # bot/chat serves both pipelines (see design in this PR).
+    try:
+        _inject_feishu_into_workspace_config(ws.config_file)
+    except Exception:  # noqa: BLE001
+        logger.exception("failed to inject feishu config into %s", ws.config_file)
+
     stdout_log = ws.stdout_log
     stdout_log.parent.mkdir(parents=True, exist_ok=True)
     log_fp = open(stdout_log, "ab", buffering=0)
@@ -572,6 +582,166 @@ def restore_orphan_loops() -> list[str]:
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
+
+
+def _inject_feishu_into_workspace_config(config_file: Path) -> None:
+    """Write the project-level Feishu config into a workspace ``config.toml``.
+
+    Reuses ``wiki_ingest.feishu_notify`` from the project's ``config.json`` so
+    the same bot/chat serves both pipelines — the user only configures it once.
+
+    Idempotent and non-destructive:
+      * If the workspace config already has a ``[summary.feishu]`` section
+        with a non-empty ``cli_path``, we do nothing — respect hand edits.
+      * If the project config.json has no Feishu values configured, we do
+        nothing — otherwise agentloop would try to notify against an empty
+        chat_id and log warnings forever.
+      * Otherwise append a fresh ``[summary]`` + ``[summary.feishu]`` block.
+    """
+    from .config import wiki_ingest_config
+
+    wi = wiki_ingest_config()
+    feishu = wi.get("feishu_notify") or {}
+    cli_path = (feishu.get("cli_path") or "").strip()
+    chat_id = (feishu.get("chat_id") or "").strip()
+    env_file = (feishu.get("env_file") or "").strip()
+
+    # Only inject when the project has actually configured a bot. An
+    # "enabled: false" project config is a valid opt-out — we honor it by
+    # refusing to inject values that the user explicitly disabled.
+    project_enabled = bool(feishu.get("enabled"))
+    if not project_enabled or not cli_path or not chat_id:
+        return
+
+    existing = ""
+    if config_file.exists():
+        try:
+            existing = config_file.read_text(encoding="utf-8")
+        except OSError:
+            return
+    # Coarse but sufficient guard — if the user already filled in real feishu
+    # values we don't want to double-inject or contradict their edits. But an
+    # empty placeholder [summary.feishu] section (created by a template or
+    # prior partial write) should still trigger injection so that valid
+    # project-level config reaches the workspace.
+    if _has_populated_feishu_section(existing):
+        return
+
+    has_empty_feishu_section = "[summary.feishu]" in existing
+
+    if has_empty_feishu_section:
+        # Replace the existing (empty) [summary.feishu] section in place,
+        # rather than appending another one — TOML forbids redeclaration.
+        new_text = _replace_feishu_section(
+            existing, cli_path=cli_path, chat_id=chat_id, env_file=env_file
+        )
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(new_text, encoding="utf-8")
+        return
+
+    # Detect pre-existing [summary] table. TOML forbids redeclaring the same
+    # table, so appending a fresh [summary] block on top of an existing one
+    # produces a parse error; AgentConfig._merge_from() then silently drops
+    # the whole file on TOMLDecodeError, losing user limits/flags.
+    # Match [summary] as its own table (not [summary.feishu] or similar).
+    has_summary_table = bool(
+        re.search(r"(?m)^\s*\[summary\]\s*$", existing)
+    )
+
+    if has_summary_table:
+        block = [
+            "",
+            "# Injected by agentloop_manager from project config.json.",
+            "# Edit here to override for this workspace only.",
+            "[summary.feishu]",
+            f'cli_path = "{cli_path}"',
+            f'chat_id = "{chat_id}"',
+            f'env_file = "{env_file}"',
+            "",
+        ]
+    else:
+        block = [
+            "",
+            "# Injected by agentloop_manager from project config.json.",
+            "# Edit here to override for this workspace only.",
+            "[summary]",
+            "enabled = true",
+            "feishu_enabled = true",
+            "",
+            "[summary.feishu]",
+            f'cli_path = "{cli_path}"',
+            f'chat_id = "{chat_id}"',
+            f'env_file = "{env_file}"',
+            "",
+        ]
+    new_text = existing
+    if new_text and not new_text.endswith("\n"):
+        new_text += "\n"
+    new_text += "\n".join(block)
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(new_text, encoding="utf-8")
+
+
+def _has_populated_feishu_section(text: str) -> bool:
+    """True iff ``text`` contains a [summary.feishu] section that the user
+    appears to have managed themselves — we should NOT overwrite.
+
+    Policy: only treat the section as a blank template placeholder
+    (overwrite-able) when BOTH ``cli_path`` and ``chat_id`` are present and
+    both parse to empty double-quoted strings (``"" ``). Anything else counts
+    as user-managed:
+      * a non-empty value in either key
+      * single-quoted values (``'...'`` — valid TOML, user-authored)
+      * only one of the two keys (deliberate partial config)
+      * any other form (multiline strings, numbers, etc.)
+    Matching the exact empty-double-quoted pair is narrow on purpose: it is
+    the canonical empty-template shape, and anything that deviates from it
+    is more likely intentional than accidental.
+    """
+    if "[summary.feishu]" not in text:
+        return False
+    m = re.search(r"(?m)^\s*\[summary\.feishu\]\s*$", text)
+    if not m:
+        return False
+    start = m.end()
+    next_header = re.search(r"(?m)^\s*\[[^\]]+\]\s*$", text[start:])
+    section = text[start : start + next_header.start()] if next_header else text[start:]
+    cli_key = re.search(r"(?m)^\s*cli_path\s*=\s*(.*)$", section)
+    chat_key = re.search(r"(?m)^\s*chat_id\s*=\s*(.*)$", section)
+    if not cli_key or not chat_key:
+        # At least one key missing — treat as user-managed (deliberate partial
+        # config) to avoid stomping on single-key edits.
+        return True
+    cli_val = cli_key.group(1).strip()
+    chat_val = chat_key.group(1).strip()
+    # Empty-template canonical shape: both values are exactly "".
+    is_blank_template = cli_val == '""' and chat_val == '""'
+    return not is_blank_template
+
+
+def _replace_feishu_section(
+    text: str, *, cli_path: str, chat_id: str, env_file: str
+) -> str:
+    """Replace an existing (empty) [summary.feishu] section body with populated
+    values. Preserves any content before the section header and after the
+    section ends (next [table] header or EOF).
+    """
+    m = re.search(r"(?m)^\s*\[summary\.feishu\]\s*$", text)
+    if not m:
+        return text  # guarded by caller, but be defensive
+    head = text[: m.end()]
+    tail_start = m.end()
+    next_header = re.search(r"(?m)^\s*\[[^\]]+\]\s*$", text[tail_start:])
+    tail = text[tail_start + next_header.start() :] if next_header else ""
+    body = (
+        "\n"
+        f'cli_path = "{cli_path}"\n'
+        f'chat_id = "{chat_id}"\n'
+        f'env_file = "{env_file}"\n'
+    )
+    if tail:
+        return head + body + ("\n" + tail if not tail.startswith("\n") else tail)
+    return head + body
 
 
 def _summary(entry: dict[str, Any]) -> dict[str, Any]:
