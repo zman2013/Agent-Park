@@ -72,6 +72,7 @@ async def delete_task(task_id: str):
         raise HTTPException(404, "task not found")
     agent_id = task.agent_id
     await runner.kill_task(task_id)
+    runner.forget_task(task_id)
     app_state.delete_task(task_id)
     agent = app_state.get_agent(agent_id)
     from server.routes_ws import broadcast

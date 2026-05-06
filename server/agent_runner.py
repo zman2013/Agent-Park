@@ -953,9 +953,10 @@ class AgentRunner:
 
     async def kill_task(self, task_id: str) -> None:
         """Terminate subprocess for a task."""
-        # Task is being torn down — drop the compact-warning flag so a future
-        # re-run of this task_id starts with a clean slate.
-        self._compact_warned.discard(task_id)
+        # Note: _compact_warned is intentionally NOT cleared here. send_input()
+        # calls kill_task() on every resume (default kill_existing=True), which
+        # would defeat the one-shot compact warning. Real teardown paths
+        # (routes_rest.delete_task) clear the flag via forget_task().
         # PTY mode: kill by pid
         pid = self._pids.pop(task_id, None)
         if pid:
@@ -1002,6 +1003,17 @@ class AgentRunner:
         t = self._subprocess_tasks.pop(task_id, None)
         if t and not t.done():
             t.cancel()
+
+    # ── task teardown (delete path) ─────────────────────────────────────
+
+    def forget_task(self, task_id: str) -> None:
+        """Clear per-task bookkeeping that must survive resumes but not deletion.
+
+        Call from real teardown paths (e.g. routes_rest.delete_task) after
+        kill_task. Not called from send_input's kill_task — we want the
+        compact-warning one-shot flag to survive normal resumes.
+        """
+        self._compact_warned.discard(task_id)
 
     # ── orphan task restore ─────────────────────────────────────────────
 
