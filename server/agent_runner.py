@@ -635,7 +635,11 @@ class AgentRunner:
         self._async_procs.pop(task_id, None)
         self._adapters.pop(task_id, None)
         self._session_baselines.pop(task_id, None)
-        self._compact_warned.discard(task_id)
+        # Note: _compact_warned is intentionally NOT cleared here. Per-run cleanup
+        # fires at the end of every subprocess run (including max-turns resume and
+        # short turns between the warn threshold and the compact boundary). The
+        # flag must persist across those until either compact_boundary fires
+        # (reset_compact_warning) or the task is fully killed/deleted (kill_task).
         # Clear persisted PID — subprocess is gone
         task = app_state.get_task(task_id)
         if task:
@@ -929,6 +933,9 @@ class AgentRunner:
 
     async def kill_task(self, task_id: str) -> None:
         """Terminate subprocess for a task."""
+        # Task is being torn down — drop the compact-warning flag so a future
+        # re-run of this task_id starts with a clean slate.
+        self._compact_warned.discard(task_id)
         # PTY mode: kill by pid
         pid = self._pids.pop(task_id, None)
         if pid:
