@@ -102,6 +102,7 @@ class CcoAdapter(BaseAdapter):
             "系统为控制上下文长度重新生成了对话摘要，之前的详细历史已被折叠。"
         )
         await ctx.send_system_notice(notice)
+        await ctx.reset_compact_warning()
 
     # ── stream_event ────────────────────────────────────────────────────
 

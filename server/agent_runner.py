@@ -33,6 +33,11 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 
+# Ratio of context window usage that triggers an early "即将压缩" warning.
+# cco auto-compact typically fires around ~88%; warn a bit earlier to give
+# the user visibility before the long compact pause begins.
+COMPACT_WARN_RATIO = 0.82
+
 
 class _RunContext:
     """Implements ChunkContext — callback interface for adapters.
@@ -179,6 +184,34 @@ class _RunContext:
             "total_cost_cny": task.total_cost_cny,
             "model_usage": task.model_usage,
         })
+
+        await self._maybe_warn_compact_pending(task, model)
+
+    async def _maybe_warn_compact_pending(self, task, model: str) -> None:
+        """Emit a one-shot '即将压缩' notice when context usage crosses the threshold."""
+        if self.task_id in self._runner._compact_warned:
+            return
+        mu = task.model_usage.get(model) if model else None
+        if not mu:
+            return
+        ctx_win = mu.get("contextWindow", 0)
+        used = mu.get("inputTokens", 0)
+        if not ctx_win or not used:
+            return
+        ratio = used / ctx_win
+        if ratio < COMPACT_WARN_RATIO:
+            return
+        self._runner._compact_warned.add(self.task_id)
+        pct = ratio * 100
+        notice = (
+            f"⚠️ 上下文接近上限（{model} 使用 {used:,}/{ctx_win:,} tokens, {pct:.1f}%），"
+            "下一轮可能触发自动压缩（compact），期间可能有较长时间无输出。"
+        )
+        await self.send_system_notice(notice)
+
+    async def reset_compact_warning(self) -> None:
+        """Called by adapters after a compact_boundary so the next round can warn again."""
+        self._runner._compact_warned.discard(self.task_id)
 
     async def apply_authoritative_usage(
         self,
@@ -389,6 +422,7 @@ class AgentRunner:
         self._session_ids: dict[str, str] = self._load_sessions()
         self._resuming: set[str] = set()          # task_ids being killed for resume
         self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
+        self._compact_warned: set[str] = set()    # task_ids that already got a compact warning this round
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
@@ -590,6 +624,7 @@ class AgentRunner:
         self._async_procs.pop(task_id, None)
         self._adapters.pop(task_id, None)
         self._session_baselines.pop(task_id, None)
+        self._compact_warned.discard(task_id)
         # Clear persisted PID — subprocess is gone
         task = app_state.get_task(task_id)
         if task:

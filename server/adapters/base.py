@@ -32,6 +32,14 @@ class ChunkContext(Protocol):
 
     async def send_system_notice(self, content: str) -> None: ...
 
+    async def reset_compact_warning(self) -> None:
+        """Clear any pending 'context-near-limit' warning state.
+
+        Called by adapters after a compact_boundary so the next round of
+        context-fill can emit a fresh warning.
+        """
+        ...
+
     async def update_tokens(
         self,
         input_tokens: int,
