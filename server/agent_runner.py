@@ -33,6 +33,18 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 
+# Ratio of context window usage that triggers an early "即将压缩" warning.
+# cco auto-compact typically fires around ~88%; warn a bit earlier to give
+# the user visibility before the long compact pause begins.
+COMPACT_WARN_RATIO = 0.82
+
+# Fallback context window used when the per-turn `message.usage` does not
+# carry `context_window`. Claude Code's stream chunks sometimes only include
+# the full window in the final `result.modelUsage`, which means the FIRST
+# near-limit turn of a fresh session would otherwise silently skip the
+# warning. All current Claude 4.x models expose a 200k context window.
+_DEFAULT_CONTEXT_WINDOW = 200_000
+
 
 class _RunContext:
     """Implements ChunkContext — callback interface for adapters.
@@ -179,6 +191,58 @@ class _RunContext:
             "total_cost_cny": task.total_cost_cny,
             "model_usage": task.model_usage,
         })
+
+        await self._maybe_warn_compact_pending(task, model, input_tokens, context_window)
+
+    async def _maybe_warn_compact_pending(
+        self,
+        task,
+        model: str,
+        current_input_tokens: int,
+        current_context_window: int,
+    ) -> None:
+        """Emit a one-shot '即将压缩' notice when THIS turn's context usage crosses the threshold.
+
+        Must use the current turn's input tokens, not the cumulative model total —
+        the cumulative sum grows unboundedly with turn count and would falsely trigger
+        even when the latest request is far below the compact threshold.
+        """
+        if self.task_id in self._runner._compact_warned:
+            return
+        if not model:
+            return
+        mu = task.model_usage.get(model) or {}
+        # Resolve ctx_win in preference order:
+        #   1. this turn's context_window (most accurate)
+        #   2. previously-seen window for this model (from earlier update_tokens
+        #      or apply_authoritative_usage seeding)
+        #   3. task-level context_window (seeded by any prior turn/result)
+        #   4. DEFAULT — so we still warn on the first near-limit turn of a
+        #      fresh session where only `message.usage` has arrived and it
+        #      lacks context_window.
+        ctx_win = (
+            current_context_window
+            or mu.get("contextWindow", 0)
+            or task.context_window
+            or _DEFAULT_CONTEXT_WINDOW
+        )
+        used = current_input_tokens
+        if not ctx_win or not used:
+            return
+        ratio = used / ctx_win
+        if ratio < COMPACT_WARN_RATIO:
+            return
+        self._runner._compact_warned.add(self.task_id)
+        pct = ratio * 100
+        notice = (
+            f"⚠️ 上下文接近上限（{model} 使用 {used:,}/{ctx_win:,} tokens, {pct:.1f}%），"
+            "下一轮可能触发自动压缩（compact），期间可能有较长时间无输出。"
+        )
+        await self.send_system_notice(notice)
+
+    async def reset_compact_warning(self) -> None:
+        """Called by adapters after a compact_boundary so the next round can warn again."""
+        self._runner._compact_warned.discard(self.task_id)
 
     async def apply_authoritative_usage(
         self,
@@ -389,6 +453,7 @@ class AgentRunner:
         self._session_ids: dict[str, str] = self._load_sessions()
         self._resuming: set[str] = set()          # task_ids being killed for resume
         self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
+        self._compact_warned: set[str] = set()    # task_ids that already got a compact warning this round
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
@@ -590,6 +655,11 @@ class AgentRunner:
         self._async_procs.pop(task_id, None)
         self._adapters.pop(task_id, None)
         self._session_baselines.pop(task_id, None)
+        # Note: _compact_warned is intentionally NOT cleared here. Per-run cleanup
+        # fires at the end of every subprocess run (including max-turns resume and
+        # short turns between the warn threshold and the compact boundary). The
+        # flag must persist across those until either compact_boundary fires
+        # (reset_compact_warning) or the task is fully killed/deleted (kill_task).
         # Clear persisted PID — subprocess is gone
         task = app_state.get_task(task_id)
         if task:
@@ -883,6 +953,10 @@ class AgentRunner:
 
     async def kill_task(self, task_id: str) -> None:
         """Terminate subprocess for a task."""
+        # Note: _compact_warned is intentionally NOT cleared here. send_input()
+        # calls kill_task() on every resume (default kill_existing=True), which
+        # would defeat the one-shot compact warning. Real teardown paths
+        # (routes_rest.delete_task) clear the flag via forget_task().
         # PTY mode: kill by pid
         pid = self._pids.pop(task_id, None)
         if pid:
@@ -929,6 +1003,17 @@ class AgentRunner:
         t = self._subprocess_tasks.pop(task_id, None)
         if t and not t.done():
             t.cancel()
+
+    # ── task teardown (delete path) ─────────────────────────────────────
+
+    def forget_task(self, task_id: str) -> None:
+        """Clear per-task bookkeeping that must survive resumes but not deletion.
+
+        Call from real teardown paths (e.g. routes_rest.delete_task) after
+        kill_task. Not called from send_input's kill_task — we want the
+        compact-warning one-shot flag to survive normal resumes.
+        """
+        self._compact_warned.discard(task_id)
 
     # ── orphan task restore ─────────────────────────────────────────────
 
