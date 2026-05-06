@@ -38,6 +38,13 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 # the user visibility before the long compact pause begins.
 COMPACT_WARN_RATIO = 0.82
 
+# Fallback context window used when the per-turn `message.usage` does not
+# carry `context_window`. Claude Code's stream chunks sometimes only include
+# the full window in the final `result.modelUsage`, which means the FIRST
+# near-limit turn of a fresh session would otherwise silently skip the
+# warning. All current Claude 4.x models expose a 200k context window.
+_DEFAULT_CONTEXT_WINDOW = 200_000
+
 
 class _RunContext:
     """Implements ChunkContext — callback interface for adapters.
@@ -205,7 +212,20 @@ class _RunContext:
         if not model:
             return
         mu = task.model_usage.get(model) or {}
-        ctx_win = current_context_window or mu.get("contextWindow", 0)
+        # Resolve ctx_win in preference order:
+        #   1. this turn's context_window (most accurate)
+        #   2. previously-seen window for this model (from earlier update_tokens
+        #      or apply_authoritative_usage seeding)
+        #   3. task-level context_window (seeded by any prior turn/result)
+        #   4. DEFAULT — so we still warn on the first near-limit turn of a
+        #      fresh session where only `message.usage` has arrived and it
+        #      lacks context_window.
+        ctx_win = (
+            current_context_window
+            or mu.get("contextWindow", 0)
+            or task.context_window
+            or _DEFAULT_CONTEXT_WINDOW
+        )
         used = current_input_tokens
         if not ctx_win or not used:
             return
