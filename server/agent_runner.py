@@ -185,17 +185,28 @@ class _RunContext:
             "model_usage": task.model_usage,
         })
 
-        await self._maybe_warn_compact_pending(task, model)
+        await self._maybe_warn_compact_pending(task, model, input_tokens, context_window)
 
-    async def _maybe_warn_compact_pending(self, task, model: str) -> None:
-        """Emit a one-shot '即将压缩' notice when context usage crosses the threshold."""
+    async def _maybe_warn_compact_pending(
+        self,
+        task,
+        model: str,
+        current_input_tokens: int,
+        current_context_window: int,
+    ) -> None:
+        """Emit a one-shot '即将压缩' notice when THIS turn's context usage crosses the threshold.
+
+        Must use the current turn's input tokens, not the cumulative model total —
+        the cumulative sum grows unboundedly with turn count and would falsely trigger
+        even when the latest request is far below the compact threshold.
+        """
         if self.task_id in self._runner._compact_warned:
             return
-        mu = task.model_usage.get(model) if model else None
-        if not mu:
+        if not model:
             return
-        ctx_win = mu.get("contextWindow", 0)
-        used = mu.get("inputTokens", 0)
+        mu = task.model_usage.get(model) or {}
+        ctx_win = current_context_window or mu.get("contextWindow", 0)
+        used = current_input_tokens
         if not ctx_win or not used:
             return
         ratio = used / ctx_win
