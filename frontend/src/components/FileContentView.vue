@@ -14,6 +14,12 @@
         :title="wordWrap ? '关闭自动换行' : '开启自动换行'"
         @click="wordWrap = !wordWrap"
       >⇌</button>
+      <a
+        :href="downloadUrl"
+        :download="fileName"
+        class="text-gray-500 hover:text-gray-200 transition-colors flex-shrink-0 ml-1 px-1"
+        title="下载文件"
+      >⬇</a>
       <button
         class="text-gray-600 hover:text-gray-300 transition-colors flex-shrink-0 ml-1"
         title="Close preview"
@@ -139,6 +145,12 @@ const displaySize = computed(() => {
 const downloadUrl = computed(() =>
   `/api/agents/${props.agentId}/files/download?path=${encodeURIComponent(props.filePath)}`
 )
+
+const fileName = computed(() => {
+  const p = props.filePath || ''
+  const idx = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
+  return idx >= 0 ? p.slice(idx + 1) : p
+})
 
 async function loadContent(force = false) {
   // Images: rendered via <img> directly
