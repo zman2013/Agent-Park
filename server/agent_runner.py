@@ -34,9 +34,13 @@ DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 
 # Ratio of context window usage that triggers an early "即将压缩" warning.
-# cco auto-compact typically fires around ~88%; warn a bit earlier to give
-# the user visibility before the long compact pause begins.
-COMPACT_WARN_RATIO = 0.82
+# cco auto-compact actually fires at ~84% based on its own preTokens accounting
+# (system prompt + tool schemas + history + attachments), which typically runs
+# ~2-3% higher than the per-turn `input_tokens + cache_*` that this proxy sees.
+# We warn at 78% so the heads-up lands before compact triggers — observed cases
+# where per-turn in-sum peaked at 81.96% while cco still triggered compact next
+# turn, slipping past an 82% threshold.
+COMPACT_WARN_RATIO = 0.78
 
 # Fallback context window used when the per-turn `message.usage` does not
 # carry `context_window`. Claude Code's stream chunks sometimes only include
