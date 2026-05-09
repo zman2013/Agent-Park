@@ -335,6 +335,31 @@ class _RunContext:
                 merged_model_usage[_model] = mu
         task.model_usage = merged_model_usage
 
+        # Backfill per-message usage.context_window for any earlier turn whose
+        # assistant chunk omitted it (cco often only emits the authoritative
+        # window in this final result chunk). Without this, the per-message
+        # badge would persist `context_window: 0` and lose the `/window (%)`
+        # display for the very turns this feature is meant to cover.
+        from server.routes_ws import broadcast
+        for msg in task.messages:
+            u = getattr(msg, "usage", None)
+            if not u or u.get("context_window"):
+                continue
+            model_name = u.get("model") or ""
+            backfilled_win = (
+                merged_model_usage.get(model_name, {}).get("contextWindow", 0)
+                or task.context_window
+            )
+            if not backfilled_win:
+                continue
+            u["context_window"] = backfilled_win
+            await broadcast({
+                "type": "message_usage",
+                "task_id": self.task_id,
+                "message_id": msg.id,
+                "usage": u,
+            })
+
     # ── task finish (called by adapter for result-bearing protocols) ────
 
     async def finish(
