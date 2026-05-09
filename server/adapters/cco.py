@@ -189,14 +189,22 @@ class CcoAdapter(BaseAdapter):
             await ctx.close_message(cur.id)
         self._current_msg = None
 
-        # Fix up server-side message content from authoritative assistant chunk
-        text_msgs = [m for m in task.messages if m.role == "agent" and m.type == "text"]
-        tool_msgs = [m for m in task.messages if m.role == "agent" and m.type == "tool_use"]
+        # Fix up server-side message content from authoritative assistant chunk.
+        # The streaming handler has already created one message per content
+        # block in this chunk; those messages sit at the TAIL of task.messages,
+        # so slice from the tail to map content_blocks back to the messages
+        # produced by THIS chunk (not all historical ones).
+        text_count = sum(1 for b in content_blocks if b.get("type") == "text")
+        tool_count = sum(1 for b in content_blocks if b.get("type") == "tool_use")
+        all_text = [m for m in task.messages if m.role == "agent" and m.type == "text"]
+        all_tool = [m for m in task.messages if m.role == "agent" and m.type == "tool_use"]
+        text_msgs = all_text[-text_count:] if text_count else []
+        tool_msgs = all_tool[-tool_count:] if tool_count else []
         text_idx = 0
         tool_idx = 0
         # Track the last message produced by THIS assistant chunk so the
         # per-turn usage badge attaches to the current turn's message rather
-        # than scanning back into older turns.
+        # than the oldest historical one.
         turn_last_msg = None
 
         for block in content_blocks:
@@ -204,6 +212,7 @@ class CcoAdapter(BaseAdapter):
             if btype == "text":
                 full_text = block.get("text", "")
                 if not full_text:
+                    text_idx += 1
                     continue
                 if text_idx < len(text_msgs):
                     text_msgs[text_idx].content = full_text
