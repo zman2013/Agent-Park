@@ -26,6 +26,11 @@ class CodexAdapter(BaseAdapter):
     def __init__(self) -> None:
         # Track the currently streaming tool_use message for command_execution
         self._current_tool_msg: Message | None = None
+        # Number of task.messages observed when the current turn started.
+        # Used to scope per-turn usage attachment so it never bleeds into
+        # earlier turns (e.g. when the current turn produces only ignored
+        # item types and has no fresh agent_message/command_execution).
+        self._turn_start_msg_count: int | None = None
 
     # ── build_args ──────────────────────────────────────────────────────
 
@@ -69,7 +74,7 @@ class CodexAdapter(BaseAdapter):
             return
 
         if chunk_type == "turn.started":
-            # No action needed
+            await self._handle_turn_started(chunk, ctx)
             return
 
         if chunk_type == "item.started":
@@ -129,6 +134,16 @@ class CodexAdapter(BaseAdapter):
                     "agent", "text", text, streaming=False,
                 )
 
+    # ── turn.started ────────────────────────────────────────────────────
+
+    async def _handle_turn_started(self, chunk: dict, ctx: ChunkContext) -> None:
+        from server.state import app_state
+
+        task = app_state.get_task(ctx.task_id)
+        # Snapshot the message count so turn.completed can constrain its
+        # reverse search to messages produced by THIS turn.
+        self._turn_start_msg_count = len(task.messages) if task else 0
+
     # ── turn.completed ──────────────────────────────────────────────────
 
     async def _handle_turn_completed(self, chunk: dict, ctx: ChunkContext) -> None:
@@ -136,20 +151,25 @@ class CodexAdapter(BaseAdapter):
 
         usage = chunk.get("usage", {})
         if not usage:
+            self._turn_start_msg_count = None
             return
         in_tok = usage.get("input_tokens", 0)
         out_tok = usage.get("output_tokens", 0)
         model = usage.get("model", "")
         await ctx.update_tokens(in_tok, out_tok, model=model)
 
-        # Attach usage to the LAST agent message of this turn so the
-        # frontend can render a per-message usage badge. codex does not
-        # report context_window — pass 0 and let the UI render best-effort.
+        # Attach usage to the LAST agent message PRODUCED BY THIS TURN.
+        # If the turn produced no eligible messages (e.g. it only emitted
+        # ignored item types like file_changes/reasoning), skip attachment
+        # rather than overwriting an earlier turn's badge.
         task = app_state.get_task(ctx.task_id)
         if task is None:
+            self._turn_start_msg_count = None
             return
+        turn_start = self._turn_start_msg_count or 0
+        self._turn_start_msg_count = None
         last_msg = None
-        for m in reversed(task.messages):
+        for m in reversed(task.messages[turn_start:]):
             if m.role == "agent" and m.type in ("text", "tool_use"):
                 last_msg = m
                 break
@@ -167,3 +187,4 @@ class CodexAdapter(BaseAdapter):
     def reset(self) -> None:
         """Clear internal state between sessions."""
         self._current_tool_msg = None
+        self._turn_start_msg_count = None
