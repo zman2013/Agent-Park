@@ -27,6 +27,13 @@
         </template>
       </template>
       <button
+        @click="triggerCompact"
+        class="ml-3 text-gray-600 hover:text-yellow-300 transition-colors px-1"
+        title="发送 /compact 指令压缩上下文"
+        :disabled="task.status === 'running'"
+        :class="{ 'opacity-40 cursor-not-allowed': task.status === 'running' }"
+      >压缩上下文</button>
+      <button
         @click="copyConversation"
         class="ml-3 text-gray-600 hover:text-gray-300 transition-colors px-1"
         title="复制全部对话（排除工具交互）"
@@ -277,5 +284,16 @@ async function copyConversation() {
   } catch {
     store.addToast('复制失败', 'error')
   }
+}
+
+function triggerCompact() {
+  if (props.task.status === 'running') {
+    store.addToast('任务进行中，无法压缩', 'warning')
+    return
+  }
+  window.dispatchEvent(new CustomEvent('trigger-compact', {
+    detail: { taskId: props.task.id }
+  }))
+  store.addToast('已发送 /compact 指令', 'info')
 }
 </script>

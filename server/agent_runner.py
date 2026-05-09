@@ -40,6 +40,8 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 # We warn at 78% so the heads-up lands before compact triggers — observed cases
 # where per-turn in-sum peaked at 81.96% while cco still triggered compact next
 # turn, slipping past an 82% threshold.
+#
+# Default kept here as fallback; runtime values come from config.compact.
 COMPACT_WARN_RATIO = 0.78
 
 # Fallback context window used when the per-turn `message.usage` does not
@@ -241,9 +243,16 @@ class _RunContext:
         Must use the current turn's input tokens, not the cumulative model total —
         the cumulative sum grows unboundedly with turn count and would falsely trigger
         even when the latest request is far below the compact threshold.
+
+        Also marks `_compact_pending` when the auto-compact threshold is crossed,
+        so the runner can dispatch `/compact` after the current turn finishes.
         """
-        if self.task_id in self._runner._compact_warned:
-            return
+        from server.config import compact_config
+        cfg = compact_config()
+        warn_ratio = cfg["warn_ratio"]
+        auto_ratio = cfg["auto_compact_ratio"]
+        auto_enabled = cfg["auto_compact_enabled"]
+
         if not model:
             return
         mu = task.model_usage.get(model) or {}
@@ -265,7 +274,17 @@ class _RunContext:
         if not ctx_win or not used:
             return
         ratio = used / ctx_win
-        if ratio < COMPACT_WARN_RATIO:
+
+        # Auto-compact: latch a pending flag when ratio crosses the auto threshold.
+        # The actual /compact dispatch happens after finish() returns control,
+        # so we don't interrupt the in-flight turn.
+        if auto_enabled and ratio >= auto_ratio:
+            self._runner._compact_pending.add(self.task_id)
+
+        # Warning notification (one-shot per compact cycle).
+        if self.task_id in self._runner._compact_warned:
+            return
+        if ratio < warn_ratio:
             return
         self._runner._compact_warned.add(self.task_id)
         pct = ratio * 100
@@ -278,6 +297,7 @@ class _RunContext:
     async def reset_compact_warning(self) -> None:
         """Called by adapters after a compact_boundary so the next round can warn again."""
         self._runner._compact_warned.discard(self.task_id)
+        self._runner._compact_pending.discard(self.task_id)
 
     async def apply_authoritative_usage(
         self,
@@ -503,6 +523,21 @@ class _RunContext:
 
         await self._runner._finish_task(self.task_id, status)
 
+        # Auto-compact: if this turn crossed the auto-compact threshold and the
+        # turn finished cleanly, dispatch `/compact` as the next user input.
+        # The cco harness intercepts /compact and runs the compact procedure
+        # itself, after which a `compact_boundary` chunk clears the pending
+        # flag. We skip on errors (errors path already returned upstream when
+        # session-renewed) so a failed turn doesn't immediately retry-as-compact.
+        # On the skipped path we still clear the pending flag so the next
+        # successful turn doesn't inherit a stale /compact dispatch (e.g. after
+        # a session-expired error clears the session and the user starts a
+        # fresh low-context turn).
+        await self._runner.maybe_dispatch_auto_compact(
+            self.task_id,
+            success=(status == TaskStatus.success and not errors),
+        )
+
 
 class AgentRunner:
     def __init__(self) -> None:
@@ -514,6 +549,7 @@ class AgentRunner:
         self._resuming: set[str] = set()          # task_ids being killed for resume
         self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
         self._compact_warned: set[str] = set()    # task_ids that already got a compact warning this round
+        self._compact_pending: set[str] = set()   # task_ids slated to receive an auto /compact after this turn
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
@@ -727,6 +763,41 @@ class AgentRunner:
             object.__setattr__(task, "subprocess_start_time", None)
             app_state.save_agent_tasks(task.agent_id)
 
+    async def maybe_dispatch_auto_compact(self, task_id: str, *, success: bool) -> None:
+        """Dispatch `/compact` as next input if this turn crossed the auto-compact threshold.
+
+        Called from every turn-completion path so the behavior works regardless
+        of adapter (cco's result-chunk path via _RunContext.finish, or
+        codex-style pipe/pty modes that finish on subprocess exit).
+
+        Always clears `_compact_pending` so a failed turn does not leave a
+        stale flag that would trigger /compact on the next unrelated success.
+        """
+        if task_id not in self._compact_pending:
+            return
+        self._compact_pending.discard(task_id)
+        if not success:
+            return
+        from server.routes_ws import broadcast
+        task = app_state.get_task(task_id)
+        if task:
+            notice = Message(
+                role="agent",
+                type="system",
+                streaming=False,
+                content="🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…",
+            )
+            task.messages.append(notice)
+            await broadcast({
+                "type": "message",
+                "task_id": task_id,
+                "message": notice.model_dump(),
+            })
+        await self.send_input(task_id, "/compact", kill_existing=False)
+        # Yield so the new run claims ownership before any pending
+        # finally-block cleanup in the just-finished subprocess fires.
+        await asyncio.sleep(0)
+
     # ── PTY mode (cco/ccs) ──────────────────────────────────────────────
 
     async def _run_pty_mode(
@@ -810,9 +881,13 @@ class AgentRunner:
 
             # Skip if this run no longer owns the task (replaced by auto-resume)
             if self._run_ids.get(task_id) == run_id:
-                await self._finish_task(
-                    task_id,
-                    TaskStatus.success if returncode == 0 else TaskStatus.failed,
+                status = TaskStatus.success if returncode == 0 else TaskStatus.failed
+                await self._finish_task(task_id, status)
+                # Adapters that finish via _RunContext.finish (cco) handle
+                # auto-compact dispatch themselves; this branch covers PTY
+                # adapters that don't, and is a no-op when the flag isn't set.
+                await self.maybe_dispatch_auto_compact(
+                    task_id, success=(status == TaskStatus.success),
                 )
 
     # ── Pipe mode (codex) ───────────────────────────────────────────────
@@ -869,9 +944,13 @@ class AgentRunner:
 
         # Skip if this run no longer owns the task (replaced by auto-resume)
         if self._run_ids.get(task_id) == run_id:
-            await self._finish_task(
-                task_id,
-                TaskStatus.success if returncode == 0 else TaskStatus.failed,
+            status = TaskStatus.success if returncode == 0 else TaskStatus.failed
+            await self._finish_task(task_id, status)
+            # Pipe-mode adapters (codex) never call _RunContext.finish, so
+            # dispatch /compact here when the auto-compact threshold fired
+            # mid-turn via update_tokens.
+            await self.maybe_dispatch_auto_compact(
+                task_id, success=(status == TaskStatus.success),
             )
 
     # ── shared JSON line reader ─────────────────────────────────────────
@@ -1074,6 +1153,7 @@ class AgentRunner:
         compact-warning one-shot flag to survive normal resumes.
         """
         self._compact_warned.discard(task_id)
+        self._compact_pending.discard(task_id)
 
     # ── orphan task restore ─────────────────────────────────────────────
 

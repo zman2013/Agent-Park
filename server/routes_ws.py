@@ -340,6 +340,41 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
 
         await runner.send_input(task_id, content)
 
+    elif msg_type == "trigger_compact":
+        task_id = data.get("task_id", "")
+        task = app_state.get_task(task_id)
+        if not task:
+            return
+        from server.models import Message, TaskStatus
+        from server.agent_runner import runner
+
+        # Reject /compact while the agent is running. Without this guard a
+        # stale tab, a duplicated click before the status update lands, or a
+        # crafted WS message could send /compact while the agent is still
+        # running, killing the in-flight turn and replacing it with /compact.
+        # Idle statuses (waiting/success/failed) are all acceptable since the
+        # frontend button only disables on `running`.
+        if task.status == TaskStatus.running:
+            return
+
+        # Notify the user via a system bubble; '/compact' itself is not stored
+        # as a user message so the chat stays clean.
+        notice = Message(
+            role="agent",
+            type="system",
+            streaming=False,
+            content="🤖 已发送 /compact 指令，正在压缩上下文…",
+        )
+        task.messages.append(notice)
+        app_state.save_agent_tasks(task.agent_id)
+        await broadcast({
+            "type": "message",
+            "task_id": task_id,
+            "message": notice.model_dump(),
+        })
+        runner._compact_pending.discard(task_id)
+        await runner.send_input(task_id, "/compact")
+
     elif msg_type == "fork_task":
         source_task_id = data.get("task_id", "")
         source_task = app_state.get_task(source_task_id)
