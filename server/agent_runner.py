@@ -533,20 +533,10 @@ class _RunContext:
         # successful turn doesn't inherit a stale /compact dispatch (e.g. after
         # a session-expired error clears the session and the user starts a
         # fresh low-context turn).
-        if self.task_id in self._runner._compact_pending:
-            self._runner._compact_pending.discard(self.task_id)
-            if status == TaskStatus.success and not errors:
-                await self.send_system_notice(
-                    "🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…"
-                )
-                await self._runner.send_input(
-                    self.task_id,
-                    "/compact",
-                    kill_existing=False,
-                )
-                # Yield so the new run claims ownership before the finally block
-                # in _run_subprocess fires _cleanup_run_resources.
-                await asyncio.sleep(0)
+        await self._runner.maybe_dispatch_auto_compact(
+            self.task_id,
+            success=(status == TaskStatus.success and not errors),
+        )
 
 
 class AgentRunner:
@@ -773,6 +763,41 @@ class AgentRunner:
             object.__setattr__(task, "subprocess_start_time", None)
             app_state.save_agent_tasks(task.agent_id)
 
+    async def maybe_dispatch_auto_compact(self, task_id: str, *, success: bool) -> None:
+        """Dispatch `/compact` as next input if this turn crossed the auto-compact threshold.
+
+        Called from every turn-completion path so the behavior works regardless
+        of adapter (cco's result-chunk path via _RunContext.finish, or
+        codex-style pipe/pty modes that finish on subprocess exit).
+
+        Always clears `_compact_pending` so a failed turn does not leave a
+        stale flag that would trigger /compact on the next unrelated success.
+        """
+        if task_id not in self._compact_pending:
+            return
+        self._compact_pending.discard(task_id)
+        if not success:
+            return
+        from server.routes_ws import broadcast
+        task = app_state.get_task(task_id)
+        if task:
+            notice = Message(
+                role="agent",
+                type="system",
+                streaming=False,
+                content="🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…",
+            )
+            task.messages.append(notice)
+            await broadcast({
+                "type": "message",
+                "task_id": task_id,
+                "message": notice.model_dump(),
+            })
+        await self.send_input(task_id, "/compact", kill_existing=False)
+        # Yield so the new run claims ownership before any pending
+        # finally-block cleanup in the just-finished subprocess fires.
+        await asyncio.sleep(0)
+
     # ── PTY mode (cco/ccs) ──────────────────────────────────────────────
 
     async def _run_pty_mode(
@@ -856,9 +881,13 @@ class AgentRunner:
 
             # Skip if this run no longer owns the task (replaced by auto-resume)
             if self._run_ids.get(task_id) == run_id:
-                await self._finish_task(
-                    task_id,
-                    TaskStatus.success if returncode == 0 else TaskStatus.failed,
+                status = TaskStatus.success if returncode == 0 else TaskStatus.failed
+                await self._finish_task(task_id, status)
+                # Adapters that finish via _RunContext.finish (cco) handle
+                # auto-compact dispatch themselves; this branch covers PTY
+                # adapters that don't, and is a no-op when the flag isn't set.
+                await self.maybe_dispatch_auto_compact(
+                    task_id, success=(status == TaskStatus.success),
                 )
 
     # ── Pipe mode (codex) ───────────────────────────────────────────────
@@ -915,9 +944,13 @@ class AgentRunner:
 
         # Skip if this run no longer owns the task (replaced by auto-resume)
         if self._run_ids.get(task_id) == run_id:
-            await self._finish_task(
-                task_id,
-                TaskStatus.success if returncode == 0 else TaskStatus.failed,
+            status = TaskStatus.success if returncode == 0 else TaskStatus.failed
+            await self._finish_task(task_id, status)
+            # Pipe-mode adapters (codex) never call _RunContext.finish, so
+            # dispatch /compact here when the auto-compact threshold fired
+            # mid-turn via update_tokens.
+            await self.maybe_dispatch_auto_compact(
+                task_id, success=(status == TaskStatus.success),
             )
 
     # ── shared JSON line reader ─────────────────────────────────────────
