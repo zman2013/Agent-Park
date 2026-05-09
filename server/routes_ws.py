@@ -345,8 +345,15 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         task = app_state.get_task(task_id)
         if not task:
             return
-        from server.models import Message
+        from server.models import Message, TaskStatus
         from server.agent_runner import runner
+
+        # Only accept /compact when the task is idle. Without this guard a
+        # stale tab, a duplicated click before the status update lands, or a
+        # crafted WS message could send /compact while the agent is still
+        # running, killing the in-flight turn and replacing it with /compact.
+        if task.status != TaskStatus.waiting:
+            return
 
         # Notify the user via a system bubble; '/compact' itself is not stored
         # as a user message so the chat stays clean.

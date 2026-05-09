@@ -543,6 +543,9 @@ class _RunContext:
                 "/compact",
                 kill_existing=False,
             )
+            # Yield so the new run claims ownership before the finally block
+            # in _run_subprocess fires _cleanup_run_resources.
+            await asyncio.sleep(0)
 
 
 class AgentRunner:
