@@ -23,6 +23,12 @@
       >
         复制
       </button>
+      <div
+        v-if="usageBadge"
+        class="mt-1 text-[11px] font-mono"
+        :class="usageBadgeColor"
+        :title="usageTooltip"
+      >{{ usageBadge }}</div>
     </div>
 
     <!-- Tool use: show tool name + collapsible params -->
@@ -49,6 +55,12 @@
       >
         复制
       </button>
+      <div
+        v-if="usageBadge"
+        class="mt-1 text-[11px] font-mono"
+        :class="usageBadgeColor"
+        :title="usageTooltip"
+      >{{ usageBadge }}</div>
     </div>
 
     <!-- Tool result: show collapsible output -->
