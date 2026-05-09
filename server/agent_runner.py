@@ -198,6 +198,37 @@ class _RunContext:
 
         await self._maybe_warn_compact_pending(task, model, input_tokens, context_window)
 
+    async def attach_usage(
+        self,
+        message_id: str,
+        usage: dict,
+    ) -> None:
+        """Attach per-turn LLM usage to a specific message and broadcast it.
+
+        Adapters call this on the LAST agent message of each turn so the
+        frontend can render a per-message usage badge. Silently no-ops when
+        the message is no longer present (e.g. task deleted mid-stream).
+        """
+        from server.routes_ws import broadcast
+
+        task = app_state.get_task(self.task_id)
+        if not task:
+            return
+        target = None
+        for m in task.messages:
+            if m.id == message_id:
+                target = m
+                break
+        if target is None:
+            return
+        target.usage = usage
+        await broadcast({
+            "type": "message_usage",
+            "task_id": self.task_id,
+            "message_id": message_id,
+            "usage": usage,
+        })
+
     async def _maybe_warn_compact_pending(
         self,
         task,

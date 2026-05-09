@@ -191,6 +191,10 @@ export function useWebSocket() {
         store.markMessageDone(data.task_id, data.message_id)
         break
 
+      case 'message_usage':
+        store.setMessageUsage(data.task_id, data.message_id, data.usage)
+        break
+
       case 'turns_info':
         store.updateTaskTurns(data.task_id, data.num_turns, {
           total_input_tokens: data.total_input_tokens,

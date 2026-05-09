@@ -132,12 +132,35 @@ class CodexAdapter(BaseAdapter):
     # ── turn.completed ──────────────────────────────────────────────────
 
     async def _handle_turn_completed(self, chunk: dict, ctx: ChunkContext) -> None:
+        from server.state import app_state
+
         usage = chunk.get("usage", {})
-        if usage:
-            in_tok = usage.get("input_tokens", 0)
-            out_tok = usage.get("output_tokens", 0)
-            model = usage.get("model", "")
-            await ctx.update_tokens(in_tok, out_tok, model=model)
+        if not usage:
+            return
+        in_tok = usage.get("input_tokens", 0)
+        out_tok = usage.get("output_tokens", 0)
+        model = usage.get("model", "")
+        await ctx.update_tokens(in_tok, out_tok, model=model)
+
+        # Attach usage to the LAST agent message of this turn so the
+        # frontend can render a per-message usage badge. codex does not
+        # report context_window — pass 0 and let the UI render best-effort.
+        task = app_state.get_task(ctx.task_id)
+        if task is None:
+            return
+        last_msg = None
+        for m in reversed(task.messages):
+            if m.role == "agent" and m.type in ("text", "tool_use"):
+                last_msg = m
+                break
+        if last_msg is None:
+            return
+        await ctx.attach_usage(last_msg.id, {
+            "input_tokens": in_tok,
+            "output_tokens": out_tok,
+            "context_window": 0,
+            "model": model,
+        })
 
     # ── cleanup ─────────────────────────────────────────────────────────
 

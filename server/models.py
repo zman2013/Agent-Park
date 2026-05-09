@@ -31,6 +31,12 @@ class Message(BaseModel):
     content: str = ""
     tool_name: str = ""
     streaming: bool = False
+    # Per-turn LLM usage at the moment this message was finalized.
+    # Only set on the LAST agent message of a turn. Shape:
+    #   {"input_tokens": int, "output_tokens": int,
+    #    "context_window": int, "model": str}
+    # context_window may be 0 when the protocol does not expose it (codex).
+    usage: dict | None = None
 
 
 class Task(BaseModel):

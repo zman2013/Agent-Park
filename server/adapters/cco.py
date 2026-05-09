@@ -226,6 +226,35 @@ class CcoAdapter(BaseAdapter):
             ctx_win = turn_usage.get("context_window", 0)
             await ctx.update_tokens(in_tok, out_tok, model=turn_model, context_window=ctx_win)
 
+            # Attach usage to the LAST agent message of this turn — prefer
+            # the last text message; fall back to the last tool_use if the
+            # turn produced no text.
+            last_msg = None
+            for m in reversed(task.messages):
+                if m.role == "agent" and m.type == "text":
+                    last_msg = m
+                    break
+            if last_msg is None:
+                for m in reversed(task.messages):
+                    if m.role == "agent" and m.type == "tool_use":
+                        last_msg = m
+                        break
+            if last_msg is not None:
+                # Fall back to task-level context_window when this turn's
+                # usage lacks it (cco's assistant chunk often omits it and
+                # only the final result chunk carries the full window).
+                effective_ctx_win = (
+                    ctx_win
+                    or task.context_window
+                    or task.model_usage.get(turn_model, {}).get("contextWindow", 0)
+                )
+                await ctx.attach_usage(last_msg.id, {
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "context_window": effective_ctx_win,
+                    "model": turn_model,
+                })
+
         app_state.save_agent_tasks(task.agent_id)
 
     # ── user (tool_result) ──────────────────────────────────────────────

@@ -48,6 +48,20 @@ class ChunkContext(Protocol):
         context_window: int = 0,
     ) -> None: ...
 
+    async def attach_usage(
+        self,
+        message_id: str,
+        usage: dict,
+    ) -> None:
+        """Attach per-turn LLM usage to a specific message.
+
+        Called by adapters on the LAST agent message of each turn. The
+        frontend renders this as a per-message usage badge. usage shape:
+            {"input_tokens": int, "output_tokens": int,
+             "context_window": int, "model": str}
+        """
+        ...
+
     async def apply_authoritative_usage(
         self,
         model_usage: dict[str, dict],
