@@ -274,14 +274,23 @@ export function useWebSocket() {
     send({ type: 'generate_summary', agent_id: agentId, date_range: dateRange })
   }
 
+  function triggerCompact(taskId) {
+    send({ type: 'trigger_compact', task_id: taskId })
+  }
+
   function onGenerateSummaryEvent(e) {
     generateSummary(e.detail.agentId, e.detail.dateRange || 'recent_n')
+  }
+
+  function onTriggerCompactEvent(e) {
+    triggerCompact(e.detail.taskId)
   }
 
   onMounted(() => {
     disposed = false
     connect()
     window.addEventListener('generate-summary', onGenerateSummaryEvent)
+    window.addEventListener('trigger-compact', onTriggerCompactEvent)
   })
 
   onUnmounted(() => {
@@ -291,6 +300,7 @@ export function useWebSocket() {
     clearHeartbeatTimer()
     connected.value = false
     window.removeEventListener('generate-summary', onGenerateSummaryEvent)
+    window.removeEventListener('trigger-compact', onTriggerCompactEvent)
     if (ws) {
       const socket = ws
       ws = null
@@ -307,5 +317,6 @@ export function useWebSocket() {
     sendUserMessage,
     forkTask,
     generateSummary,
+    triggerCompact,
   }
 }

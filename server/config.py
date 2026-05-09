@@ -47,6 +47,16 @@ def memory_config() -> dict:
     }
 
 
+def compact_config() -> dict:
+    """Return the compact (auto-trigger / warning) configuration with defaults."""
+    cfg = get_config().get("compact", {})
+    return {
+        "warn_ratio": float(cfg.get("warn_ratio", 0.78)),
+        "auto_compact_ratio": float(cfg.get("auto_compact_ratio", 0.85)),
+        "auto_compact_enabled": bool(cfg.get("auto_compact_enabled", True)),
+    }
+
+
 def knowledge_config() -> dict:
     """Return the knowledge summary configuration with defaults."""
     cfg = get_config().get("knowledge", {})

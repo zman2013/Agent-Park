@@ -10,6 +10,12 @@
     "command": "your-memory-command",
     "max_lines": 200
   },
+  "compact": {
+    "_comment": "上下文水位阈值（0-1）。超过 warn_ratio 发送预警通知；超过 auto_compact_ratio 且 auto_compact_enabled=true 时，当前 turn 结束后自动发送 /compact 指令。",
+    "warn_ratio": 0.78,
+    "auto_compact_ratio": 0.85,
+    "auto_compact_enabled": true
+  },
   "knowledge": {
     "enabled": true,
     "command": "your-knowledge-command",
