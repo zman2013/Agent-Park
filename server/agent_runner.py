@@ -529,23 +529,24 @@ class _RunContext:
         # itself, after which a `compact_boundary` chunk clears the pending
         # flag. We skip on errors (errors path already returned upstream when
         # session-renewed) so a failed turn doesn't immediately retry-as-compact.
-        if (
-            status == TaskStatus.success
-            and self.task_id in self._runner._compact_pending
-            and not errors
-        ):
+        # On the skipped path we still clear the pending flag so the next
+        # successful turn doesn't inherit a stale /compact dispatch (e.g. after
+        # a session-expired error clears the session and the user starts a
+        # fresh low-context turn).
+        if self.task_id in self._runner._compact_pending:
             self._runner._compact_pending.discard(self.task_id)
-            await self.send_system_notice(
-                "🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…"
-            )
-            await self._runner.send_input(
-                self.task_id,
-                "/compact",
-                kill_existing=False,
-            )
-            # Yield so the new run claims ownership before the finally block
-            # in _run_subprocess fires _cleanup_run_resources.
-            await asyncio.sleep(0)
+            if status == TaskStatus.success and not errors:
+                await self.send_system_notice(
+                    "🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…"
+                )
+                await self._runner.send_input(
+                    self.task_id,
+                    "/compact",
+                    kill_existing=False,
+                )
+                # Yield so the new run claims ownership before the finally block
+                # in _run_subprocess fires _cleanup_run_resources.
+                await asyncio.sleep(0)
 
 
 class AgentRunner:
