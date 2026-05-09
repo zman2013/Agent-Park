@@ -274,6 +274,15 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  function setMessageUsage(taskId, messageId, usage) {
+    const task = tasks.value[taskId]
+    if (!task) return
+    const msg = task.messages.find(m => m.id === messageId)
+    if (msg) {
+      msg.usage = usage
+    }
+  }
+
   function selectTask(taskId) {
     currentTaskId.value = taskId
     // Entering a task exits agentloop view
@@ -748,6 +757,7 @@ export const useAgentStore = defineStore('agent', () => {
     appendChunk,
     appendChunks,
     markMessageDone,
+    setMessageUsage,
     selectTask,
     toggleAgent,
     isCollapsed,

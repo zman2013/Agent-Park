@@ -23,6 +23,12 @@
       >
         复制
       </button>
+      <div
+        v-if="usageBadge"
+        class="mt-1 text-[11px] font-mono"
+        :class="usageBadgeColor"
+        :title="usageTooltip"
+      >{{ usageBadge }}</div>
     </div>
 
     <!-- Tool use: show tool name + collapsible params -->
@@ -49,6 +55,12 @@
       >
         复制
       </button>
+      <div
+        v-if="usageBadge"
+        class="mt-1 text-[11px] font-mono"
+        :class="usageBadgeColor"
+        :title="usageTooltip"
+      >{{ usageBadge }}</div>
     </div>
 
     <!-- Tool result: show collapsible output -->
@@ -112,6 +124,13 @@
         class="whitespace-pre-wrap"
       >{{ message.content }}</div>
       <div v-else class="whitespace-pre-wrap">{{ message.content }}</div>
+
+      <div
+        v-if="usageBadge"
+        class="mt-1 text-[11px] font-mono"
+        :class="usageBadgeColor"
+        :title="usageTooltip"
+      >{{ usageBadge }}</div>
 
       <button
         v-if="!message.streaming"
@@ -261,6 +280,53 @@ const contentPreview = computed(() => {
 })
 
 const toolDescription = computed(() => parsedToolInput.value?.description || '')
+
+function formatTokens(n) {
+  if (!n && n !== 0) return ''
+  if (n < 1000) return String(n)
+  if (n < 1000 * 1000) return `${(n / 1000).toFixed(1)}k`
+  return `${(n / 1_000_000).toFixed(2)}M`
+}
+
+const usageBadge = computed(() => {
+  const u = props.message.usage
+  if (!u || props.message.role !== 'agent' || props.message.streaming) return ''
+  const inTok = u.input_tokens || 0
+  const ctx = u.context_window || 0
+  if (!inTok) return ''
+  if (ctx) {
+    const pct = (inTok / ctx) * 100
+    return `ctx ${formatTokens(inTok)} / ${formatTokens(ctx)} (${pct.toFixed(0)}%)`
+  }
+  return `ctx ${formatTokens(inTok)}`
+})
+
+const usageRatio = computed(() => {
+  const u = props.message.usage
+  if (!u) return 0
+  const inTok = u.input_tokens || 0
+  const ctx = u.context_window || 0
+  if (!inTok || !ctx) return 0
+  return inTok / ctx
+})
+
+const usageBadgeColor = computed(() => {
+  const r = usageRatio.value
+  if (r >= 0.78) return 'text-red-400'
+  if (r >= 0.6) return 'text-yellow-400'
+  return 'text-gray-500'
+})
+
+const usageTooltip = computed(() => {
+  const u = props.message.usage
+  if (!u) return ''
+  const parts = []
+  if (u.model) parts.push(`model: ${u.model}`)
+  if (u.input_tokens) parts.push(`input: ${u.input_tokens.toLocaleString()}`)
+  if (u.output_tokens) parts.push(`output: ${u.output_tokens.toLocaleString()}`)
+  if (u.context_window) parts.push(`window: ${u.context_window.toLocaleString()}`)
+  return parts.join('\n')
+})
 
 function copyToClipboard(text) {
   if (navigator.clipboard && window.isSecureContext) {
