@@ -48,8 +48,10 @@ COMPACT_WARN_RATIO = 0.78
 # carry `context_window`. Claude Code's stream chunks sometimes only include
 # the full window in the final `result.modelUsage`, which means the FIRST
 # near-limit turn of a fresh session would otherwise silently skip the
-# warning. All current Claude 4.x models expose a 200k context window.
-_DEFAULT_CONTEXT_WINDOW = 200_000
+# warning. Default to 1M to match current Opus 4.x [1m] windows — a too-low
+# fallback caused false auto-compact triggers when the real window was 1M
+# but decision-time only saw the 200k default.
+_DEFAULT_CONTEXT_WINDOW = 1_000_000
 
 
 class _RunContext:
@@ -261,13 +263,24 @@ class _RunContext:
         #   2. previously-seen window for this model (from earlier update_tokens
         #      or apply_authoritative_usage seeding)
         #   3. task-level context_window (seeded by any prior turn/result)
-        #   4. DEFAULT — so we still warn on the first near-limit turn of a
+        #   4. ANY non-zero contextWindow in task.model_usage — cco's assistant
+        #      chunk reports model="claude-opus-4-7" while the authoritative
+        #      result chunk keys its modelUsage as "opus-4.7[1m]", so a direct
+        #      key lookup on step 2 misses the real 1M window.
+        #   5. DEFAULT — so we still warn on the first near-limit turn of a
         #      fresh session where only `message.usage` has arrived and it
         #      lacks context_window.
+        cross_model_ctx = 0
+        for _mu in task.model_usage.values():
+            cw = _mu.get("contextWindow", 0) if isinstance(_mu, dict) else 0
+            if cw:
+                cross_model_ctx = cw
+                break
         ctx_win = (
             current_context_window
             or mu.get("contextWindow", 0)
             or task.context_window
+            or cross_model_ctx
             or _DEFAULT_CONTEXT_WINDOW
         )
         used = current_input_tokens
