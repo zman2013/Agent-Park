@@ -48,8 +48,48 @@ COMPACT_WARN_RATIO = 0.78
 # carry `context_window`. Claude Code's stream chunks sometimes only include
 # the full window in the final `result.modelUsage`, which means the FIRST
 # near-limit turn of a fresh session would otherwise silently skip the
-# warning. All current Claude 4.x models expose a 200k context window.
+# warning. Default to 200k (safe lower bound for current Claude 4.x models):
+# overestimating to 1M would make 200k-window agents at 170k tokens compute
+# 17% instead of 85%, silently skipping the warning/compact on the exact
+# near-limit turn the fallback is meant to cover — and for codex-style usage
+# (no authoritative modelUsage ever arrives) the underestimate would persist.
 _DEFAULT_CONTEXT_WINDOW = 200_000
+
+# 1M-window variants (Opus 4.x [1m]) need a larger fallback so we don't
+# latch auto-compact on sub-threshold usage when only the per-turn usage
+# (which may lack context_window) has arrived. Match by:
+#   1. an explicit [1m] / -1m marker in the model name, OR
+#   2. a known 1M-default alias emitted by cco's assistant chunk.
+# cco's `assistant` chunk reports `model="claude-opus-4-7"` (no [1m] marker)
+# even when the authoritative modelUsage keys the same turn as
+# "opus-4.7[1m]" — without the alias list we would fall back to 200k and
+# latch auto-compact on the very first sub-threshold turn of a fresh cco
+# session, which is exactly the regression this patch is meant to cover.
+_LARGE_CONTEXT_WINDOW = 1_000_000
+_LARGE_WINDOW_MODEL_MARKERS = ("[1m]", "-1m")
+_LARGE_WINDOW_MODEL_ALIASES = (
+    "claude-opus-4-7",
+    "claude-opus-4.7",
+    "opus-4-7",
+    "opus-4.7",
+)
+
+
+def _infer_default_context_window(model: str) -> int:
+    """Return a reasonable context-window fallback given a model name.
+
+    Used only when no authoritative window has been observed yet. The goal
+    is to avoid both silent under-trigger (200k model reported as 1M) and
+    silent over-trigger (1M model reported as 200k).
+    """
+    if not model:
+        return _DEFAULT_CONTEXT_WINDOW
+    m = model.lower()
+    if any(marker in m for marker in _LARGE_WINDOW_MODEL_MARKERS):
+        return _LARGE_CONTEXT_WINDOW
+    if any(alias in m for alias in _LARGE_WINDOW_MODEL_ALIASES):
+        return _LARGE_CONTEXT_WINDOW
+    return _DEFAULT_CONTEXT_WINDOW
 
 
 class _RunContext:
@@ -261,14 +301,25 @@ class _RunContext:
         #   2. previously-seen window for this model (from earlier update_tokens
         #      or apply_authoritative_usage seeding)
         #   3. task-level context_window (seeded by any prior turn/result)
-        #   4. DEFAULT — so we still warn on the first near-limit turn of a
+        #   4. ANY non-zero contextWindow in task.model_usage — cco's assistant
+        #      chunk reports model="claude-opus-4-7" while the authoritative
+        #      result chunk keys its modelUsage as "opus-4.7[1m]", so a direct
+        #      key lookup on step 2 misses the real 1M window.
+        #   5. DEFAULT — so we still warn on the first near-limit turn of a
         #      fresh session where only `message.usage` has arrived and it
         #      lacks context_window.
+        cross_model_ctx = 0
+        for _mu in task.model_usage.values():
+            cw = _mu.get("contextWindow", 0) if isinstance(_mu, dict) else 0
+            if cw:
+                cross_model_ctx = cw
+                break
         ctx_win = (
             current_context_window
             or mu.get("contextWindow", 0)
             or task.context_window
-            or _DEFAULT_CONTEXT_WINDOW
+            or cross_model_ctx
+            or _infer_default_context_window(model)
         )
         used = current_input_tokens
         if not ctx_win or not used:
