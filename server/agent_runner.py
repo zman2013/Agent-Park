@@ -48,10 +48,34 @@ COMPACT_WARN_RATIO = 0.78
 # carry `context_window`. Claude Code's stream chunks sometimes only include
 # the full window in the final `result.modelUsage`, which means the FIRST
 # near-limit turn of a fresh session would otherwise silently skip the
-# warning. Default to 1M to match current Opus 4.x [1m] windows — a too-low
-# fallback caused false auto-compact triggers when the real window was 1M
-# but decision-time only saw the 200k default.
-_DEFAULT_CONTEXT_WINDOW = 1_000_000
+# warning. Default to 200k (safe lower bound for current Claude 4.x models):
+# overestimating to 1M would make 200k-window agents at 170k tokens compute
+# 17% instead of 85%, silently skipping the warning/compact on the exact
+# near-limit turn the fallback is meant to cover — and for codex-style usage
+# (no authoritative modelUsage ever arrives) the underestimate would persist.
+_DEFAULT_CONTEXT_WINDOW = 200_000
+
+# 1M-window variants (Opus 4.x [1m]) need a larger fallback so we don't
+# latch auto-compact on sub-threshold usage when only the per-turn usage
+# (which may lack context_window) has arrived. Match by substring against
+# the model name reported by the adapter.
+_LARGE_CONTEXT_WINDOW = 1_000_000
+_LARGE_WINDOW_MODEL_MARKERS = ("[1m]", "-1m")
+
+
+def _infer_default_context_window(model: str) -> int:
+    """Return a reasonable context-window fallback given a model name.
+
+    Used only when no authoritative window has been observed yet. The goal
+    is to avoid both silent under-trigger (200k model reported as 1M) and
+    silent over-trigger (1M model reported as 200k).
+    """
+    if not model:
+        return _DEFAULT_CONTEXT_WINDOW
+    m = model.lower()
+    if any(marker in m for marker in _LARGE_WINDOW_MODEL_MARKERS):
+        return _LARGE_CONTEXT_WINDOW
+    return _DEFAULT_CONTEXT_WINDOW
 
 
 class _RunContext:
@@ -281,7 +305,7 @@ class _RunContext:
             or mu.get("contextWindow", 0)
             or task.context_window
             or cross_model_ctx
-            or _DEFAULT_CONTEXT_WINDOW
+            or _infer_default_context_window(model)
         )
         used = current_input_tokens
         if not ctx_win or not used:
