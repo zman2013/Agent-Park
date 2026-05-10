@@ -57,10 +57,22 @@ _DEFAULT_CONTEXT_WINDOW = 200_000
 
 # 1M-window variants (Opus 4.x [1m]) need a larger fallback so we don't
 # latch auto-compact on sub-threshold usage when only the per-turn usage
-# (which may lack context_window) has arrived. Match by substring against
-# the model name reported by the adapter.
+# (which may lack context_window) has arrived. Match by:
+#   1. an explicit [1m] / -1m marker in the model name, OR
+#   2. a known 1M-default alias emitted by cco's assistant chunk.
+# cco's `assistant` chunk reports `model="claude-opus-4-7"` (no [1m] marker)
+# even when the authoritative modelUsage keys the same turn as
+# "opus-4.7[1m]" — without the alias list we would fall back to 200k and
+# latch auto-compact on the very first sub-threshold turn of a fresh cco
+# session, which is exactly the regression this patch is meant to cover.
 _LARGE_CONTEXT_WINDOW = 1_000_000
 _LARGE_WINDOW_MODEL_MARKERS = ("[1m]", "-1m")
+_LARGE_WINDOW_MODEL_ALIASES = (
+    "claude-opus-4-7",
+    "claude-opus-4.7",
+    "opus-4-7",
+    "opus-4.7",
+)
 
 
 def _infer_default_context_window(model: str) -> int:
@@ -74,6 +86,8 @@ def _infer_default_context_window(model: str) -> int:
         return _DEFAULT_CONTEXT_WINDOW
     m = model.lower()
     if any(marker in m for marker in _LARGE_WINDOW_MODEL_MARKERS):
+        return _LARGE_CONTEXT_WINDOW
+    if any(alias in m for alias in _LARGE_WINDOW_MODEL_ALIASES):
         return _LARGE_CONTEXT_WINDOW
     return _DEFAULT_CONTEXT_WINDOW
 
