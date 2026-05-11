@@ -58,11 +58,16 @@ def compact_config() -> dict:
       - Users generally care about "compact before the next turn costs too
         much" rather than a fraction of an opaque window that varies by
         model.
+
+    Defaults target the common 200k-window case (Claude Sonnet/Opus). They
+    roughly correspond to the previous ratio behaviour (warn ~78%, compact
+    ~85% of 200k). 1M-window users should override via ``config.json``
+    (e.g. ``warn_tokens: 820000`` / ``auto_compact_tokens: 880000``).
     """
     cfg = get_config().get("compact", {})
     return {
-        "warn_tokens": int(cfg.get("warn_tokens", 270_000)),
-        "auto_compact_tokens": int(cfg.get("auto_compact_tokens", 300_000)),
+        "warn_tokens": int(cfg.get("warn_tokens", 156_000)),
+        "auto_compact_tokens": int(cfg.get("auto_compact_tokens", 170_000)),
         "auto_compact_enabled": bool(cfg.get("auto_compact_enabled", True)),
     }
 
