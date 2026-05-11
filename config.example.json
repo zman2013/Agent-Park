@@ -11,9 +11,9 @@
     "max_lines": 200
   },
   "compact": {
-    "_comment": "上下文水位阈值（0-1）。超过 warn_ratio 发送预警通知；超过 auto_compact_ratio 且 auto_compact_enabled=true 时，当前 turn 结束后自动发送 /compact 指令。",
-    "warn_ratio": 0.78,
-    "auto_compact_ratio": 0.85,
+    "_comment": "压缩阈值（绝对 token 数，针对本轮 input_tokens + cache_read + cache_creation 求和）。超过 warn_tokens 发送预警通知；超过 auto_compact_tokens 且 auto_compact_enabled=true 时，当前 turn 结束后自动发送 /compact 指令。默认贴近 Sonnet/Opus 200k 窗口的 compact 触发点（≈78% / ≈85%）。1M 窗口模型请覆盖为例如 820000 / 880000。",
+    "warn_tokens": 156000,
+    "auto_compact_tokens": 170000,
     "auto_compact_enabled": true
   },
   "knowledge": {
