@@ -48,11 +48,21 @@ def memory_config() -> dict:
 
 
 def compact_config() -> dict:
-    """Return the compact (auto-trigger / warning) configuration with defaults."""
+    """Return the compact (auto-trigger / warning) configuration with defaults.
+
+    Thresholds are absolute token counts on the per-turn input
+    (input_tokens + cache_read + cache_creation). Ratio-based config was
+    removed because:
+      - cco's assistant chunk usually lacks ``context_window``, so ratio
+        decisions had to guess the window and mis-fired on 1M models.
+      - Users generally care about "compact before the next turn costs too
+        much" rather than a fraction of an opaque window that varies by
+        model.
+    """
     cfg = get_config().get("compact", {})
     return {
-        "warn_ratio": float(cfg.get("warn_ratio", 0.78)),
-        "auto_compact_ratio": float(cfg.get("auto_compact_ratio", 0.85)),
+        "warn_tokens": int(cfg.get("warn_tokens", 270_000)),
+        "auto_compact_tokens": int(cfg.get("auto_compact_tokens", 300_000)),
         "auto_compact_enabled": bool(cfg.get("auto_compact_enabled", True)),
     }
 

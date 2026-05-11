@@ -33,64 +33,6 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 
-# Ratio of context window usage that triggers an early "即将压缩" warning.
-# cco auto-compact actually fires at ~84% based on its own preTokens accounting
-# (system prompt + tool schemas + history + attachments), which typically runs
-# ~2-3% higher than the per-turn `input_tokens + cache_*` that this proxy sees.
-# We warn at 78% so the heads-up lands before compact triggers — observed cases
-# where per-turn in-sum peaked at 81.96% while cco still triggered compact next
-# turn, slipping past an 82% threshold.
-#
-# Default kept here as fallback; runtime values come from config.compact.
-COMPACT_WARN_RATIO = 0.78
-
-# Fallback context window used when the per-turn `message.usage` does not
-# carry `context_window`. Claude Code's stream chunks sometimes only include
-# the full window in the final `result.modelUsage`, which means the FIRST
-# near-limit turn of a fresh session would otherwise silently skip the
-# warning. Default to 200k (safe lower bound for current Claude 4.x models):
-# overestimating to 1M would make 200k-window agents at 170k tokens compute
-# 17% instead of 85%, silently skipping the warning/compact on the exact
-# near-limit turn the fallback is meant to cover — and for codex-style usage
-# (no authoritative modelUsage ever arrives) the underestimate would persist.
-_DEFAULT_CONTEXT_WINDOW = 200_000
-
-# 1M-window variants (Opus 4.x [1m]) need a larger fallback so we don't
-# latch auto-compact on sub-threshold usage when only the per-turn usage
-# (which may lack context_window) has arrived. Match by:
-#   1. an explicit [1m] / -1m marker in the model name, OR
-#   2. a known 1M-default alias emitted by cco's assistant chunk.
-# cco's `assistant` chunk reports `model="claude-opus-4-7"` (no [1m] marker)
-# even when the authoritative modelUsage keys the same turn as
-# "opus-4.7[1m]" — without the alias list we would fall back to 200k and
-# latch auto-compact on the very first sub-threshold turn of a fresh cco
-# session, which is exactly the regression this patch is meant to cover.
-_LARGE_CONTEXT_WINDOW = 1_000_000
-_LARGE_WINDOW_MODEL_MARKERS = ("[1m]", "-1m")
-_LARGE_WINDOW_MODEL_ALIASES = (
-    "claude-opus-4-7",
-    "claude-opus-4.7",
-    "opus-4-7",
-    "opus-4.7",
-)
-
-
-def _infer_default_context_window(model: str) -> int:
-    """Return a reasonable context-window fallback given a model name.
-
-    Used only when no authoritative window has been observed yet. The goal
-    is to avoid both silent under-trigger (200k model reported as 1M) and
-    silent over-trigger (1M model reported as 200k).
-    """
-    if not model:
-        return _DEFAULT_CONTEXT_WINDOW
-    m = model.lower()
-    if any(marker in m for marker in _LARGE_WINDOW_MODEL_MARKERS):
-        return _LARGE_CONTEXT_WINDOW
-    if any(alias in m for alias in _LARGE_WINDOW_MODEL_ALIASES):
-        return _LARGE_CONTEXT_WINDOW
-    return _DEFAULT_CONTEXT_WINDOW
-
 
 class _RunContext:
     """Implements ChunkContext — callback interface for adapters.
@@ -278,70 +220,51 @@ class _RunContext:
         current_input_tokens: int,
         current_context_window: int,
     ) -> None:
-        """Emit a one-shot '即将压缩' notice when THIS turn's context usage crosses the threshold.
+        """Emit a one-shot '即将压缩' notice when THIS turn's input tokens cross the threshold.
+
+        Uses absolute token counts (config.compact.warn_tokens /
+        auto_compact_tokens) rather than ratios against a context window.
+        Ratios were unreliable because cco's assistant chunk usually omits
+        ``context_window`` and model key names diverge between the assistant
+        chunk and the authoritative result chunk, so the ratio code had to
+        guess the window and mis-fired on 1M models.
 
         Must use the current turn's input tokens, not the cumulative model total —
         the cumulative sum grows unboundedly with turn count and would falsely trigger
         even when the latest request is far below the compact threshold.
 
-        Also marks `_compact_pending` when the auto-compact threshold is crossed,
-        so the runner can dispatch `/compact` after the current turn finishes.
+        Also marks ``_compact_pending`` when the auto-compact threshold is
+        crossed, so the runner can dispatch ``/compact`` after the current
+        turn finishes.
         """
         from server.config import compact_config
         cfg = compact_config()
-        warn_ratio = cfg["warn_ratio"]
-        auto_ratio = cfg["auto_compact_ratio"]
+        warn_tokens = cfg["warn_tokens"]
+        auto_tokens = cfg["auto_compact_tokens"]
         auto_enabled = cfg["auto_compact_enabled"]
 
         if not model:
             return
-        mu = task.model_usage.get(model) or {}
-        # Resolve ctx_win in preference order:
-        #   1. this turn's context_window (most accurate)
-        #   2. previously-seen window for this model (from earlier update_tokens
-        #      or apply_authoritative_usage seeding)
-        #   3. task-level context_window (seeded by any prior turn/result)
-        #   4. ANY non-zero contextWindow in task.model_usage — cco's assistant
-        #      chunk reports model="claude-opus-4-7" while the authoritative
-        #      result chunk keys its modelUsage as "opus-4.7[1m]", so a direct
-        #      key lookup on step 2 misses the real 1M window.
-        #   5. DEFAULT — so we still warn on the first near-limit turn of a
-        #      fresh session where only `message.usage` has arrived and it
-        #      lacks context_window.
-        cross_model_ctx = 0
-        for _mu in task.model_usage.values():
-            cw = _mu.get("contextWindow", 0) if isinstance(_mu, dict) else 0
-            if cw:
-                cross_model_ctx = cw
-                break
-        ctx_win = (
-            current_context_window
-            or mu.get("contextWindow", 0)
-            or task.context_window
-            or cross_model_ctx
-            or _infer_default_context_window(model)
-        )
         used = current_input_tokens
-        if not ctx_win or not used:
+        if not used:
             return
-        ratio = used / ctx_win
 
-        # Auto-compact: latch a pending flag when ratio crosses the auto threshold.
+        # Auto-compact: latch a pending flag when used tokens cross the auto threshold.
         # The actual /compact dispatch happens after finish() returns control,
         # so we don't interrupt the in-flight turn.
-        if auto_enabled and ratio >= auto_ratio:
+        if auto_enabled and auto_tokens and used >= auto_tokens:
             self._runner._compact_pending.add(self.task_id)
 
         # Warning notification (one-shot per compact cycle).
         if self.task_id in self._runner._compact_warned:
             return
-        if ratio < warn_ratio:
+        if not warn_tokens or used < warn_tokens:
             return
         self._runner._compact_warned.add(self.task_id)
-        pct = ratio * 100
         notice = (
-            f"⚠️ 上下文接近上限（{model} 使用 {used:,}/{ctx_win:,} tokens, {pct:.1f}%），"
-            "下一轮可能触发自动压缩（compact），期间可能有较长时间无输出。"
+            f"⚠️ 上下文接近压缩阈值（{model} 本轮使用 {used:,} tokens，"
+            f"阈值 {warn_tokens:,}），下一轮可能触发自动压缩（compact），"
+            "期间可能有较长时间无输出。"
         )
         await self.send_system_notice(notice)
 
