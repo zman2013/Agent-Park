@@ -388,6 +388,11 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
 
         await runner.kill_task(task_id)
 
+        # Clear any pending auto-compact flag set during this turn. Without
+        # this, a follow-up successful turn in the same task would inherit
+        # the stale flag and unexpectedly auto-send /compact.
+        await runner.maybe_dispatch_auto_compact(task_id, success=False)
+
         # Finalize any in-flight streaming bubbles. kill_task() cancels the
         # subprocess before the adapter can emit content_block_stop /
         # message_done, so without this the stopped transcript would keep
