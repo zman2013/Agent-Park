@@ -388,6 +388,19 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
 
         await runner.kill_task(task_id)
 
+        # Finalize any in-flight streaming bubbles. kill_task() cancels the
+        # subprocess before the adapter can emit content_block_stop /
+        # message_done, so without this the stopped transcript would keep
+        # rendering old bubbles as streaming after reload.
+        for msg in task.messages:
+            if msg.streaming:
+                msg.streaming = False
+                await broadcast({
+                    "type": "message_done",
+                    "task_id": task_id,
+                    "message_id": msg.id,
+                })
+
         notice = Message(
             role="agent",
             type="system",
