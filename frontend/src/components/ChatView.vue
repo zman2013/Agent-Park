@@ -27,6 +27,13 @@
         </template>
       </template>
       <button
+        @click="triggerStop"
+        class="ml-3 text-gray-600 hover:text-red-400 transition-colors px-1"
+        title="停止当前任务，中断 session"
+        :disabled="task.status !== 'running'"
+        :class="{ 'opacity-40 cursor-not-allowed': task.status !== 'running' }"
+      >停止</button>
+      <button
         @click="triggerCompact"
         class="ml-3 text-gray-600 hover:text-yellow-300 transition-colors px-1"
         title="发送 /compact 指令压缩上下文"
@@ -295,5 +302,13 @@ function triggerCompact() {
     detail: { taskId: props.task.id }
   }))
   store.addToast('已发送 /compact 指令', 'info')
+}
+
+function triggerStop() {
+  if (props.task.status !== 'running') return
+  window.dispatchEvent(new CustomEvent('trigger-stop-task', {
+    detail: { taskId: props.task.id }
+  }))
+  store.addToast('已发送停止指令', 'info')
 }
 </script>

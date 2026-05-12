@@ -375,6 +375,33 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         runner._compact_pending.discard(task_id)
         await runner.send_input(task_id, "/compact")
 
+    elif msg_type == "stop_task":
+        task_id = data.get("task_id", "")
+        task = app_state.get_task(task_id)
+        if not task:
+            return
+        from server.models import Message, TaskStatus
+        from server.agent_runner import runner
+
+        if task.status != TaskStatus.running:
+            return
+
+        await runner.kill_task(task_id)
+
+        notice = Message(
+            role="agent",
+            type="system",
+            streaming=False,
+            content="🛑 已停止任务，session 已中断。",
+        )
+        task.messages.append(notice)
+        await broadcast({
+            "type": "message",
+            "task_id": task_id,
+            "message": notice.model_dump(),
+        })
+        await runner._finish_task(task_id, TaskStatus.failed)
+
     elif msg_type == "fork_task":
         source_task_id = data.get("task_id", "")
         source_task = app_state.get_task(source_task_id)
