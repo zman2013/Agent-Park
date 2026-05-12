@@ -278,6 +278,10 @@ export function useWebSocket() {
     send({ type: 'trigger_compact', task_id: taskId })
   }
 
+  function stopTask(taskId) {
+    send({ type: 'stop_task', task_id: taskId })
+  }
+
   function onGenerateSummaryEvent(e) {
     generateSummary(e.detail.agentId, e.detail.dateRange || 'recent_n')
   }
@@ -286,11 +290,16 @@ export function useWebSocket() {
     triggerCompact(e.detail.taskId)
   }
 
+  function onTriggerStopTaskEvent(e) {
+    stopTask(e.detail.taskId)
+  }
+
   onMounted(() => {
     disposed = false
     connect()
     window.addEventListener('generate-summary', onGenerateSummaryEvent)
     window.addEventListener('trigger-compact', onTriggerCompactEvent)
+    window.addEventListener('trigger-stop-task', onTriggerStopTaskEvent)
   })
 
   onUnmounted(() => {
@@ -301,6 +310,7 @@ export function useWebSocket() {
     connected.value = false
     window.removeEventListener('generate-summary', onGenerateSummaryEvent)
     window.removeEventListener('trigger-compact', onTriggerCompactEvent)
+    window.removeEventListener('trigger-stop-task', onTriggerStopTaskEvent)
     if (ws) {
       const socket = ws
       ws = null
@@ -318,5 +328,6 @@ export function useWebSocket() {
     forkTask,
     generateSummary,
     triggerCompact,
+    stopTask,
   }
 }
