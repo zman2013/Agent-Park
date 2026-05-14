@@ -277,20 +277,59 @@ def test_decision_advanced_dev_ready_for_qa():
     assert _decision_advanced(before, after, d) is True
 
 
-def test_decision_not_advanced_dev_attempt_log_growth_only():
-    """Dev-arm: attempt_log growth without ready_for_qa is NOT forward.
+def test_decision_advanced_dev_legit_failure_pending_with_attempt():
+    """Dev legitimate failure: status pending + attempt_log++ IS forward.
 
-    Regression: previously a killed dev process left a single ``doing``
-    attempt entry, which the helper read as forward motion and skipped
-    ``_reconcile``. The item then froze in ``doing`` until PM rule-4
-    fallback exited the loop. Dev advance now requires reaching
-    ``ready_for_qa`` — anything short of that falls through to reconcile.
+    Per DESIGN §7, when dev cannot finish an item it leaves the status at
+    ``pending`` and appends its own ``attempt_log`` entry. This is real
+    progress (the fuse counter advances by exactly one); the scheduler must
+    NOT call ``_reconcile`` here, otherwise reconcile would append a second
+    pending entry with different ``notes`` (so tail-idempotency wouldn't
+    dedupe), double-counting the same failure into ``_fuse`` and halving
+    the effective retry budget.
     """
     from agentloop.loop import _decision_advanced
     before = _tl(_dev("T-001", status="pending"))
     after = _tl(
         Item(id="T-001", type="dev", status="pending", title="dev T-001",
              attempt_log=[Attempt(1, "pending", "first fail")])
+    )
+    d = Decision(next="dev", item_id="T-001", reason="x")
+    assert _decision_advanced(before, after, d) is True
+
+
+def test_decision_not_advanced_dev_killed_in_doing():
+    """Dev killed mid-run: status stuck at ``doing`` is NOT forward.
+
+    Regression: a SIGKILL-ed dev process can leave the item in ``doing``
+    (status was flipped pending→doing before the kill) with no attempt_log
+    growth. Without this guard, ``_decision_advanced`` would skip
+    ``_reconcile`` and PM would see a frozen ``doing``, falling through to
+    rule-4 fallback "no actionable items" → premature EXHAUSTED. The
+    per-cycle ``stale_doing_reconcile`` catches it on the *next* cycle, but
+    the immediate-cycle reconcile is what makes the fuse counter move.
+    """
+    from agentloop.loop import _decision_advanced
+    before = _tl(_dev("T-001", status="pending"))
+    after = _tl(_dev("T-001", status="doing"))  # process died after flipping
+    d = Decision(next="dev", item_id="T-001", reason="x")
+    assert _decision_advanced(before, after, d) is False
+
+
+def test_decision_not_advanced_dev_killed_with_partial_attempt():
+    """Dev killed after writing partial attempt but before pending flip.
+
+    Edge case: dev wrote an attempt entry but the kill arrived before it
+    flipped status back to ``pending``. Status is still ``doing``, so this
+    must not count as forward — otherwise the next cycle's
+    ``stale_doing_reconcile`` is the only thing keeping us out of the
+    rule-4 fallback. We want the immediate reconcile to fire too.
+    """
+    from agentloop.loop import _decision_advanced
+    before = _tl(_dev("T-001", status="pending"))
+    after = _tl(
+        Item(id="T-001", type="dev", status="doing", title="dev T-001",
+             attempt_log=[Attempt(1, "pending", "partial write before kill")])
     )
     d = Decision(next="dev", item_id="T-001", reason="x")
     assert _decision_advanced(before, after, d) is False
