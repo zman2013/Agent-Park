@@ -107,6 +107,24 @@ def run(
     while True:
         todolist = parse_todolist(ws)
 
+        # Per-cycle stale-doing reconcile: a `doing` item surviving across
+        # cycles means the previous dev/qa run was killed (timeout / SIGKILL /
+        # crash) and `_decision_advanced` failed to detect the silent failure.
+        # Without this, PM sees a frozen `doing` and falls through to the
+        # rule-4 fallback "no actionable items", exiting EXHAUSTED prematurely.
+        # `_startup_health` only runs once at boot; this catches mid-run kills.
+        reset_ids = sw.stale_doing_reconcile(todolist, boot_cycle=state.cycle)
+        if reset_ids:
+            sw.scheduler_write(ws, todolist)
+            state.scheduler_events.append(
+                {
+                    "cycle": state.cycle,
+                    "kind": "stale_doing_reconciled",
+                    "ids": reset_ids,
+                    "at": _utcnow_iso(),
+                }
+            )
+
         if reason := state.should_exit(config.limits):
             state.mark_exhausted(reason)
             state.save(ws)
@@ -370,13 +388,31 @@ def _decision_advanced(before: Todolist, after: Todolist, decision: Decision) ->
     """Return True iff the dispatched cycle actually moved the state forward.
 
     "Forward" means one of:
-    * the assigned item reached a terminal result (dev → ready_for_qa; qa → done)
-    * its attempt_log grew (a failed attempt is still forward progress — fuse
-      will eventually catch it)
-    * for qa decisions, the reviewed dev's status changed
+    * dev → status reached ``ready_for_qa``
+    * dev → status is ``pending`` AND attempt_log digest changed (the
+      legitimate "dev failed and wrote its own attempt" path, per DESIGN §7)
+    * qa → status reached ``done`` OR attempt_log digest changed OR a
+      reviewed dev's status / attempt_log changed
 
-    Silent failure — agent exited cleanly with no attempt_log entry — returns
-    False; caller falls through to :func:`_reconcile`.
+    Note on the dev-arm guard: a dev process killed mid-run leaves the item
+    stuck in ``doing`` with no attempt_log growth (because the agent never
+    got to flip ``doing → pending`` nor write its own attempt). Counting
+    "still ``doing``" or "``doing`` plus a partial entry" as progress would
+    skip ``_reconcile`` and freeze the item until PM rule-4 fallback exits
+    the loop. We therefore require dev to either reach ``ready_for_qa`` *or*
+    return to ``pending`` while appending an attempt — both of which a
+    SIGKILL-ed run cannot satisfy.
+
+    Conversely, when dev legitimately failed and wrote its own pending
+    attempt (status returned to ``pending`` and attempt_log grew), this
+    helper returns True so we do *not* call ``_reconcile``. Otherwise
+    reconcile would append a *second* pending entry (with a different
+    ``notes`` so the idempotency check at the tail does not dedupe),
+    double-counting the same failure into ``_fuse`` and halving the
+    effective retry budget.
+
+    Silent failure — agent exited cleanly with no terminal state change —
+    returns False; caller falls through to :func:`_reconcile`.
     """
     if decision.next not in {"dev", "qa"}:
         return True
@@ -392,7 +428,15 @@ def _decision_advanced(before: Todolist, after: Todolist, decision: Decision) ->
     if decision.next == "dev":
         if a.status == "ready_for_qa" and b.status != "ready_for_qa":
             return True
-        if _attempt_log_digest(a) != _attempt_log_digest(b):
+        # Legitimate self-reported failure: dev landed the item back at
+        # ``pending`` AND wrote its own attempt entry (DESIGN §7). A
+        # SIGKILL-ed run cannot reach this branch because the agent never
+        # gets to flip ``doing → pending`` nor append to ``attempt_log`` —
+        # it leaves the item stuck in ``doing`` instead.
+        if (
+            a.status == "pending"
+            and _attempt_log_digest(a) != _attempt_log_digest(b)
+        ):
             return True
         return False
 
