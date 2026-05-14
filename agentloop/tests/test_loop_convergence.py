@@ -277,7 +277,15 @@ def test_decision_advanced_dev_ready_for_qa():
     assert _decision_advanced(before, after, d) is True
 
 
-def test_decision_advanced_dev_attempt_log_growth():
+def test_decision_not_advanced_dev_attempt_log_growth_only():
+    """Dev-arm: attempt_log growth without ready_for_qa is NOT forward.
+
+    Regression: previously a killed dev process left a single ``doing``
+    attempt entry, which the helper read as forward motion and skipped
+    ``_reconcile``. The item then froze in ``doing`` until PM rule-4
+    fallback exited the loop. Dev advance now requires reaching
+    ``ready_for_qa`` — anything short of that falls through to reconcile.
+    """
     from agentloop.loop import _decision_advanced
     before = _tl(_dev("T-001", status="pending"))
     after = _tl(
@@ -285,7 +293,7 @@ def test_decision_advanced_dev_attempt_log_growth():
              attempt_log=[Attempt(1, "pending", "first fail")])
     )
     d = Decision(next="dev", item_id="T-001", reason="x")
-    assert _decision_advanced(before, after, d) is True
+    assert _decision_advanced(before, after, d) is False
 
 
 def test_decision_not_advanced_silent_failure():
