@@ -383,6 +383,112 @@ def test_pm_skips_dev_with_unmet_deps():
     assert d.item_id == "T-001"
 
 
+def test_pm_picks_nearest_qa_not_terminal_aggregated_qa():
+    """Regression: PM must not pick an aggregated qa whose other deps are still pending.
+
+    Reproduces the v5-phase2-design 13-cycle deadlock: T-008's source mentions
+    T-002 textually, but T-008.deps include T-004/T-005/T-007 (all pending).
+    The legacy substring matcher returns T-008 → qa self-fails on
+    "dependencies not complete" → cascade downgrades T-002 → loop. The fix
+    walks the dep DAG and picks the qa with the fewest unmet blockers.
+    """
+    tl = _tl(
+        _dev("T-001", status="done"),
+        Item(id="T-002", type="dev", status="ready_for_qa", title="t2",
+             dependencies=["T-001"]),
+        _qa("T-003", source="follows T-001, T-002", status="done",
+            dependencies=["T-001", "T-002"]),
+        Item(id="T-004", type="dev", status="pending", title="t4",
+             dependencies=["T-002"]),
+        Item(id="T-005", type="dev", status="pending", title="t5",
+             dependencies=["T-004"]),
+        Item(id="T-006", type="qa", status="pending", title="qa6",
+             source="follows T-004, T-005",
+             dependencies=["T-004", "T-005"]),
+        Item(id="T-007", type="dev", status="pending", title="t7",
+             dependencies=["T-005"]),
+        Item(id="T-008", type="qa", status="pending", title="qa8",
+             source="follows T-001, T-002, T-004, T-005, T-007",
+             dependencies=["T-001", "T-002", "T-004", "T-005", "T-007"]),
+    )
+    d = pm_agent.decide(tl)
+    assert d.next == "qa"
+    # T-002 is ready_for_qa. Both T-006 and T-008 cover T-002 transitively
+    # (T-006 ← T-004 ← T-002; T-008 ← T-002). T-006 has 2 unmet deps (T-004, T-005);
+    # T-008 has 4 unmet deps (T-004, T-005, T-007 — T-001/T-002 are done/rfqa).
+    # PM must pick T-006 (fewer blockers) — picking T-008 here is what
+    # caused the original 13-cycle deadlock.
+    assert d.item_id == "T-006", (
+        f"PM selected {d.item_id}; expected T-006 (nearest qa covering T-002)."
+    )
+
+
+def test_pm_skips_qa_with_pending_non_dev_deps_even_if_source_matches():
+    """When a qa has unmet deps AND there's an actionable dev to advance,
+    PM must pick the dev rather than redispatching a doomed qa."""
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1"),
+        Item(id="T-002", type="qa", status="pending", title="qa2",
+             source="follows T-001",
+             dependencies=["T-001", "T-099"]),  # T-099 missing — qa never ready
+        Item(id="T-003", type="dev", status="pending", title="t3"),
+        Item(id="T-004", type="qa", status="pending", title="qa4",
+             source="follows T-001, T-003",
+             dependencies=["T-001", "T-003"]),  # T-003 still pending
+    )
+    d = pm_agent.decide(tl)
+    # Both qa candidates for T-001 have unmet deps. PM rule-1 require_ready
+    # filters them out; rule-2 picks T-003 (pending dev, no deps) so the
+    # T-004 qa can become ready next cycle.
+    assert d.next == "dev"
+    assert d.item_id == "T-003"
+
+
+def test_pm_falls_back_to_blocked_qa_when_no_dev_actionable():
+    """If every covering qa has unmet deps AND no dev is actionable, PM falls
+    back to the best (fewest-blocker) qa so the loop's qa-demote machinery
+    can surface the deadlock — preferable to silent rule-4 'no actionable'."""
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1"),
+        Item(id="T-002", type="qa", status="pending", title="qa2",
+             source="follows T-001",
+             dependencies=["T-001", "T-099"]),  # dangling
+    )
+    d = pm_agent.decide(tl)
+    assert d.next == "qa"
+    assert d.item_id == "T-002"
+
+
+def test_pm_aggregated_qa_ok_when_all_other_deps_done():
+    """Aggregated terminal qa must still be selectable once its deps land."""
+    tl = _tl(
+        _dev("T-001", status="done"),
+        Item(id="T-002", type="dev", status="ready_for_qa", title="t2",
+             dependencies=["T-001"]),
+        _dev("T-003", status="done", dependencies=["T-002"]),
+        Item(id="T-004", type="qa", status="pending", title="qa4",
+             source="follows T-001, T-002, T-003",
+             dependencies=["T-001", "T-002", "T-003"]),
+    )
+    d = pm_agent.decide(tl)
+    assert d.next == "qa"
+    assert d.item_id == "T-004"
+
+
+def test_pm_qa_match_uses_dep_graph_not_source_text():
+    """qa.source need not mention dev_id — dep-graph reachability is enough."""
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1"),
+        _dev("T-002", status="done", dependencies=["T-001"]),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-002",  # source only mentions T-002
+             dependencies=["T-002"]),  # but T-002 → T-001 covers T-001
+    )
+    d = pm_agent.decide(tl)
+    assert d.next == "qa"
+    assert d.item_id == "T-003"
+
+
 # ---------- LoopState exhaustion ----------------------------------------
 
 

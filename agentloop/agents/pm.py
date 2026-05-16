@@ -27,24 +27,28 @@ _TERMINAL = {"done", "abandoned"}
 def decide(todolist: Todolist) -> Decision:
     items = todolist.items
 
-    # 1. ready_for_qa → qa
+    # 1. ready_for_qa → qa, but ONLY when a qa with all-terminal deps exists.
+    #    If every covering qa still has unmet deps, fall through to rule 2 so
+    #    PM advances the actually-pending dep instead of redispatching a qa
+    #    that would just self-fail on "dependencies not complete".
+    deferred_dev: Item | None = None
     for dev in items:
         if dev.type != "dev":
             continue
         if dev.status != "ready_for_qa":
             continue
-        qa = _find_qa_for(dev.id, items)
+        qa = _find_qa_for(dev.id, items, require_ready=True)
         if qa is not None:
             return Decision(
                 next="qa",
                 item_id=qa.id,
                 reason=f"qa {qa.id} → review {dev.id}",
             )
-        return Decision(
-            next="qa",
-            item_id=None,
-            reason=f"ready_for_qa {dev.id} has no matching qa item",
-        )
+        # Remember the first ready_for_qa dev that had no ready qa. If rule
+        # 2 finds no actionable dev either, we'll come back and either pick
+        # any covering qa (fallback) or emit a dynamic-qa marker.
+        if deferred_dev is None:
+            deferred_dev = dev
 
     # 2. pending dev with all deps terminal (done or abandoned) → dev
     for dev in items:
@@ -56,6 +60,24 @@ def decide(todolist: Todolist) -> Decision:
             next="dev",
             item_id=dev.id,
             reason=f"dev {dev.id} — deps satisfied",
+        )
+
+    # 1b. No actionable dev — fall back to the deferred dev's best qa, even
+    #     if its deps aren't all terminal. This preserves dynamic-qa creation
+    #     for stranded ready_for_qa devs and lets the loop's qa-demote /
+    #     cascade machinery surface the deadlock instead of stalling here.
+    if deferred_dev is not None:
+        qa = _find_qa_for(deferred_dev.id, items, require_ready=False)
+        if qa is not None:
+            return Decision(
+                next="qa",
+                item_id=qa.id,
+                reason=f"qa {qa.id} → review {deferred_dev.id} (fallback, deps unmet)",
+            )
+        return Decision(
+            next="qa",
+            item_id=None,
+            reason=f"ready_for_qa {deferred_dev.id} has no matching qa item",
         )
 
     # 3. all terminal
@@ -73,16 +95,98 @@ def decide(todolist: Todolist) -> Decision:
     return Decision(next="done", item_id=None, reason="no actionable items")
 
 
-def _find_qa_for(dev_id: str, items: list[Item]) -> Item | None:
-    for it in items:
-        if it.type != "qa":
+def _find_qa_for(
+    dev_id: str, items: list[Item], *, require_ready: bool = False
+) -> Item | None:
+    """Pick the qa whose ready-to-run distance from dev is minimum.
+
+    An aggregated terminal qa may textually mention dev_id in its source,
+    but its other deps may still be pending — dispatching it loops the
+    scheduler (qa self-fails on "dependencies not complete"). We instead
+    walk the dependency DAG: a qa "covers" dev_id iff dev_id is reachable
+    from the qa via dependencies. Among covering qa items, pick the one
+    with the fewest still-pending non-dev blockers; ties broken by depth
+    (shorter chain first), then file order.
+
+    ``require_ready=True`` filters to qa with zero unmet deps (PM rule-1
+    primary path). ``require_ready=False`` allows any covering qa as a
+    fallback when no actionable dev is left to advance.
+    """
+    index = {it.id: it for it in items}
+    candidates: list[tuple[tuple[int, int], int, Item]] = []
+
+    for idx, it in enumerate(items):
+        if it.type != "qa" or it.status in _TERMINAL:
             continue
-        if it.status in _TERMINAL:
+        if not _qa_covers_dev(it, dev_id, index):
             continue
-        source = (it.source or "").lower()
-        if dev_id.lower() in source:
-            return it
-    return None
+        pending_blockers = 0
+        for d in it.dependencies:
+            if d == dev_id:
+                continue
+            dep = index.get(d)
+            if dep is None:
+                # Dangling dep — never resolves; count as blocker so this qa
+                # falls out of the require_ready=True path.
+                pending_blockers += 1
+            elif dep.status not in _TERMINAL:
+                pending_blockers += 1
+        if require_ready and pending_blockers > 0:
+            continue
+        depth = _shortest_dep_depth(it.id, dev_id, index)
+        candidates.append(((pending_blockers, depth), idx, it))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return candidates[0][2]
+
+
+def _qa_covers_dev(qa: Item, dev_id: str, index: dict[str, Item]) -> bool:
+    """qa covers dev_id iff dev_id is reachable from qa.dependencies (DFS upward).
+
+    Fallback: if the qa has no dependencies declared at all, fall back to
+    matching ``dev_id`` against the source string. This preserves the
+    historical planner contract where source="follows T-xxx" was the only
+    pairing signal — switching to dep-DAG strict matching would silently
+    drop those items.
+    """
+    if qa.dependencies:
+        seen: set[str] = set()
+        stack: list[str] = list(qa.dependencies)
+        while stack:
+            x = stack.pop()
+            if x in seen:
+                continue
+            seen.add(x)
+            if x == dev_id:
+                return True
+            nxt = index.get(x)
+            if nxt is not None:
+                stack.extend(nxt.dependencies)
+        return False
+    # No deps → fall back to source-text matching (legacy contract).
+    return dev_id.lower() in (qa.source or "").lower()
+
+
+def _shortest_dep_depth(qa_id: str, dev_id: str, index: dict[str, Item]) -> int:
+    """BFS from qa to dev along dependencies; smaller depth = closer qa."""
+    from collections import deque
+
+    q: deque[tuple[str, int]] = deque([(qa_id, 0)])
+    seen = {qa_id}
+    while q:
+        node, d = q.popleft()
+        if node == dev_id:
+            return d
+        cur = index.get(node)
+        if cur is None:
+            continue
+        for dep in cur.dependencies:
+            if dep not in seen:
+                seen.add(dep)
+                q.append((dep, d + 1))
+    return 1 << 30
 
 
 def _deps_ok(item: Item, items: list[Item]) -> bool:
