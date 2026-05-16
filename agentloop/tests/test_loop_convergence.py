@@ -128,6 +128,53 @@ def test_cascade_empty_when_nothing_abandoned(tmp_path: Path):
     assert _cascade(tmp_path, tl, cycle=3) == ([], [])
 
 
+def test_cascade_upstream_replay_rolls_back_done_downstream(tmp_path: Path):
+    """Regression for codex round3 P1: when an upstream dev is rolled back to
+    pending (e.g. by qa demote or qa rejection of a ready_for_qa dep), every
+    downstream dev that already produced an artifact on top of the now-stale
+    upstream must also roll back.
+
+    Setup mirrors the scenario codex flagged: PM ran T-002 while T-001 was
+    only ``ready_for_qa`` (per PM ``_DEP_READY``). Then qa demoted T-001 to
+    pending. Without upstream-replay, T-002 stays at ``done`` based on a
+    stale T-001 artifact; with the fix, T-002 also rolls back so it reruns
+    against the eventual approved T-001 output.
+    """
+    tl = _tl(
+        Item(id="T-001", type="dev", status="pending", title="t1",
+             attempt_log=[Attempt(2, "pending", "downgraded: qa T-099 demoted")]),
+        Item(id="T-002", type="dev", status="done", title="t2",
+             dependencies=["T-001"], dev_notes="impl based on stale T-001"),
+        Item(id="T-003", type="dev", status="ready_for_qa", title="t3",
+             dependencies=["T-002"], dev_notes="impl based on stale T-002"),
+    )
+    _, downgraded = _cascade(tmp_path, tl, cycle=3)
+    # T-002 (done) and T-003 (ready_for_qa) must both roll back to pending
+    # because their upstream dependencies are no longer trustworthy.
+    assert {i for i, _ in downgraded} == {"T-002", "T-003"}
+    assert tl.by_id("T-002").status == "pending"
+    assert tl.by_id("T-003").status == "pending"
+    for dev_id in ("T-002", "T-003"):
+        assert "upstream replay" in tl.by_id(dev_id).attempt_log[-1].notes
+
+
+def test_cascade_upstream_replay_skips_when_no_pending_dep(tmp_path: Path):
+    """A done dev whose deps are all done/abandoned/ready_for_qa stays put.
+
+    ``ready_for_qa`` deps explicitly DO NOT trigger upstream replay (PM treats
+    them as artifact-ready; only an actual rollback to ``pending`` invalidates
+    downstream).
+    """
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1"),
+        Item(id="T-002", type="dev", status="done", title="t2",
+             dependencies=["T-001"], dev_notes="impl"),
+    )
+    _, downgraded = _cascade(tmp_path, tl, cycle=3)
+    assert downgraded == []
+    assert tl.by_id("T-002").status == "done"
+
+
 def test_loop_persists_downgrade_only_cascade(tmp_path: Path, monkeypatch):
     """Regression (Codex P1): when _cascade only downgrades (no newly
     abandoned) the main loop must still call scheduler_write, otherwise PM

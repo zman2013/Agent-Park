@@ -28,7 +28,7 @@ from .config import AgentConfig
 from . import notify
 from . import scheduler_writes as sw
 from .state import Decision, LoopState
-from .todolist import Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
+from .todolist import Attempt, Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
 from .validator import ValidationError, _reviewed_dev_ids, validate_transition
 from .workspace import WorkspacePaths
 
@@ -746,6 +746,36 @@ def _cascade(
             reason = f"qa {it.id} abandoned"
             if sw.downgrade_reviewed_dev(tl, dev_id, cycle, reason):
                 downgraded.append((dev_id, reason))
+
+    # Upstream-replay propagation: PM treats ``ready_for_qa`` deps as
+    # artifact-ready (so downstream devs can run before qa stamps the
+    # upstream). When qa later rolls a dep back to ``pending`` (or any
+    # mechanism downgrades it), every downstream dev that already produced
+    # an artifact on top of the now-stale upstream must also roll back —
+    # otherwise stale ``done``/``ready_for_qa`` work survives and a future
+    # qa stamps it as valid based on out-of-date inputs. Fixed-point form:
+    # while any dev/qa whose dep is ``pending`` still sits in
+    # ``done``/``ready_for_qa``, downgrade it.
+    pending_replay = {it.id for it in tl.items if it.status == "pending"}
+    changed = True
+    while changed:
+        changed = False
+        for it in tl.items:
+            if it.type != "dev":
+                continue
+            if it.status not in {"done", "ready_for_qa"}:
+                continue
+            stale = [d for d in it.dependencies if d in pending_replay]
+            if not stale:
+                continue
+            reason = f"upstream replay: dep(s) rolled back to pending: {', '.join(stale)}"
+            it.status = "pending"
+            it.attempt_log.append(
+                Attempt(cycle=cycle, result="pending", notes=f"downgraded: {reason}")
+            )
+            pending_replay.add(it.id)
+            downgraded.append((it.id, reason))
+            changed = True
     return newly, downgraded
 
 
