@@ -389,8 +389,14 @@ def test_pm_picks_nearest_qa_not_terminal_aggregated_qa():
     Reproduces the v5-phase2-design 13-cycle deadlock: T-008's source mentions
     T-002 textually, but T-008.deps include T-004/T-005/T-007 (all pending).
     The legacy substring matcher returns T-008 → qa self-fails on
-    "dependencies not complete" → cascade downgrades T-002 → loop. The fix
-    walks the dep DAG and picks the qa with the fewest unmet blockers.
+    "dependencies not complete" → cascade downgrades T-002 → loop.
+
+    The fix: PM rule-1 require_ready filters every covering qa whose siblings
+    are still in-flight (pending/doing). Both T-006 (deps T-004/T-005 pending)
+    and T-008 (deps T-004/T-005/T-007 pending) get filtered. Rule-2 then
+    advances T-004 (its dep T-002 is ready_for_qa, which counts as
+    artifact-on-disk per _DEP_READY) — pushing the chain forward instead of
+    redispatching a doomed qa.
     """
     tl = _tl(
         _dev("T-001", status="done"),
@@ -412,14 +418,11 @@ def test_pm_picks_nearest_qa_not_terminal_aggregated_qa():
              dependencies=["T-001", "T-002", "T-004", "T-005", "T-007"]),
     )
     d = pm_agent.decide(tl)
-    assert d.next == "qa"
-    # T-002 is ready_for_qa. Both T-006 and T-008 cover T-002 transitively
-    # (T-006 ← T-004 ← T-002; T-008 ← T-002). T-006 has 2 unmet deps (T-004, T-005);
-    # T-008 has 4 unmet deps (T-004, T-005, T-007 — T-001/T-002 are done/rfqa).
-    # PM must pick T-006 (fewer blockers) — picking T-008 here is what
-    # caused the original 13-cycle deadlock.
-    assert d.item_id == "T-006", (
-        f"PM selected {d.item_id}; expected T-006 (nearest qa covering T-002)."
+    assert d.next == "dev"
+    assert d.item_id == "T-004", (
+        f"PM selected {d.item_id}; expected T-004 (advance pending dev whose "
+        f"only dep T-002 is ready_for_qa) — picking T-008 here is what caused "
+        f"the original 13-cycle deadlock."
     )
 
 
@@ -444,10 +447,13 @@ def test_pm_skips_qa_with_pending_non_dev_deps_even_if_source_matches():
     assert d.item_id == "T-003"
 
 
-def test_pm_falls_back_to_blocked_qa_when_no_dev_actionable():
-    """If every covering qa has unmet deps AND no dev is actionable, PM falls
-    back to the best (fewest-blocker) qa so the loop's qa-demote machinery
-    can surface the deadlock — preferable to silent rule-4 'no actionable'."""
+def test_pm_falls_back_to_dynamic_qa_when_no_dev_actionable():
+    """If every covering qa has unmet deps AND no dev is actionable, PM emits
+    item_id=None so the loop creates a dynamic 1:1 qa scoped to the stranded
+    dev. We never re-dispatch a covering qa whose siblings are still in-flight
+    — that path causes 'dependencies not complete' self-fails and demote-to-
+    pending of the very dev that's already ready_for_qa, throwing away its
+    work."""
     tl = _tl(
         Item(id="T-001", type="dev", status="ready_for_qa", title="t1"),
         Item(id="T-002", type="qa", status="pending", title="qa2",
@@ -456,7 +462,49 @@ def test_pm_falls_back_to_blocked_qa_when_no_dev_actionable():
     )
     d = pm_agent.decide(tl)
     assert d.next == "qa"
-    assert d.item_id == "T-002"
+    assert d.item_id is None
+    assert "T-001" in d.reason
+
+
+def test_pm_dispatches_dev_when_dep_is_ready_for_qa():
+    """Regression for v5-phase2-resume cycle-4 bug: PM must treat a dep in
+    ready_for_qa as artifact-ready and advance the downstream pending dev,
+    rather than falling back to dispatching a qa whose other dep (the
+    pending downstream dev itself) is still unmet."""
+    tl = _tl(
+        _dev("T-001", status="done"),
+        Item(id="T-002", type="dev", status="ready_for_qa", title="t2",
+             dependencies=["T-001"]),
+        Item(id="T-003", type="dev", status="pending", title="t3",
+             dependencies=["T-001", "T-002"]),
+        Item(id="T-004", type="qa", status="pending", title="qa4",
+             source="follows T-002, T-003",
+             dependencies=["T-002", "T-003"]),
+    )
+    d = pm_agent.decide(tl)
+    # rule 1 finds T-004 covers T-002 but T-003 (sibling) is still pending →
+    # blockers=1 → filtered. rule 2 picks T-003 because its only unmet dep
+    # T-002 is ready_for_qa (counts as artifact on disk).
+    assert d.next == "dev"
+    assert d.item_id == "T-003"
+
+
+def test_pm_dispatches_aggregated_qa_when_all_devs_ready_for_qa():
+    """When every reviewed dev has reached ready_for_qa, the aggregated qa is
+    selectable even though no dep is in {done, abandoned}."""
+    tl = _tl(
+        _dev("T-001", status="done"),
+        Item(id="T-002", type="dev", status="ready_for_qa", title="t2",
+             dependencies=["T-001"]),
+        Item(id="T-003", type="dev", status="ready_for_qa", title="t3",
+             dependencies=["T-001"]),
+        Item(id="T-004", type="qa", status="pending", title="qa4",
+             source="follows T-002, T-003",
+             dependencies=["T-002", "T-003"]),
+    )
+    d = pm_agent.decide(tl)
+    assert d.next == "qa"
+    assert d.item_id == "T-004"
 
 
 def test_pm_aggregated_qa_ok_when_all_other_deps_done():
