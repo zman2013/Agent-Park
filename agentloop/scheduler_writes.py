@@ -103,6 +103,56 @@ def downgrade_reviewed_dev(
     return True
 
 
+def demote_blocked_qa(
+    tl: Todolist, qa_id: str, cycle: int, reason: str
+) -> list[str]:
+    """Short-circuit a qa that keeps self-failing on "dependencies not complete".
+
+    Resets the qa to ``pending`` (so PM rule-2 will route to the actually-pending
+    dep instead of redispatching this qa), appends an attempt note, and rolls
+    every ``ready_for_qa`` dev that this qa reviews back to ``pending`` so they
+    don't sit blocked while the loop chases unmet deps.
+
+    Returns the list of dev ids that were downgraded as a side effect (may be
+    empty). The qa itself is always touched if the call is non-noop.
+    """
+    from .validator import _reviewed_dev_ids
+
+    qa = tl.by_id(qa_id)
+    if qa is None or qa.type != "qa":
+        return []
+    if qa.status in {"done", "abandoned"}:
+        return []
+
+    # Force qa back to pending if it somehow drifted; main goal is the note.
+    if qa.status != "pending":
+        qa.status = "pending"
+    append_scheduler_attempt(
+        qa,
+        cycle=cycle,
+        result="pending",
+        notes=f"qa demoted: {reason}",
+    )
+
+    downgraded: list[str] = []
+    for dev_id in _reviewed_dev_ids(qa, tl):
+        dev = tl.by_id(dev_id)
+        if dev is None or dev.type != "dev":
+            continue
+        if dev.status != "ready_for_qa":
+            continue
+        dev.status = "pending"
+        dev.attempt_log.append(
+            Attempt(
+                cycle=cycle,
+                result="pending",
+                notes=f"downgraded: qa {qa_id} demoted ({reason})",
+            )
+        )
+        downgraded.append(dev_id)
+    return downgraded
+
+
 def append_scheduler_attempt(
     item: Item, cycle: int, result: str, notes: str
 ) -> bool:

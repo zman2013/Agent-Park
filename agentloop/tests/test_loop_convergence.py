@@ -128,6 +128,53 @@ def test_cascade_empty_when_nothing_abandoned(tmp_path: Path):
     assert _cascade(tmp_path, tl, cycle=3) == ([], [])
 
 
+def test_cascade_upstream_replay_rolls_back_done_downstream(tmp_path: Path):
+    """Regression for codex round3 P1: when an upstream dev is rolled back to
+    pending (e.g. by qa demote or qa rejection of a ready_for_qa dep), every
+    downstream dev that already produced an artifact on top of the now-stale
+    upstream must also roll back.
+
+    Setup mirrors the scenario codex flagged: PM ran T-002 while T-001 was
+    only ``ready_for_qa`` (per PM ``_DEP_READY``). Then qa demoted T-001 to
+    pending. Without upstream-replay, T-002 stays at ``done`` based on a
+    stale T-001 artifact; with the fix, T-002 also rolls back so it reruns
+    against the eventual approved T-001 output.
+    """
+    tl = _tl(
+        Item(id="T-001", type="dev", status="pending", title="t1",
+             attempt_log=[Attempt(2, "pending", "downgraded: qa T-099 demoted")]),
+        Item(id="T-002", type="dev", status="done", title="t2",
+             dependencies=["T-001"], dev_notes="impl based on stale T-001"),
+        Item(id="T-003", type="dev", status="ready_for_qa", title="t3",
+             dependencies=["T-002"], dev_notes="impl based on stale T-002"),
+    )
+    _, downgraded = _cascade(tmp_path, tl, cycle=3)
+    # T-002 (done) and T-003 (ready_for_qa) must both roll back to pending
+    # because their upstream dependencies are no longer trustworthy.
+    assert {i for i, _ in downgraded} == {"T-002", "T-003"}
+    assert tl.by_id("T-002").status == "pending"
+    assert tl.by_id("T-003").status == "pending"
+    for dev_id in ("T-002", "T-003"):
+        assert "upstream replay" in tl.by_id(dev_id).attempt_log[-1].notes
+
+
+def test_cascade_upstream_replay_skips_when_no_pending_dep(tmp_path: Path):
+    """A done dev whose deps are all done/abandoned/ready_for_qa stays put.
+
+    ``ready_for_qa`` deps explicitly DO NOT trigger upstream replay (PM treats
+    them as artifact-ready; only an actual rollback to ``pending`` invalidates
+    downstream).
+    """
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1"),
+        Item(id="T-002", type="dev", status="done", title="t2",
+             dependencies=["T-001"], dev_notes="impl"),
+    )
+    _, downgraded = _cascade(tmp_path, tl, cycle=3)
+    assert downgraded == []
+    assert tl.by_id("T-002").status == "done"
+
+
 def test_loop_persists_downgrade_only_cascade(tmp_path: Path, monkeypatch):
     """Regression (Codex P1): when _cascade only downgrades (no newly
     abandoned) the main loop must still call scheduler_write, otherwise PM
@@ -682,3 +729,323 @@ def test_stall_killed_doing_recovered(tmp_path: Path, monkeypatch):
     assert result.code == scheduler.ExitCode.SUCCESS
     tl2 = parse_tl(ws)
     assert tl2.by_id("T-001").status == "done"
+
+
+# ---------- v3 deadlock-guard regression --------------------------------
+
+
+def test_phase2_design_8item_dag_converges(tmp_path: Path, monkeypatch):
+    """End-to-end regression for the v5-phase2-design 13-cycle deadlock.
+
+    Setup mirrors the failing run: 5 dev items + 3 qa items, with one
+    aggregated terminal qa (T-008) whose source mentions every dev id but
+    whose deps include several still-pending devs. Before the fix, PM kept
+    selecting T-008 for T-002, T-008 self-failed on "dependencies not
+    complete", cascade rolled T-002 back, the cycle repeated until
+    max_cycles. After the fix, PM picks T-006 (nearest qa) for T-002, and
+    the dep chain drains to completion.
+
+    Mock dev/qa runners advance their items deterministically; the test
+    asserts the loop terminates with SUCCESS in well under max_cycles.
+    """
+    from agentloop import loop as scheduler
+    from agentloop.agents.base import RunResult
+    from agentloop.todolist import (
+        Attempt,
+        parse as parse_tl,
+        write as write_todolist,
+    )
+    from agentloop.validator import _reviewed_dev_ids
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="done", title="t1",
+             dev_notes="impl T-001"),
+        Item(id="T-002", type="dev", status="ready_for_qa", title="t2",
+             dependencies=["T-001"], dev_notes="impl T-002"),
+        Item(id="T-003", type="qa", status="done", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"]),
+        Item(id="T-004", type="dev", status="pending", title="t4",
+             dependencies=["T-002"]),
+        Item(id="T-005", type="dev", status="pending", title="t5",
+             dependencies=["T-004"]),
+        Item(id="T-006", type="qa", status="pending", title="qa6",
+             source="follows T-004, T-005",
+             dependencies=["T-004", "T-005"]),
+        Item(id="T-007", type="dev", status="pending", title="t7",
+             dependencies=["T-005"]),
+        Item(id="T-008", type="qa", status="pending", title="qa8",
+             source="follows T-001, T-002, T-004, T-005, T-007",
+             dependencies=["T-001", "T-002", "T-004", "T-005", "T-007"]),
+    )
+    ws = _ws(tmp_path)
+    write_todolist(ws, tl)
+    design_path = tmp_path / "design.md"
+    design_path.write_text("# design\n", encoding="utf-8")
+
+    def fake_dev_run(cwd, item_id, cycle, cfg):
+        cur = parse_tl(cwd)
+        item = cur.by_id(item_id)
+        item.status = "ready_for_qa"
+        item.dev_notes = f"impl {item_id}"
+        item.attempt_log.append(Attempt(cycle, "ready_for_qa", f"{item_id} done"))
+        from agentloop.todolist import write as wt
+        wt(cwd, cur)
+        return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1,
+                         cost_cny=0.0, success=True, errors=[])
+
+    def fake_qa_run(cwd, item_id, cycle, cfg):
+        cur = parse_tl(cwd)
+        qa = cur.by_id(item_id)
+        unmet = [
+            d for d in qa.dependencies
+            if (dep := cur.by_id(d)) is not None
+            and dep.status not in {"done", "abandoned"}
+            and not (dep.type == "dev" and dep.status == "ready_for_qa")
+        ]
+        if unmet:
+            qa.attempt_log.append(
+                Attempt(cycle, "pending",
+                        f"qa self-failure: dependencies not complete ({', '.join(unmet)})")
+            )
+        else:
+            for dev_id in _reviewed_dev_ids(qa, cur):
+                d = cur.by_id(dev_id)
+                if d is not None and d.status == "ready_for_qa":
+                    d.status = "done"
+            qa.status = "done"
+        from agentloop.todolist import write as wt
+        wt(cwd, cur)
+        return RunResult(stream_json_path=Path("/dev/null"), duration_sec=0.1,
+                         cost_cny=0.0, success=True, errors=[])
+
+    monkeypatch.setattr("agentloop.loop.dev_agent.run", fake_dev_run)
+    monkeypatch.setattr("agentloop.loop.qa_agent.run", fake_qa_run)
+
+    # The legacy bug looped this DAG indefinitely (PM kept picking T-008,
+    # cascade kept downgrading T-002, ad infinitum until max_cycles). With
+    # the fix, the loop must converge to a terminal state — either SUCCESS
+    # (everything drains) or PARTIAL_SUCCESS (some structurally-blocked
+    # items get abandoned by the qa-blocked / replay fuses). What we
+    # absolutely must not see: EXHAUSTED, which means we ran the budget
+    # without converging.
+    result = scheduler.run(design_path, max_cycles=25, ws=ws)
+    assert result.code in (
+        scheduler.ExitCode.SUCCESS,
+        scheduler.ExitCode.PARTIAL_SUCCESS,
+    ), f"loop did not converge: code={result.code} reason={result.reason}"
+    final = parse_tl(ws)
+    # The originally-done items must remain done.
+    for iid in ("T-001", "T-003"):
+        assert final.by_id(iid).status == "done"
+    # Regression: T-002 must NOT be stuck oscillating ready_for_qa↔pending —
+    # the loop should have closed it (done or abandoned).
+    assert final.by_id("T-002").status in {"done", "abandoned"}, (
+        f"T-002 left non-terminal at {final.by_id('T-002').status} — "
+        "deadlock guard failed"
+    )
+
+
+def test_demote_blocked_qa_short_circuits(tmp_path: Path):
+    """qa with consecutive 'dependencies not complete' tail entries → demoted.
+
+    Direct unit test on _demote_blocked_qa: a qa whose attempt_log tail has
+    ≥ 2 pending entries with the canonical needle should be reset to pending
+    and its ready_for_qa devs should be downgraded so PM rule-2 picks the
+    actually-pending dep next cycle.
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1",
+             dev_notes="impl"),
+        Item(id="T-002", type="dev", status="pending", title="t2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(3, "pending", "qa self-failure: dependencies not complete (T-002)"),
+                 Attempt(4, "pending", "qa self-failure: dependencies not complete (T-002)"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=5)
+    assert len(out) == 1
+    qa_id, downgraded, _reason = out[0]
+    assert qa_id == "T-003"
+    assert downgraded == ["T-001"]
+    assert tl.by_id("T-001").status == "pending"
+    assert tl.by_id("T-003").status == "pending"
+
+
+def test_demote_blocked_qa_skips_when_deps_ready(tmp_path: Path):
+    """A qa whose tail looks self-failed but whose deps are now all terminal
+    should NOT be demoted — the next dispatch will resolve it."""
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="done", title="t1"),
+        Item(id="T-002", type="qa", status="pending", title="qa2",
+             source="follows T-001",
+             dependencies=["T-001"],
+             attempt_log=[
+                 Attempt(2, "pending", "qa self-failure: dependencies not complete"),
+                 Attempt(3, "pending", "qa self-failure: dependencies not complete"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=4)
+    assert out == []
+
+
+def test_demote_blocked_qa_ignores_scheduler_demote_note(tmp_path: Path):
+    """Regression: scheduler-written 'qa demoted: ... dependencies not complete'
+    notes must NOT be re-counted as fresh qa self-failures.
+
+    Setup: a qa already demoted last cycle. Its attempt_log tail looks like
+    [self-fail, self-fail, scheduler-demote-note]. The scheduler note ENDS
+    the tail scan — old self-failures from before the demote do not re-trigger
+    another demote on this cycle. Without this, demote_blocked_qa would burn
+    cycles and downgrade reviewed devs based on stale evidence.
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1",
+             dev_notes="impl"),
+        Item(id="T-002", type="dev", status="pending", title="t2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(3, "pending", "qa self-failure: dependencies not complete (T-002)"),
+                 Attempt(4, "pending", "qa self-failure: dependencies not complete (T-002)"),
+                 Attempt(5, "pending",
+                         "qa demoted: qa self-failed 2× on 'dependencies not complete' "
+                         "with unmet deps: T-002"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=6)
+    assert out == [], (
+        "scheduler note ended the tail scan; the two self-failures before it "
+        "must NOT re-trigger demote — they were already accounted for last cycle"
+    )
+
+
+def test_demote_blocked_qa_real_failures_after_scheduler_note(tmp_path: Path):
+    """A qa CAN demote again, but only via FRESH self-failures recorded after
+    the last scheduler-written note.
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="pending", title="t1"),
+        Item(id="T-002", type="dev", status="pending", title="t2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(5, "pending",
+                         "qa demoted: qa self-failed 2× on 'dependencies not complete' "
+                         "with unmet deps: T-001, T-002"),
+                 # Two fresh self-failures AFTER the scheduler note → demote
+                 Attempt(6, "pending", "qa self-failure: dependencies not complete (T-001)"),
+                 Attempt(7, "pending", "qa self-failure: dependencies not complete (T-001)"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=8)
+    assert len(out) == 1
+    _qa_id, _downgraded, reason = out[0]
+    assert "2×" in reason
+
+
+def test_demote_blocked_qa_no_real_failures_after_scheduler_note(tmp_path: Path):
+    """Regression: after a demote, only the scheduler note sits at the tail.
+    No fresh qa self-failures = no new demote, no matter how many cycles pass.
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="pending", title="t1"),
+        Item(id="T-002", type="dev", status="pending", title="t2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(5, "pending",
+                         "qa demoted: qa self-failed 2× on 'dependencies not complete' "
+                         "with unmet deps: T-001, T-002"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=6)
+    assert out == []
+
+
+def test_demote_blocked_qa_skips_when_all_reviewed_devs_ready_for_qa(tmp_path: Path):
+    """Regression for codex round2 P2-2: ready_for_qa deps count as artifact-ready.
+
+    Setup: aggregated qa self-failed twice in earlier cycles when one sibling
+    was still pending. By this cycle every reviewed dev is ready_for_qa.
+    Demoting now would roll those devs back to pending and discard their
+    work — instead, let the next qa dispatch run (per new PM contract,
+    ready_for_qa deps allow the qa to proceed).
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1",
+             dev_notes="impl1"),
+        Item(id="T-002", type="dev", status="ready_for_qa", title="t2",
+             dev_notes="impl2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(3, "pending", "qa self-failure: dependencies not complete (T-002)"),
+                 Attempt(4, "pending", "qa self-failure: dependencies not complete (T-002)"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=5)
+    assert out == [], (
+        "ready_for_qa deps must count as artifact-ready; demoting here would "
+        "downgrade T-001/T-002 and throw away their work"
+    )
+
+
+def test_fuse_replay_devs_abandons_dev_with_no_progress(tmp_path: Path):
+    """A dev that has been downgraded N times without ever populating dev_notes
+    should be marked abandoned to break the loop."""
+    from agentloop.loop import _fuse_replay_devs
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="pending", title="t1",
+             dev_notes=None,
+             attempt_log=[
+                 Attempt(1, "ready_for_qa", "first try"),
+                 Attempt(2, "pending", "downgraded: qa abandoned"),
+                 Attempt(3, "ready_for_qa", "retry"),
+                 Attempt(4, "pending", "downgraded: qa abandoned"),
+                 Attempt(5, "ready_for_qa", "retry again"),
+                 Attempt(6, "pending", "downgraded: qa T-002 demoted"),
+             ]),
+    )
+    out = _fuse_replay_devs(tmp_path, tl, cycle=7)
+    assert [i for i, _ in out] == ["T-001"]
+    assert tl.by_id("T-001").status == "abandoned"
+
+
+def test_fuse_replay_devs_skips_dev_with_dev_notes(tmp_path: Path):
+    """If dev_notes is non-empty, the dev produced *something* — let normal
+    attempt-fuse handle it instead of replay-fuse."""
+    from agentloop.loop import _fuse_replay_devs
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="pending", title="t1",
+             dev_notes="implemented foo",
+             attempt_log=[
+                 Attempt(2, "pending", "downgraded: x"),
+                 Attempt(4, "pending", "downgraded: y"),
+                 Attempt(6, "pending", "downgraded: z"),
+             ]),
+    )
+    out = _fuse_replay_devs(tmp_path, tl, cycle=7)
+    assert out == []
+    assert tl.by_id("T-001").status == "pending"

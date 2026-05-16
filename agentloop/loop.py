@@ -28,7 +28,7 @@ from .config import AgentConfig
 from . import notify
 from . import scheduler_writes as sw
 from .state import Decision, LoopState
-from .todolist import Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
+from .todolist import Attempt, Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
 from .validator import ValidationError, _reviewed_dev_ids, validate_transition
 from .workspace import WorkspacePaths
 
@@ -136,7 +136,46 @@ def run(
         # the downstream DAG and downgrades stranded qa/dev pairs.
         fused = _fuse(ws, todolist, config.limits.max_item_attempts, state.cycle)
         cascaded, downgraded = _cascade(ws, todolist, state.cycle)
-        if fused or cascaded or downgraded:
+        # v3 deadlock guards (run before fuse-counted dispatch decisions):
+        #   * `_demote_blocked_qa`  — qa repeatedly self-fails with
+        #     "dependencies not complete" (PM picked a far qa whose other
+        #     deps are still pending). Short-circuit it back to pending and
+        #     downgrade its reviewed devs so PM rule-2 advances the actual
+        #     pending dep instead of redispatching the same qa.
+        #   * `_fuse_replay_devs`   — dev keeps cycling
+        #     ready_for_qa→pending without dev_notes changing (no real work
+        #     between replays). Force-abandon it so cascade can clear the
+        #     downstream and the loop terminates instead of looping forever.
+        demoted_qa = _demote_blocked_qa(ws, todolist, state.cycle)
+        replay_abandoned = _fuse_replay_devs(ws, todolist, state.cycle)
+        if demoted_qa or replay_abandoned:
+            # Re-run cascade so any newly-abandoned dev propagates downstream
+            # in the same cycle (otherwise we'd dispatch a doomed downstream
+            # item and only catch the cascade next iteration).
+            extra_newly, extra_down = _cascade(ws, todolist, state.cycle)
+            cascaded.extend(extra_newly)
+            downgraded.extend(extra_down)
+        for qa_id, dev_ids, reason_txt in demoted_qa:
+            state.scheduler_events.append(
+                {
+                    "cycle": state.cycle,
+                    "kind": "qa_demoted_blocked",
+                    "qa_id": qa_id,
+                    "downgraded_devs": dev_ids,
+                    "reason": reason_txt,
+                    "at": _utcnow_iso(),
+                }
+            )
+        for iid, reason_txt in replay_abandoned:
+            state.abandoned_events.append(
+                {
+                    "cycle": state.cycle,
+                    "item_id": iid,
+                    "reason": reason_txt,
+                    "at": _utcnow_iso(),
+                }
+            )
+        if fused or cascaded or downgraded or demoted_qa or replay_abandoned:
             for iid, reason_txt in fused + cascaded:
                 state.abandoned_events.append(
                     {
@@ -550,6 +589,116 @@ def _fuse(ws: WorkspacePaths | Path, tl: Todolist, max_attempts: int, cycle: int
     return newly
 
 
+_QA_BLOCKED_NEEDLE = "dependencies not complete"
+_QA_BLOCKED_THRESHOLD = 2  # consecutive self-failures with this needle
+# Notes written by the scheduler itself (not by qa runs). They may quote the
+# needle in their reason text, but must not be re-counted as fresh qa
+# self-failures — otherwise demote_blocked_qa's own bookkeeping triggers
+# another demote on the very next cycle while deps remain unmet.
+_SCHEDULER_NOTE_PREFIXES = ("qa demoted:", "downgraded:", "auto-created")
+
+
+def _demote_blocked_qa(
+    ws: WorkspacePaths | Path, tl: Todolist, cycle: int
+) -> list[tuple[str, list[str], str]]:
+    """Find qa items stuck on "dependencies not complete" and short-circuit them.
+
+    Detection: the qa's attempt_log tail has ≥ _QA_BLOCKED_THRESHOLD consecutive
+    pending entries whose notes contain _QA_BLOCKED_NEEDLE (case-insensitive),
+    AND the qa still has at least one non-terminal dependency (otherwise the
+    qa is genuinely ready and the next dispatch will resolve it).
+
+    Returns ``(qa_id, downgraded_dev_ids, reason)`` per demoted qa.
+    """
+    out: list[tuple[str, list[str], str]] = []
+    index = {it.id: it for it in tl.items}
+    for qa in tl.items:
+        if qa.type != "qa" or qa.status in {"done", "abandoned"}:
+            continue
+        if not qa.attempt_log:
+            continue
+        # Count tail-consecutive matches. A scheduler-written note (the
+        # bookkeeping demote_blocked_qa itself appended last cycle) ENDS the
+        # scan — counting only resumes if a *fresh* qa self-failure shows up
+        # after the scheduler note. Otherwise old failures would re-demote
+        # the same qa cycle after cycle while deps stay unmet, downgrading
+        # reviewed devs based on stale evidence.
+        tail_hits = 0
+        for att in reversed(qa.attempt_log):
+            if att.result != "pending":
+                break
+            note = (att.notes or "").lower()
+            if any(note.startswith(p) for p in _SCHEDULER_NOTE_PREFIXES):
+                break
+            if _QA_BLOCKED_NEEDLE in note:
+                tail_hits += 1
+            else:
+                break
+        if tail_hits < _QA_BLOCKED_THRESHOLD:
+            continue
+        # Only demote if the qa actually has unmet deps right now — otherwise
+        # the next dispatch genuinely can run. ``ready_for_qa`` deps count as
+        # artifact-ready (aligns with PM ``_DEP_READY``): an aggregated qa
+        # whose every reviewed dev has finally reached ready_for_qa is
+        # runnable now and must NOT be demoted (which would roll those devs
+        # back to pending and discard their work).
+        unmet = [
+            d
+            for d in qa.dependencies
+            if (dep := index.get(d)) is not None
+            and dep.status not in {"done", "abandoned", "ready_for_qa"}
+        ]
+        if not unmet:
+            continue
+        reason = (
+            f"qa self-failed {tail_hits}× on '{_QA_BLOCKED_NEEDLE}' "
+            f"with unmet deps: {', '.join(unmet)}"
+        )
+        downgraded = sw.demote_blocked_qa(tl, qa.id, cycle, reason)
+        out.append((qa.id, downgraded, reason))
+    return out
+
+
+_REPLAY_THRESHOLD = 3  # ready_for_qa→pending cycles with stable dev_notes
+
+
+def _fuse_replay_devs(
+    ws: WorkspacePaths | Path, tl: Todolist, cycle: int
+) -> list[tuple[str, str]]:
+    """Abandon dev items that keep cycling ready_for_qa→pending without progress.
+
+    Heuristic: a dev whose attempt_log shows ≥ _REPLAY_THRESHOLD distinct
+    ``downgraded:`` cycles (cascade rollback or qa-demote rollback) without
+    ``dev_notes`` ever being populated has been replayed N times producing
+    no new artifact — the LLM is stuck. Mark it abandoned so cascade can
+    close downstream items and the loop terminates instead of looping.
+
+    A dev with non-empty ``dev_notes`` is treated as having made *some*
+    progress; it falls through to the normal attempt-count fuse instead.
+    """
+    newly: list[tuple[str, str]] = []
+    for it in tl.items:
+        if it.type != "dev" or it.status in {"done", "abandoned"}:
+            continue
+        downgrade_cycles = {
+            a.cycle
+            for a in it.attempt_log
+            if a.result == "pending" and "downgraded" in (a.notes or "").lower()
+        }
+        if len(downgrade_cycles) < _REPLAY_THRESHOLD:
+            continue
+        if (it.dev_notes or "").strip():
+            # Dev produced *something* — let the normal attempt fuse handle it.
+            continue
+        reason = (
+            f"qa_blocked: {len(downgrade_cycles)} downgrade cycles without "
+            f"dev_notes progress"
+        )
+        if sw.mark_abandoned(tl, it.id, reason, cycle):
+            newly.append((it.id, reason))
+    return newly
+
+
 def _cascade(
     ws: WorkspacePaths | Path, tl: Todolist, cycle: int
 ) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -597,6 +746,36 @@ def _cascade(
             reason = f"qa {it.id} abandoned"
             if sw.downgrade_reviewed_dev(tl, dev_id, cycle, reason):
                 downgraded.append((dev_id, reason))
+
+    # Upstream-replay propagation: PM treats ``ready_for_qa`` deps as
+    # artifact-ready (so downstream devs can run before qa stamps the
+    # upstream). When qa later rolls a dep back to ``pending`` (or any
+    # mechanism downgrades it), every downstream dev that already produced
+    # an artifact on top of the now-stale upstream must also roll back —
+    # otherwise stale ``done``/``ready_for_qa`` work survives and a future
+    # qa stamps it as valid based on out-of-date inputs. Fixed-point form:
+    # while any dev/qa whose dep is ``pending`` still sits in
+    # ``done``/``ready_for_qa``, downgrade it.
+    pending_replay = {it.id for it in tl.items if it.status == "pending"}
+    changed = True
+    while changed:
+        changed = False
+        for it in tl.items:
+            if it.type != "dev":
+                continue
+            if it.status not in {"done", "ready_for_qa"}:
+                continue
+            stale = [d for d in it.dependencies if d in pending_replay]
+            if not stale:
+                continue
+            reason = f"upstream replay: dep(s) rolled back to pending: {', '.join(stale)}"
+            it.status = "pending"
+            it.attempt_log.append(
+                Attempt(cycle=cycle, result="pending", notes=f"downgraded: {reason}")
+            )
+            pending_replay.add(it.id)
+            downgraded.append((it.id, reason))
+            changed = True
     return newly, downgraded
 
 
