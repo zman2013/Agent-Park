@@ -617,15 +617,19 @@ def _demote_blocked_qa(
             continue
         if not qa.attempt_log:
             continue
-        # Count tail-consecutive matches. Skip scheduler-written notes (they
-        # may quote the needle but represent bookkeeping, not new qa runs).
+        # Count tail-consecutive matches. A scheduler-written note (the
+        # bookkeeping demote_blocked_qa itself appended last cycle) ENDS the
+        # scan — counting only resumes if a *fresh* qa self-failure shows up
+        # after the scheduler note. Otherwise old failures would re-demote
+        # the same qa cycle after cycle while deps stay unmet, downgrading
+        # reviewed devs based on stale evidence.
         tail_hits = 0
         for att in reversed(qa.attempt_log):
             if att.result != "pending":
                 break
             note = (att.notes or "").lower()
             if any(note.startswith(p) for p in _SCHEDULER_NOTE_PREFIXES):
-                continue
+                break
             if _QA_BLOCKED_NEEDLE in note:
                 tail_hits += 1
             else:
@@ -633,11 +637,16 @@ def _demote_blocked_qa(
         if tail_hits < _QA_BLOCKED_THRESHOLD:
             continue
         # Only demote if the qa actually has unmet deps right now — otherwise
-        # the next dispatch genuinely can run.
+        # the next dispatch genuinely can run. ``ready_for_qa`` deps count as
+        # artifact-ready (aligns with PM ``_DEP_READY``): an aggregated qa
+        # whose every reviewed dev has finally reached ready_for_qa is
+        # runnable now and must NOT be demoted (which would roll those devs
+        # back to pending and discard their work).
         unmet = [
             d
             for d in qa.dependencies
-            if (dep := index.get(d)) is not None and dep.status not in {"done", "abandoned"}
+            if (dep := index.get(d)) is not None
+            and dep.status not in {"done", "abandoned", "ready_for_qa"}
         ]
         if not unmet:
             continue

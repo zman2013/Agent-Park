@@ -854,9 +854,10 @@ def test_demote_blocked_qa_ignores_scheduler_demote_note(tmp_path: Path):
     notes must NOT be re-counted as fresh qa self-failures.
 
     Setup: a qa already demoted last cycle. Its attempt_log tail looks like
-    [self-fail, self-fail, scheduler-demote-note]. With the bug, the tail
-    scan would count the scheduler note (it contains the needle) and trigger
-    another demote on this cycle — burning cycles while deps stay unmet.
+    [self-fail, self-fail, scheduler-demote-note]. The scheduler note ENDS
+    the tail scan — old self-failures from before the demote do not re-trigger
+    another demote on this cycle. Without this, demote_blocked_qa would burn
+    cycles and downgrade reviewed devs based on stale evidence.
     """
     from agentloop.loop import _demote_blocked_qa
 
@@ -875,14 +876,37 @@ def test_demote_blocked_qa_ignores_scheduler_demote_note(tmp_path: Path):
                          "with unmet deps: T-002"),
              ]),
     )
-    # Cycle 6: only the two real self-failures should be counted (the
-    # scheduler note is skipped). The threshold is 2, so the qa should
-    # demote — but only because of the prior real failures, not because the
-    # scheduler note re-triggered counting.
     out = _demote_blocked_qa(tmp_path, tl, cycle=6)
+    assert out == [], (
+        "scheduler note ended the tail scan; the two self-failures before it "
+        "must NOT re-trigger demote — they were already accounted for last cycle"
+    )
+
+
+def test_demote_blocked_qa_real_failures_after_scheduler_note(tmp_path: Path):
+    """A qa CAN demote again, but only via FRESH self-failures recorded after
+    the last scheduler-written note.
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="pending", title="t1"),
+        Item(id="T-002", type="dev", status="pending", title="t2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(5, "pending",
+                         "qa demoted: qa self-failed 2× on 'dependencies not complete' "
+                         "with unmet deps: T-001, T-002"),
+                 # Two fresh self-failures AFTER the scheduler note → demote
+                 Attempt(6, "pending", "qa self-failure: dependencies not complete (T-001)"),
+                 Attempt(7, "pending", "qa self-failure: dependencies not complete (T-001)"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=8)
     assert len(out) == 1
     _qa_id, _downgraded, reason = out[0]
-    # Reason text reports tail_hits == 2 (the two real entries), not 3.
     assert "2×" in reason
 
 
@@ -906,6 +930,37 @@ def test_demote_blocked_qa_no_real_failures_after_scheduler_note(tmp_path: Path)
     )
     out = _demote_blocked_qa(tmp_path, tl, cycle=6)
     assert out == []
+
+
+def test_demote_blocked_qa_skips_when_all_reviewed_devs_ready_for_qa(tmp_path: Path):
+    """Regression for codex round2 P2-2: ready_for_qa deps count as artifact-ready.
+
+    Setup: aggregated qa self-failed twice in earlier cycles when one sibling
+    was still pending. By this cycle every reviewed dev is ready_for_qa.
+    Demoting now would roll those devs back to pending and discard their
+    work — instead, let the next qa dispatch run (per new PM contract,
+    ready_for_qa deps allow the qa to proceed).
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1",
+             dev_notes="impl1"),
+        Item(id="T-002", type="dev", status="ready_for_qa", title="t2",
+             dev_notes="impl2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(3, "pending", "qa self-failure: dependencies not complete (T-002)"),
+                 Attempt(4, "pending", "qa self-failure: dependencies not complete (T-002)"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=5)
+    assert out == [], (
+        "ready_for_qa deps must count as artifact-ready; demoting here would "
+        "downgrade T-001/T-002 and throw away their work"
+    )
 
 
 def test_fuse_replay_devs_abandons_dev_with_no_progress(tmp_path: Path):
