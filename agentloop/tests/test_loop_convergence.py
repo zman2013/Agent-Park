@@ -849,6 +849,65 @@ def test_demote_blocked_qa_skips_when_deps_ready(tmp_path: Path):
     assert out == []
 
 
+def test_demote_blocked_qa_ignores_scheduler_demote_note(tmp_path: Path):
+    """Regression: scheduler-written 'qa demoted: ... dependencies not complete'
+    notes must NOT be re-counted as fresh qa self-failures.
+
+    Setup: a qa already demoted last cycle. Its attempt_log tail looks like
+    [self-fail, self-fail, scheduler-demote-note]. With the bug, the tail
+    scan would count the scheduler note (it contains the needle) and trigger
+    another demote on this cycle — burning cycles while deps stay unmet.
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="ready_for_qa", title="t1",
+             dev_notes="impl"),
+        Item(id="T-002", type="dev", status="pending", title="t2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(3, "pending", "qa self-failure: dependencies not complete (T-002)"),
+                 Attempt(4, "pending", "qa self-failure: dependencies not complete (T-002)"),
+                 Attempt(5, "pending",
+                         "qa demoted: qa self-failed 2× on 'dependencies not complete' "
+                         "with unmet deps: T-002"),
+             ]),
+    )
+    # Cycle 6: only the two real self-failures should be counted (the
+    # scheduler note is skipped). The threshold is 2, so the qa should
+    # demote — but only because of the prior real failures, not because the
+    # scheduler note re-triggered counting.
+    out = _demote_blocked_qa(tmp_path, tl, cycle=6)
+    assert len(out) == 1
+    _qa_id, _downgraded, reason = out[0]
+    # Reason text reports tail_hits == 2 (the two real entries), not 3.
+    assert "2×" in reason
+
+
+def test_demote_blocked_qa_no_real_failures_after_scheduler_note(tmp_path: Path):
+    """Regression: after a demote, only the scheduler note sits at the tail.
+    No fresh qa self-failures = no new demote, no matter how many cycles pass.
+    """
+    from agentloop.loop import _demote_blocked_qa
+
+    tl = _tl(
+        Item(id="T-001", type="dev", status="pending", title="t1"),
+        Item(id="T-002", type="dev", status="pending", title="t2"),
+        Item(id="T-003", type="qa", status="pending", title="qa3",
+             source="follows T-001, T-002",
+             dependencies=["T-001", "T-002"],
+             attempt_log=[
+                 Attempt(5, "pending",
+                         "qa demoted: qa self-failed 2× on 'dependencies not complete' "
+                         "with unmet deps: T-001, T-002"),
+             ]),
+    )
+    out = _demote_blocked_qa(tmp_path, tl, cycle=6)
+    assert out == []
+
+
 def test_fuse_replay_devs_abandons_dev_with_no_progress(tmp_path: Path):
     """A dev that has been downgraded N times without ever populating dev_notes
     should be marked abandoned to break the loop."""

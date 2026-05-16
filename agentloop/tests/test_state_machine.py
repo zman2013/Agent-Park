@@ -523,18 +523,32 @@ def test_pm_aggregated_qa_ok_when_all_other_deps_done():
     assert d.item_id == "T-004"
 
 
-def test_pm_qa_match_uses_dep_graph_not_source_text():
-    """qa.source need not mention dev_id — dep-graph reachability is enough."""
+def test_pm_qa_match_uses_source_tokens_not_dep_graph_transitive():
+    """qa coverage must stay aligned with validator._reviewed_dev_ids: only the
+    T-xxx tokens in qa.source count as reviewed devs.
+
+    Regression for codex P1: previously _qa_covers_dev walked qa.dependencies
+    transitively, so a qa with ``source="follows T-002"`` and ``deps=[T-002]``
+    where ``T-002`` itself depends on ``T-001`` would be reported as covering
+    T-001. PM dispatched this qa for T-001, but the validator rejected the
+    state change (T-001 was not in the source-derived reviewed set), and the
+    loop spun.
+
+    With the fix, that qa does NOT cover T-001. PM falls through to rule 1b
+    and emits ``item_id=None`` so the loop creates a dynamic 1:1 qa for T-001.
+    """
     tl = _tl(
         Item(id="T-001", type="dev", status="ready_for_qa", title="t1"),
         _dev("T-002", status="done", dependencies=["T-001"]),
         Item(id="T-003", type="qa", status="pending", title="qa3",
              source="follows T-002",  # source only mentions T-002
-             dependencies=["T-002"]),  # but T-002 → T-001 covers T-001
+             dependencies=["T-002"]),  # transitive reach to T-001 must NOT count
     )
     d = pm_agent.decide(tl)
     assert d.next == "qa"
-    assert d.item_id == "T-003"
+    # Rule 1b: no covering qa for T-001 → emit dynamic-qa marker.
+    assert d.item_id is None
+    assert "T-001" in (d.reason or "")
 
 
 # ---------- LoopState exhaustion ----------------------------------------

@@ -159,30 +159,27 @@ def _find_qa_for(
 
 
 def _qa_covers_dev(qa: Item, dev_id: str, index: dict[str, Item]) -> bool:
-    """qa covers dev_id iff dev_id is reachable from qa.dependencies (DFS upward).
+    """qa covers dev_id iff the validator would let this qa review dev_id.
 
-    Fallback: if the qa has no dependencies declared at all, fall back to
-    matching ``dev_id`` against the source string. This preserves the
-    historical planner contract where source="follows T-xxx" was the only
-    pairing signal — switching to dep-DAG strict matching would silently
-    drop those items.
+    Coverage MUST stay aligned with ``validator._reviewed_dev_ids``: if PM
+    dispatches a qa for dev_id but the validator's source-derived reviewed
+    set excludes dev_id, the qa run will be rolled back and the loop
+    spins. We therefore reuse the same source-token parsing here instead of
+    walking the dep DAG (a transitive dep is "reachable" but not
+    "reviewed").
     """
-    if qa.dependencies:
-        seen: set[str] = set()
-        stack: list[str] = list(qa.dependencies)
-        while stack:
-            x = stack.pop()
-            if x in seen:
-                continue
-            seen.add(x)
-            if x == dev_id:
-                return True
-            nxt = index.get(x)
-            if nxt is not None:
-                stack.extend(nxt.dependencies)
-        return False
-    # No deps → fall back to source-text matching (legacy contract).
-    return dev_id.lower() in (qa.source or "").lower()
+    import re
+
+    raw = re.findall(r"[Tt]-\d+", qa.source or "")
+    source_ids = {"T-" + r[2:] for r in raw}
+    if source_ids:
+        return dev_id in source_ids
+    # No T-xxx tokens in source: validator falls back to "first ready_for_qa
+    # dev". Mirror that here so PM and validator agree.
+    for it in index.values():
+        if it.type == "dev" and it.status == "ready_for_qa":
+            return it.id == dev_id
+    return False
 
 
 def _shortest_dep_depth(qa_id: str, dev_id: str, index: dict[str, Item]) -> int:

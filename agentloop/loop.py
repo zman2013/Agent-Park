@@ -591,6 +591,11 @@ def _fuse(ws: WorkspacePaths | Path, tl: Todolist, max_attempts: int, cycle: int
 
 _QA_BLOCKED_NEEDLE = "dependencies not complete"
 _QA_BLOCKED_THRESHOLD = 2  # consecutive self-failures with this needle
+# Notes written by the scheduler itself (not by qa runs). They may quote the
+# needle in their reason text, but must not be re-counted as fresh qa
+# self-failures — otherwise demote_blocked_qa's own bookkeeping triggers
+# another demote on the very next cycle while deps remain unmet.
+_SCHEDULER_NOTE_PREFIXES = ("qa demoted:", "downgraded:", "auto-created")
 
 
 def _demote_blocked_qa(
@@ -612,12 +617,16 @@ def _demote_blocked_qa(
             continue
         if not qa.attempt_log:
             continue
-        # Count tail-consecutive matches.
+        # Count tail-consecutive matches. Skip scheduler-written notes (they
+        # may quote the needle but represent bookkeeping, not new qa runs).
         tail_hits = 0
         for att in reversed(qa.attempt_log):
             if att.result != "pending":
                 break
-            if _QA_BLOCKED_NEEDLE in (att.notes or "").lower():
+            note = (att.notes or "").lower()
+            if any(note.startswith(p) for p in _SCHEDULER_NOTE_PREFIXES):
+                continue
+            if _QA_BLOCKED_NEEDLE in note:
                 tail_hits += 1
             else:
                 break
