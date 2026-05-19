@@ -38,6 +38,21 @@ def agent_defaults() -> list[dict]:
     ])
 
 
+def upload_config() -> dict:
+    """Return the upload configuration with defaults.
+
+    Files are written under ``{agent.cwd}/.agent-park/uploads/{yyyymmdd}/``.
+    ``max_size_mb`` defaults to 100; set ``allowed_extensions`` to a list of
+    suffixes (with leading dot, e.g. ``[".png", ".pdf"]``) to restrict types,
+    or leave empty to allow all.
+    """
+    cfg = get_config().get("upload", {})
+    return {
+        "max_size_mb": int(cfg.get("max_size_mb", 100)),
+        "allowed_extensions": list(cfg.get("allowed_extensions", [])),
+    }
+
+
 def memory_config() -> dict:
     """Return the global memory configuration with defaults."""
     cfg = get_config().get("memory", {})

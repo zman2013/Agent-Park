@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import uuid
+from datetime import datetime
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from server.config import upload_config
 from server.state import app_state
 
 router = APIRouter(prefix="/api")
@@ -665,6 +669,137 @@ async def download_file(agent_id: str, path: str = ""):
         filename=filename,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+_UNSAFE_NAME_RE = re.compile(r"[\x00-\x1f/\\:*?\"<>|]")
+
+
+def _safe_filename(name: str) -> str:
+    """Sanitize an uploaded filename: strip path components and control chars."""
+    name = os.path.basename(name or "").strip()
+    name = _UNSAFE_NAME_RE.sub("_", name)
+    if not name or name in {".", ".."}:
+        name = "file"
+    if len(name) > 200:
+        # Preserve extension when truncating long names.
+        root, ext = os.path.splitext(name)
+        ext = ext[:20]
+        name = root[: 200 - len(ext)] + ext
+    return name
+
+
+def _agent_uploads_root(agent_id: str) -> tuple[str, str]:
+    """Return ``(cwd, uploads_root)`` ensuring the agent has a usable cwd."""
+    agent = app_state.get_agent(agent_id)
+    if not agent:
+        raise HTTPException(404, "agent not found")
+    if not agent.cwd:
+        raise HTTPException(400, "agent has no cwd configured")
+    cwd = os.path.realpath(agent.cwd)
+    if not os.path.isdir(cwd):
+        raise HTTPException(400, "agent cwd does not exist")
+    uploads_root = os.path.join(cwd, ".agent-park", "uploads")
+    return cwd, uploads_root
+
+
+@router.post("/agents/{agent_id}/uploads")
+async def upload_file(agent_id: str, file: UploadFile = File(...)):
+    """Upload a single file under ``{cwd}/.agent-park/uploads/{yyyymmdd}/``.
+
+    The original filename is preserved (with basic sanitization) and prefixed
+    with a short uuid to avoid collisions. Returns ``abs_path`` / ``rel_path``
+    (relative to cwd) for the caller to inject into the next prompt.
+    """
+    cfg = upload_config()
+    max_bytes = cfg["max_size_mb"] * 1024 * 1024
+    allowed = [s.lower() for s in cfg["allowed_extensions"]]
+
+    cwd, uploads_root = _agent_uploads_root(agent_id)
+    safe_name = _safe_filename(file.filename or "file")
+    if allowed:
+        ext = os.path.splitext(safe_name)[1].lower()
+        if ext not in allowed:
+            raise HTTPException(415, f"file type not allowed: {ext or '(none)'}")
+
+    date_dir = datetime.now().strftime("%Y%m%d")
+    target_dir = os.path.join(uploads_root, date_dir)
+    os.makedirs(target_dir, exist_ok=True)
+
+    uid = uuid.uuid4().hex[:8]
+    final_name = f"{uid}_{safe_name}"
+    abs_path = os.path.join(target_dir, final_name)
+
+    chunk_size = 1024 * 1024
+    written = 0
+    try:
+        with open(abs_path, "wb") as fp:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    fp.close()
+                    try:
+                        os.unlink(abs_path)
+                    except OSError:
+                        pass
+                    raise HTTPException(413, f"file exceeds {cfg['max_size_mb']} MB limit")
+                fp.write(chunk)
+    except HTTPException:
+        raise
+    except OSError as e:
+        try:
+            os.unlink(abs_path)
+        except OSError:
+            pass
+        raise HTTPException(500, f"failed to write file: {e}")
+    finally:
+        await file.close()
+
+    rel_path = os.path.relpath(abs_path, cwd)
+    return {
+        "id": uid,
+        "filename": safe_name,
+        "stored_name": final_name,
+        "size": written,
+        "abs_path": abs_path,
+        "rel_path": rel_path,
+    }
+
+
+class DeleteUploadBody(BaseModel):
+    rel_path: str | None = None
+    abs_path: str | None = None
+
+
+@router.delete("/agents/{agent_id}/uploads")
+async def delete_upload(agent_id: str, rel_path: str = "", abs_path: str = ""):
+    """Delete a previously uploaded file. Path must lie inside the agent's
+    ``.agent-park/uploads/`` directory; anything else is rejected."""
+    cwd, uploads_root = _agent_uploads_root(agent_id)
+    uploads_root_real = os.path.realpath(uploads_root)
+    if abs_path:
+        target = os.path.realpath(abs_path)
+    elif rel_path:
+        target = os.path.realpath(os.path.join(cwd, rel_path))
+    else:
+        raise HTTPException(400, "rel_path or abs_path required")
+
+    try:
+        if os.path.commonpath([target, uploads_root_real]) != uploads_root_real:
+            raise HTTPException(400, "path is not inside uploads dir")
+    except ValueError:
+        raise HTTPException(400, "path is not inside uploads dir")
+
+    if not os.path.isfile(target):
+        # Idempotent: missing file is treated as success.
+        return {"ok": True, "removed": False}
+    try:
+        os.unlink(target)
+    except OSError as e:
+        raise HTTPException(500, f"failed to delete: {e}")
+    return {"ok": True, "removed": True}
 
 
 @router.post("/shell/exec")
