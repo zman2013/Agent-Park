@@ -381,9 +381,17 @@ function send() {
     content = (trimmed ? `${trimmed}\n\n` : '') + `附件列表：\n${lines}`
   }
 
-  window.dispatchEvent(new CustomEvent('send-message', {
-    detail: { taskId: props.task.id, content }
-  }))
+  const evt = new CustomEvent('send-message', {
+    cancelable: true,
+    detail: { taskId: props.task.id, content },
+  })
+  const accepted = window.dispatchEvent(evt)
+  if (!accepted) {
+    // App.vue rejected the send (e.g. WebSocket disconnected). Keep the
+    // text and attachments staged so the user can retry without losing
+    // their uploads.
+    return
+  }
 
   text.value = ''
   attachments.value = []
