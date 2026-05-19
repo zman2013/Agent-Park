@@ -106,6 +106,14 @@ watch(text, (val) => {
   saveDraft(val)
 })
 
+// Reset attachments when task switches — App.vue reuses ChatInput across
+// tasks, so without this the next send would attach files uploaded under
+// the previous task (and DELETE would be issued against the wrong agent).
+watch(() => props.task.id, (_newId, oldId) => {
+  if (oldId === undefined) return
+  discardAttachments()
+})
+
 const agent = computed(() => store.agents.find(a => a.id === props.task.agent_id))
 const canUpload = computed(() => !!agent.value?.cwd)
 const uploadTitle = computed(() =>
@@ -256,6 +264,7 @@ function onFilesChosen(e) {
 
 function startUpload(file) {
   const uid = Math.random().toString(36).slice(2, 10)
+  const agentId = props.task.agent_id
   attachments.value.push({
     uid,
     name: file.name,
@@ -266,6 +275,7 @@ function startUpload(file) {
     relPath: null,
     error: null,
     xhr: null,
+    agentId,
   })
   // Re-fetch the reactive proxy so handler writes trigger UI updates.
   // Plain `push` keeps the closure's reference as the raw object, which
@@ -276,7 +286,7 @@ function startUpload(file) {
   att.xhr = xhr
   const form = new FormData()
   form.append('file', file)
-  xhr.open('POST', `/api/agents/${props.task.agent_id}/uploads`)
+  xhr.open('POST', `/api/agents/${agentId}/uploads`)
   xhr.upload.onprogress = (ev) => {
     if (ev.lengthComputable) {
       att.progress = Math.round((ev.loaded / ev.total) * 100)
@@ -332,11 +342,27 @@ function removeAttachment(uid) {
     return
   }
   if (att.status === 'success' && att.relPath) {
-    const url = `/api/agents/${props.task.agent_id}/uploads?rel_path=${encodeURIComponent(att.relPath)}`
+    const url = `/api/agents/${att.agentId}/uploads?rel_path=${encodeURIComponent(att.relPath)}`
     fetch(url, { method: 'DELETE' }).catch(() => {
       // Best-effort: even on failure the UI entry is gone; user can clean
       // up the .agent-park/uploads directory manually if needed.
     })
+  }
+}
+
+function discardAttachments() {
+  // Drop every attachment, aborting in-flight uploads and best-effort DELETE
+  // for completed ones. Each attachment carries the agent_id it was uploaded
+  // under, so this works correctly across task switches.
+  const snapshot = attachments.value.slice()
+  attachments.value = []
+  for (const att of snapshot) {
+    if (att.status === 'uploading' && att.xhr) {
+      try { att.xhr.abort() } catch {}
+    } else if (att.status === 'success' && att.relPath) {
+      const url = `/api/agents/${att.agentId}/uploads?rel_path=${encodeURIComponent(att.relPath)}`
+      fetch(url, { method: 'DELETE' }).catch(() => {})
+    }
   }
 }
 
