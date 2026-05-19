@@ -287,6 +287,7 @@ function onSendMessage(e) {
   const { taskId, content } = e.detail
   if (!wsConnected.value) {
     store.addToast('Cannot send message: WebSocket not connected', 'error')
+    e.preventDefault()
     return
   }
   sendUserMessage(taskId, content)

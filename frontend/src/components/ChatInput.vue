@@ -24,7 +24,23 @@
       </div>
     </div>
 
-    <div class="flex gap-2">
+    <ChatAttachments :attachments="attachments" @remove="removeAttachment" />
+
+    <input
+      ref="fileInputEl"
+      type="file"
+      multiple
+      class="hidden"
+      @change="onFilesChosen"
+    />
+
+    <div class="flex gap-2 items-stretch">
+      <button
+        class="bg-[#1a1a1a] border border-gray-700 hover:border-gray-500 hover:text-gray-100 text-gray-300 w-10 h-10 self-end rounded-lg text-lg leading-none transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+        :disabled="!canUpload"
+        :title="uploadTitle"
+        @click="triggerFileChooser"
+      >+</button>
       <textarea
         ref="inputEl"
         v-model="text"
@@ -37,8 +53,8 @@
         @blur="handleBlur"
       ></textarea>
       <button
-        class="bg-green-600 hover:bg-green-700 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-        :disabled="!text.trim()"
+        class="bg-green-600 hover:bg-green-700 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+        :disabled="!canSend"
         @click="send"
       >
         Send
@@ -50,6 +66,7 @@
 <script setup>
 import { ref, computed, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useAgentStore } from '../stores/agentStore.js'
+import ChatAttachments from './ChatAttachments.vue'
 
 const props = defineProps({
   task: { type: Object, required: true },
@@ -58,12 +75,16 @@ const props = defineProps({
 const emit = defineEmits(['send'])
 const text = ref('')
 const inputEl = ref(null)
+const fileInputEl = ref(null)
 const store = useAgentStore()
 
 // Skill autocomplete state
 const allSkills = ref([])
 const showSkillMenu = ref(false)
 const activeIndex = ref(0)
+
+// Attachments state — not persisted across reloads (File objects + physical files)
+const attachments = ref([])
 
 const DRAFT_KEY = 'chat_draft'
 
@@ -85,6 +106,28 @@ watch(text, (val) => {
   saveDraft(val)
 })
 
+// Reset attachments when task switches — App.vue reuses ChatInput across
+// tasks, so without this the next send would attach files uploaded under
+// the previous task (and DELETE would be issued against the wrong agent).
+watch(() => props.task.id, (_newId, oldId) => {
+  if (oldId === undefined) return
+  discardAttachments()
+})
+
+const agent = computed(() => store.agents.find(a => a.id === props.task.agent_id))
+const canUpload = computed(() => !!agent.value?.cwd)
+const uploadTitle = computed(() =>
+  canUpload.value ? 'Upload files' : 'Configure agent cwd to enable uploads'
+)
+const hasUploading = computed(() =>
+  attachments.value.some(a => a.status === 'uploading')
+)
+const canSend = computed(() => {
+  if (hasUploading.value) return false
+  if (text.value.trim()) return true
+  return attachments.value.some(a => a.status === 'success')
+})
+
 onMounted(async () => {
   // Restore draft from localStorage
   const saved = localStorage.getItem(DRAFT_KEY)
@@ -99,8 +142,7 @@ onMounted(async () => {
   window.addEventListener('fill-prompt', onFillPrompt)
 
   try {
-    const agent = store.agents.find(a => a.id === props.task.agent_id)
-    const cwd = agent?.cwd || ''
+    const cwd = agent.value?.cwd || ''
     const url = cwd ? `/api/skills?cwd=${encodeURIComponent(cwd)}` : '/api/skills'
     const res = await fetch(url)
     if (res.ok) {
@@ -113,6 +155,13 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('fill-prompt', onFillPrompt)
+  // Abort any in-flight uploads but leave persisted files alone — the
+  // user can clean them up later via the filesystem if desired.
+  for (const att of attachments.value) {
+    if (att.status === 'uploading' && att.xhr) {
+      try { att.xhr.abort() } catch {}
+    }
+  }
 })
 
 function onFillPrompt(e) {
@@ -199,15 +248,153 @@ function autoResize() {
   el.style.height = Math.min(el.scrollHeight, 150) + 'px'
 }
 
-function send() {
-  const content = text.value.trim()
-  if (!content) return
+function triggerFileChooser() {
+  if (!canUpload.value) return
+  fileInputEl.value?.click()
+}
 
-  window.dispatchEvent(new CustomEvent('send-message', {
-    detail: { taskId: props.task.id, content }
-  }))
+function onFilesChosen(e) {
+  const files = Array.from(e.target.files || [])
+  for (const f of files) {
+    startUpload(f)
+  }
+  // Reset so picking the same file again retriggers change
+  e.target.value = ''
+}
+
+function startUpload(file) {
+  const uid = Math.random().toString(36).slice(2, 10)
+  const agentId = props.task.agent_id
+  attachments.value.push({
+    uid,
+    name: file.name,
+    size: file.size,
+    status: 'uploading',
+    progress: 0,
+    absPath: null,
+    relPath: null,
+    error: null,
+    xhr: null,
+    agentId,
+  })
+  // Re-fetch the reactive proxy so handler writes trigger UI updates.
+  // Plain `push` keeps the closure's reference as the raw object, which
+  // bypasses the reactive proxy and leaves the UI stuck on "uploading".
+  const att = attachments.value[attachments.value.length - 1]
+
+  const xhr = new XMLHttpRequest()
+  att.xhr = xhr
+  const form = new FormData()
+  form.append('file', file)
+  xhr.open('POST', `/api/agents/${agentId}/uploads`)
+  xhr.upload.onprogress = (ev) => {
+    if (ev.lengthComputable) {
+      att.progress = Math.round((ev.loaded / ev.total) * 100)
+    }
+  }
+  xhr.onload = () => {
+    if (xhr.status >= 200 && xhr.status < 300) {
+      try {
+        const data = JSON.parse(xhr.responseText)
+        att.status = 'success'
+        att.absPath = data.abs_path
+        att.relPath = data.rel_path
+        att.size = data.size
+        att.progress = 100
+        att.xhr = null
+      } catch (err) {
+        att.status = 'failed'
+        att.error = 'invalid server response'
+      }
+    } else {
+      att.status = 'failed'
+      let msg = `HTTP ${xhr.status}`
+      try {
+        const data = JSON.parse(xhr.responseText)
+        if (data?.detail) msg = data.detail
+      } catch {}
+      att.error = msg
+      store.addToast(`Upload failed: ${file.name} — ${msg}`, 'error')
+    }
+  }
+  xhr.onerror = () => {
+    att.status = 'failed'
+    att.error = 'network error'
+    store.addToast(`Upload failed: ${file.name}`, 'error')
+  }
+  xhr.onabort = () => {
+    // Removed by user during upload — nothing to do here, removeAttachment
+    // already handled the array splice.
+  }
+  xhr.send(form)
+}
+
+function removeAttachment(uid) {
+  const idx = attachments.value.findIndex(a => a.uid === uid)
+  if (idx === -1) return
+  const att = attachments.value[idx]
+  attachments.value.splice(idx, 1)
+
+  if (att.status === 'uploading') {
+    if (att.xhr) {
+      try { att.xhr.abort() } catch {}
+    }
+    return
+  }
+  if (att.status === 'success' && att.relPath) {
+    const url = `/api/agents/${att.agentId}/uploads?rel_path=${encodeURIComponent(att.relPath)}`
+    fetch(url, { method: 'DELETE' }).catch(() => {
+      // Best-effort: even on failure the UI entry is gone; user can clean
+      // up the .agent-park/uploads directory manually if needed.
+    })
+  }
+}
+
+function discardAttachments() {
+  // Drop every attachment, aborting in-flight uploads and best-effort DELETE
+  // for completed ones. Each attachment carries the agent_id it was uploaded
+  // under, so this works correctly across task switches.
+  const snapshot = attachments.value.slice()
+  attachments.value = []
+  for (const att of snapshot) {
+    if (att.status === 'uploading' && att.xhr) {
+      try { att.xhr.abort() } catch {}
+    } else if (att.status === 'success' && att.relPath) {
+      const url = `/api/agents/${att.agentId}/uploads?rel_path=${encodeURIComponent(att.relPath)}`
+      fetch(url, { method: 'DELETE' }).catch(() => {})
+    }
+  }
+}
+
+function send() {
+  if (hasUploading.value) {
+    store.addToast('请等待文件上传完成', 'warning')
+    return
+  }
+  const trimmed = text.value.trim()
+  const ready = attachments.value.filter(a => a.status === 'success')
+  if (!trimmed && ready.length === 0) return
+
+  let content = trimmed
+  if (ready.length > 0) {
+    const lines = ready.map((a, i) => `${i + 1}. ${a.absPath}`).join('\n')
+    content = (trimmed ? `${trimmed}\n\n` : '') + `附件列表：\n${lines}`
+  }
+
+  const evt = new CustomEvent('send-message', {
+    cancelable: true,
+    detail: { taskId: props.task.id, content },
+  })
+  const accepted = window.dispatchEvent(evt)
+  if (!accepted) {
+    // App.vue rejected the send (e.g. WebSocket disconnected). Keep the
+    // text and attachments staged so the user can retry without losing
+    // their uploads.
+    return
+  }
 
   text.value = ''
+  attachments.value = []
   clearTimeout(saveTimer)
   localStorage.removeItem(DRAFT_KEY)
   showSkillMenu.value = false

@@ -25,3 +25,6 @@ config.json
 # AgentLoop runtime workspaces
 .agentloop/
 
+# Chat upload staging dir (per-agent cwd)
+.agent-park/
+
