@@ -29,6 +29,18 @@
 
     <!-- Content area -->
     <div class="flex-1 overflow-auto min-h-0">
+      <!-- Truncation banner -->
+      <div
+        v-if="content !== null && truncatedSize > 0"
+        class="px-4 py-2 text-xs text-yellow-300 bg-yellow-900/30 border-b border-yellow-800 flex items-center justify-between gap-3"
+      >
+        <span>⚠ 文件过大，仅显示前 {{ formatBytes(truncatedSize) }}（共 {{ displaySize }}），如需完整内容请下载。</span>
+        <a
+          :href="downloadUrl"
+          :download="fileName"
+          class="text-yellow-200 hover:text-yellow-100 underline flex-shrink-0"
+        >下载完整文件</a>
+      </div>
       <!-- Loading -->
       <div v-if="loading" class="flex items-center justify-center h-full text-xs text-gray-600">Loading...</div>
 
@@ -117,6 +129,7 @@ const loadError = ref('')
 const showLargeConfirm = ref(false)
 const isBinary = ref(false)
 const wordWrap = ref(true)
+const truncatedSize = ref(0)
 
 const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.bmp', '.avif'])
 
@@ -137,10 +150,15 @@ const renderedMarkdown = computed(() => {
 const displaySize = computed(() => {
   const bytes = props.fileSize
   if (!bytes) return ''
+  return formatBytes(bytes)
+})
+
+function formatBytes(bytes) {
+  if (!bytes) return ''
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`
-})
+}
 
 const downloadUrl = computed(() =>
   `/api/agents/${props.agentId}/files/download?path=${encodeURIComponent(props.filePath)}`
@@ -167,9 +185,11 @@ async function loadContent(force = false) {
   loading.value = true
   loadError.value = ''
   content.value = null
+  truncatedSize.value = 0
 
   try {
-    const res = await fetch(`/api/agents/${props.agentId}/files/content?path=${encodeURIComponent(props.filePath)}`)
+    const url = `/api/agents/${props.agentId}/files/content?path=${encodeURIComponent(props.filePath)}${force ? '&force=1' : ''}`
+    const res = await fetch(url)
     if (res.status === 413) {
       showLargeConfirm.value = true
       return
@@ -181,6 +201,9 @@ async function loadContent(force = false) {
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
       throw new Error(data.detail || `HTTP ${res.status}`)
+    }
+    if (res.headers.get('X-File-Truncated') === '1') {
+      truncatedSize.value = Number(res.headers.get('X-File-Truncated-Size') || 0)
     }
     content.value = await res.text()
   } catch (e) {
@@ -197,6 +220,7 @@ watch(
     loadError.value = ''
     showLargeConfirm.value = false
     isBinary.value = false
+    truncatedSize.value = 0
     loadContent()
   },
   { immediate: true }
