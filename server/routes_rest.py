@@ -627,7 +627,7 @@ async def resolve_file_path(agent_id: str, path: str = ""):
 
 
 @router.get("/agents/{agent_id}/files/content")
-async def file_content(agent_id: str, path: str = ""):
+async def file_content(agent_id: str, path: str = "", force: bool = False):
     cwd, abs_path, _ = _resolve_agent_path(agent_id, path)
     if not os.path.isfile(abs_path):
         raise HTTPException(400, "path is not a file")
@@ -637,7 +637,7 @@ async def file_content(agent_id: str, path: str = ""):
         raise HTTPException(500, "cannot stat file")
 
     MAX_SIZE = 1 * 1024 * 1024  # 1 MB
-    if size >= MAX_SIZE:
+    if size >= MAX_SIZE and not force:
         from fastapi.responses import Response
         return Response(status_code=413, headers={"X-File-Size": str(size)})
 

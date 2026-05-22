@@ -169,7 +169,8 @@ async function loadContent(force = false) {
   content.value = null
 
   try {
-    const res = await fetch(`/api/agents/${props.agentId}/files/content?path=${encodeURIComponent(props.filePath)}`)
+    const url = `/api/agents/${props.agentId}/files/content?path=${encodeURIComponent(props.filePath)}${force ? '&force=1' : ''}`
+    const res = await fetch(url)
     if (res.status === 413) {
       showLargeConfirm.value = true
       return
