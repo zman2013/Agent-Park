@@ -637,24 +637,33 @@ async def file_content(agent_id: str, path: str = "", force: bool = False):
         raise HTTPException(500, "cannot stat file")
 
     MAX_SIZE = 1 * 1024 * 1024  # 1 MB
+    FORCE_MAX_SIZE = 50 * 1024 * 1024  # 50 MB hard cap even when force=1
     if size >= MAX_SIZE and not force:
         from fastapi.responses import Response
         return Response(status_code=413, headers={"X-File-Size": str(size)})
 
-    # Binary detection: read first 512 bytes, then read whole file
+    read_limit = FORCE_MAX_SIZE if force else MAX_SIZE
+    truncated = force and size > FORCE_MAX_SIZE
+
+    # Binary detection: read first 512 bytes, then read up to read_limit total
     try:
         with open(abs_path, "rb") as f:
             head = f.read(512)
             if b"\x00" in head:
                 from fastapi.responses import Response
                 return Response(status_code=415, headers={"X-File-Size": str(size)})
-            rest = f.read()
+            remaining = max(0, read_limit - len(head))
+            rest = f.read(remaining)
         text = (head + rest).decode("utf-8", errors="replace")
     except (OSError, PermissionError) as e:
         raise HTTPException(500, str(e))
 
     from fastapi.responses import PlainTextResponse
-    return PlainTextResponse(text, headers={"X-File-Size": str(size)})
+    headers = {"X-File-Size": str(size)}
+    if truncated:
+        headers["X-File-Truncated"] = "1"
+        headers["X-File-Truncated-Size"] = str(read_limit)
+    return PlainTextResponse(text, headers=headers)
 
 
 @router.get("/agents/{agent_id}/files/download")
