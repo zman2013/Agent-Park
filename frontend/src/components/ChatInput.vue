@@ -51,6 +51,7 @@
         @keydown="handleKeydown"
         @input="handleInput"
         @blur="handleBlur"
+        @paste="handlePaste"
       ></textarea>
       <button
         class="bg-green-600 hover:bg-green-700 px-4 rounded-lg text-sm font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
@@ -260,6 +261,49 @@ function onFilesChosen(e) {
   }
   // Reset so picking the same file again retriggers change
   e.target.value = ''
+}
+
+function handlePaste(e) {
+  // Only intercept when the clipboard actually carries image files.
+  // Plain text paste must keep the browser default behavior.
+  if (!canUpload.value) return
+  const items = e.clipboardData?.items || []
+  const imageFiles = []
+  let hasText = false
+  for (const it of items) {
+    if (it.kind === 'file' && it.type.startsWith('image/')) {
+      const f = it.getAsFile()
+      if (f) imageFiles.push(f)
+    } else if (it.kind === 'string') {
+      // Any string item counts as text — text/plain, text/html, text/uri-list,
+      // rich-text payloads, etc. We must not preventDefault when any of these
+      // are present, otherwise the browser drops them silently.
+      hasText = true
+    }
+  }
+  if (imageFiles.length === 0) return
+  // Only suppress the default paste path when the clipboard is image-only.
+  // For mixed image+text clipboards, let the browser insert the text and
+  // we still pick up the image files for upload.
+  if (!hasText) {
+    e.preventDefault()
+  }
+  for (const f of imageFiles) {
+    startUpload(normalizePastedImage(f))
+  }
+}
+
+function normalizePastedImage(file) {
+  // Browsers hand pasted screenshots a generic name like "image.png" (or
+  // sometimes empty). Multiple pastes would collide visually in the chip
+  // list, so synthesize a timestamped name. Backend still uuid-prefixes
+  // the stored filename.
+  const generic = !file.name || file.name === 'image.png' || file.name === 'image'
+  if (!generic) return file
+  const subtype = (file.type.split('/')[1] || 'png').toLowerCase()
+  const ext = subtype === 'jpeg' ? 'jpg' : subtype
+  const ts = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)
+  return new File([file], `pasted-${ts}.${ext}`, { type: file.type })
 }
 
 function startUpload(file) {
