@@ -274,7 +274,10 @@ function handlePaste(e) {
     if (it.kind === 'file' && it.type.startsWith('image/')) {
       const f = it.getAsFile()
       if (f) imageFiles.push(f)
-    } else if (it.kind === 'string' && (it.type === 'text/plain' || it.type === 'text/html')) {
+    } else if (it.kind === 'string') {
+      // Any string item counts as text — text/plain, text/html, text/uri-list,
+      // rich-text payloads, etc. We must not preventDefault when any of these
+      // are present, otherwise the browser drops them silently.
       hasText = true
     }
   }
