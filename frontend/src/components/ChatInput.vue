@@ -269,14 +269,22 @@ function handlePaste(e) {
   if (!canUpload.value) return
   const items = e.clipboardData?.items || []
   const imageFiles = []
+  let hasText = false
   for (const it of items) {
     if (it.kind === 'file' && it.type.startsWith('image/')) {
       const f = it.getAsFile()
       if (f) imageFiles.push(f)
+    } else if (it.kind === 'string' && (it.type === 'text/plain' || it.type === 'text/html')) {
+      hasText = true
     }
   }
   if (imageFiles.length === 0) return
-  e.preventDefault()
+  // Only suppress the default paste path when the clipboard is image-only.
+  // For mixed image+text clipboards, let the browser insert the text and
+  // we still pick up the image files for upload.
+  if (!hasText) {
+    e.preventDefault()
+  }
   for (const f of imageFiles) {
     startUpload(normalizePastedImage(f))
   }
