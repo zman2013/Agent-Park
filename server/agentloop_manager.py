@@ -12,6 +12,7 @@ UI.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -862,6 +863,20 @@ _STATUS_DISPLAY: dict[str, tuple[str, str]] = {
 # ``running`` is excluded because the loop hasn't actually finished yet.
 _NOTIFIABLE_STATUSES = frozenset(_STATUS_DISPLAY.keys())
 
+# Per-loop notification lock to prevent duplicate system-message injection when
+# multiple triggers fire concurrently (e.g. an AgentLoop GET refresh racing the
+# 60s background sweep). The lock plus pre-await ``notified_at`` stamp gives us
+# a true compare-and-set under the asyncio event loop.
+_NOTIFY_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_notify_lock(loop_id: str) -> asyncio.Lock:
+    lock = _NOTIFY_LOCKS.get(loop_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _NOTIFY_LOCKS[loop_id] = lock
+    return lock
+
 
 def _read_summary_md(ws: WorkspacePaths | _LegacyWorkspacePaths) -> str | None:
     """Read ``summary.md`` from the workspace, truncating if oversize."""
@@ -929,78 +944,106 @@ async def notify_source_task(loop_id: str) -> bool:
     function is idempotent: every skip path that consumes a chance (no
     source task, task deleted) still stamps ``notified_at`` so we never
     retry. Genuine "not finished yet" cases (running) leave the flag alone.
+
+    Concurrency: a per-loop ``asyncio.Lock`` plus a ``notified_at`` stamp
+    written *before* any ``await`` ensures two concurrent triggers (GET
+    refresh + 60s sweep, or two simultaneous GETs) cannot both append a
+    system-message. Whichever coroutine grabs the lock first claims the
+    slot; the second sees ``notified_at`` set and bails.
     """
-    entry = _find(loop_id)
-    if not entry:
-        return False
-    if entry.get("notified_at"):
-        return False
+    async with _get_notify_lock(loop_id):
+        entry = _find(loop_id)
+        if not entry:
+            return False
+        if entry.get("notified_at"):
+            return False
 
-    status = (entry.get("status") or "").lower()
-    if status not in _NOTIFIABLE_STATUSES:
-        # ``running`` / ``stopped`` / unrecognised: leave for the next refresh.
-        # ``stopped`` is intentional — user asked for it, no need to ping back.
-        return False
+        status = (entry.get("status") or "").lower()
+        if status not in _NOTIFIABLE_STATUSES:
+            # ``running`` / ``stopped`` / unrecognised: leave for the next refresh.
+            # ``stopped`` is intentional — user asked for it, no need to ping back.
+            return False
 
-    source_task_id = entry.get("source_task_id")
-    if not source_task_id:
-        # No origin recorded — nothing we can deliver to. Stamp so we don't
-        # waste cycles re-checking on every poll/refresh.
+        source_task_id = entry.get("source_task_id")
+        if not source_task_id:
+            # No origin recorded — nothing we can deliver to. Stamp so we don't
+            # waste cycles re-checking on every poll/refresh.
+            _update_fields(loop_id, notified_at=_utcnow())
+            return False
+
+        # Imports kept local to avoid a circular at module-load time
+        # (agentloop_manager is imported by routes_agentloop, which is imported
+        # by main.py before app_state is fully wired).
+        from server.state import app_state
+        from server.models import Message
+        from server.routes_ws import broadcast, task_updated_message
+
+        task = app_state.get_task(source_task_id)
+        if task is None:
+            # Source task was deleted before the loop finished — stamp and skip.
+            _update_fields(loop_id, notified_at=_utcnow())
+            return False
+
+        try:
+            ws = _entry_workspace(entry)
+        except ValueError:
+            logger.exception("notify_source_task: cannot resolve workspace for %s", loop_id)
+            return False
+
+        try:
+            content = _render_completion_message(entry, ws)
+        except Exception:  # noqa: BLE001
+            logger.exception("notify_source_task: failed to render message for %s", loop_id)
+            return False
+
+        # Stamp ``notified_at`` BEFORE any ``await`` so that even if a
+        # concurrent trigger somehow bypassed the lock (e.g. across
+        # processes via the registry file), the second one would see
+        # the stamp and bail out. Combined with the lock above, this
+        # gives us strong idempotency under the in-process event loop.
         _update_fields(loop_id, notified_at=_utcnow())
-        return False
 
-    # Imports kept local to avoid a circular at module-load time
-    # (agentloop_manager is imported by routes_agentloop, which is imported
-    # by main.py before app_state is fully wired).
-    from server.state import app_state
-    from server.models import Message
-    from server.routes_ws import broadcast
+        msg = Message(role="agent", type="system", streaming=False, content=content)
+        task.messages.append(msg)
+        # Bump the task's updated_at so the UI surfaces this completed
+        # task at the top of its agent's task list and the unseen badge
+        # logic (driven by updated_at, not just message append) fires
+        # for users who don't have the task currently open.
+        from server.models import _utcnow as _model_utcnow
+        task.updated_at = _model_utcnow()
 
-    task = app_state.get_task(source_task_id)
-    if task is None:
-        # Source task was deleted before the loop finished — stamp and skip.
-        _update_fields(loop_id, notified_at=_utcnow())
-        return False
+        try:
+            await broadcast({
+                "type": "message",
+                "task_id": source_task_id,
+                "message": msg.model_dump(),
+            })
+        except Exception:  # noqa: BLE001
+            # Broadcast failures shouldn't block persistence — the message is
+            # already in memory and will be saved below.
+            logger.exception("notify_source_task: broadcast failed for %s", loop_id)
 
-    try:
-        ws = _entry_workspace(entry)
-    except ValueError:
-        logger.exception("notify_source_task: cannot resolve workspace for %s", loop_id)
-        return False
+        # Notify list views / sidebar that the task's recency changed so
+        # finished loops bubble up even when the source task isn't open.
+        try:
+            await broadcast(task_updated_message(task))
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "notify_source_task: task_updated broadcast failed for %s", loop_id
+            )
 
-    try:
-        content = _render_completion_message(entry, ws)
-    except Exception:  # noqa: BLE001
-        logger.exception("notify_source_task: failed to render message for %s", loop_id)
-        return False
+        # Persist the message — this is mandatory for already-finished tasks since
+        # the normal save_agent_tasks calls (driven by agent_runner) won't fire.
+        try:
+            app_state.save_agent_tasks(task.agent_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("notify_source_task: persist failed for %s", loop_id)
 
-    msg = Message(role="agent", type="system", streaming=False, content=content)
-    task.messages.append(msg)
-
-    try:
-        await broadcast({
-            "type": "message",
-            "task_id": source_task_id,
-            "message": msg.model_dump(),
-        })
-    except Exception:  # noqa: BLE001
-        # Broadcast failures shouldn't block persistence — the message is
-        # already in memory and will be saved below.
-        logger.exception("notify_source_task: broadcast failed for %s", loop_id)
-
-    # Persist the message — this is mandatory for already-finished tasks since
-    # the normal save_agent_tasks calls (driven by agent_runner) won't fire.
-    try:
-        app_state.save_agent_tasks(task.agent_id)
-    except Exception:  # noqa: BLE001
-        logger.exception("notify_source_task: persist failed for %s", loop_id)
-
-    _update_fields(loop_id, notified_at=_utcnow())
-    logger.info(
-        "AgentLoop %s notified source task %s (status=%s)",
-        loop_id, source_task_id, status,
-    )
-    return True
+        logger.info(
+            "AgentLoop %s notified source task %s (status=%s)",
+            loop_id, source_task_id, status,
+        )
+        return True
 
 
 async def notify_pending() -> int:
