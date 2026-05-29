@@ -112,9 +112,14 @@ def main() -> None:
         assert "cycles**: 7" in msg.content
         assert "¥1.23" in msg.content
         assert "all good" in msg.content
-        assert len(broadcast_calls) == 1
+        # Two broadcasts: the inserted message + a task_updated bump so the
+        # finished task surfaces in sidebar/list views.
+        assert len(broadcast_calls) == 2, broadcast_calls
         assert broadcast_calls[0]["type"] == "message"
         assert broadcast_calls[0]["task_id"] == task_id
+        assert broadcast_calls[1]["type"] == "task_updated"
+        assert broadcast_calls[1]["task_id"] == task_id
+        assert broadcast_calls[1]["fields"]["updated_at"] == task.updated_at
         assert alm._find("L-happy").get("notified_at"), "notified_at must be stamped"
         # Persisted on disk
         persisted = json.loads((sandbox / "tasks" / "agent-1.json").read_text())
