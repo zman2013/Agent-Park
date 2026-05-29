@@ -797,7 +797,7 @@ class AgentRunner:
                 os.close(slave_fd)
             if agent_cwd:
                 os.chdir(agent_cwd)
-            env = _clean_env()
+            env = _clean_env(task_id)
             os.execvpe(args[0], args, env)
             # execvpe does not return
         else:
@@ -875,7 +875,7 @@ class AgentRunner:
         ctx: _RunContext,
         run_id: str = "",
     ) -> None:
-        env = _clean_env()
+        env = _clean_env(task_id)
 
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -1244,9 +1244,9 @@ def _read_proc_start_time(pid: int) -> int | None:
     except Exception:
         return None
 
-def _clean_env() -> dict[str, str]:
+def _clean_env(task_id: str = "") -> dict[str, str]:
     """Return a copy of os.environ with virtualenv and Claude Code session
-    markers stripped.
+    markers stripped, optionally tagged with the current agent task id.
 
     Only the nested-session marker keys (CLAUDECODE / CLAUDE_CODE_ENTRYPOINT /
     CLAUDE_CODE_SSE_PORT) are stripped — other CLAUDE_CODE_* vars
@@ -1254,6 +1254,13 @@ def _clean_env() -> dict[str, str]:
     legitimate backend auth / routing config and must be preserved, otherwise
     Bedrock/Vertex-AI setups lose their routing and fall back to public API
     (or fail entirely).
+
+    When ``task_id`` is non-empty we inject ``AGENTPARK_TASK_ID``. Skills
+    running inside the agent process (e.g. the agentloop skill) read this to
+    self-identify when calling back into agent-park's REST API. The variable
+    is intentionally only set for child agent processes — keeping it absent
+    from the server's own environment avoids polluting unrelated subshells
+    spawned from the main FastAPI process.
     """
     env = os.environ.copy()
     venv = env.pop("VIRTUAL_ENV", None)
@@ -1265,6 +1272,8 @@ def _clean_env() -> dict[str, str]:
         path_parts = env.get("PATH", "").split(os.pathsep)
         path_parts = [p for p in path_parts if p != venv_bin]
         env["PATH"] = os.pathsep.join(path_parts)
+    if task_id:
+        env["AGENTPARK_TASK_ID"] = task_id
     return env
 
 
