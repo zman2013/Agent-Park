@@ -12,6 +12,7 @@ UI.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -829,3 +830,241 @@ def _list_runs(ws: WorkspacePaths) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+# ── source-task notification ─────────────────────────────────────────────────
+#
+# When an agentloop is spawned via the /agentloop skill, the registry records
+# the originating agent task as ``source_task_id``. The loop runs detached and
+# the source task usually finishes long before the loop does. ``notify_source_task``
+# closes that loop: once a loop transitions out of ``running``, we inject a
+# ``type="system"`` message back into the source task with status + cycles +
+# cost + summary.md, so the user sees the result inline in the original
+# conversation without having to open the AgentLoop side panel.
+#
+# Triggered from two places: (a) every GET on /api/agentloops* refreshes status
+# and fires a fire-and-forget call, and (b) ``_agentloop_notify_loop`` in
+# routes_ws polls every 60 s as a fallback when no UI is open. ``notified_at``
+# in the registry guarantees idempotency across both paths.
+
+_SUMMARY_MAX_BYTES = 20 * 1024  # truncate summary.md beyond this in the message
+
+_STATUS_DISPLAY: dict[str, tuple[str, str]] = {
+    # status → (emoji, 中文标签)
+    "done": ("✅", "完成"),
+    "partial": ("⚠️", "部分完成"),
+    "exhausted": ("⏱️", "资源耗尽"),
+    "error": ("❌", "失败"),
+    "unknown": ("❓", "未知"),
+}
+
+# Statuses that warrant notification. ``stopped`` is excluded on purpose:
+# the user explicitly asked the loop to stop, so they don't need a poke.
+# ``running`` is excluded because the loop hasn't actually finished yet.
+_NOTIFIABLE_STATUSES = frozenset(_STATUS_DISPLAY.keys())
+
+# Per-loop notification lock to prevent duplicate system-message injection when
+# multiple triggers fire concurrently (e.g. an AgentLoop GET refresh racing the
+# 60s background sweep). The lock plus pre-await ``notified_at`` stamp gives us
+# a true compare-and-set under the asyncio event loop.
+_NOTIFY_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_notify_lock(loop_id: str) -> asyncio.Lock:
+    lock = _NOTIFY_LOCKS.get(loop_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _NOTIFY_LOCKS[loop_id] = lock
+    return lock
+
+
+def _read_summary_md(ws: WorkspacePaths | _LegacyWorkspacePaths) -> str | None:
+    """Read ``summary.md`` from the workspace, truncating if oversize."""
+    summary_path = ws.workspace_dir / "summary.md"
+    if not summary_path.is_file():
+        return None
+    try:
+        data = summary_path.read_bytes()
+    except OSError:
+        return None
+    if len(data) <= _SUMMARY_MAX_BYTES:
+        return data.decode("utf-8", errors="replace")
+    head = data[:_SUMMARY_MAX_BYTES].decode("utf-8", errors="replace")
+    return head + "\n\n… (truncated, 完整版见 workspace 内 summary.md)"
+
+
+def _render_completion_message(
+    entry: dict[str, Any],
+    ws: WorkspacePaths | _LegacyWorkspacePaths,
+) -> str:
+    """Build the markdown body of the system message injected into the source task."""
+    status = (entry.get("status") or "unknown").lower()
+    emoji, label = _STATUS_DISPLAY.get(status, _STATUS_DISPLAY["unknown"])
+
+    state = _read_state(ws) or {}
+    cycle = int(state.get("cycle", 0))
+    total_cost = float(state.get("total_cost_cny", 0.0))
+    exhausted_reason = state.get("exhausted_reason") or "(完成)"
+    workspace_dir = entry.get("workspace_dir") or str(ws.workspace_dir)
+    design_path = entry.get("design_path") or str(ws.design)
+    loop_id = entry.get("loop_id", "")
+
+    lines = [
+        f"## 🎯 AgentLoop 已结束（{emoji} {label}）",
+        "",
+        f"- **退出原因**: {exhausted_reason}",
+        f"- **cycles**: {cycle}",
+        f"- **总成本**: ¥{total_cost:.2f}",
+        f"- **workspace**: `{workspace_dir}`",
+        f"- **design**: `{design_path}`",
+        f"- **loop_id**: `{loop_id}` （在左侧 AgentLoop 面板中点击可查看完整流水）",
+    ]
+
+    summary = _read_summary_md(ws)
+    if summary is None:
+        lines += ["", "> summary.md 未生成"]
+    else:
+        lines += [
+            "",
+            "<details>",
+            "<summary>📄 summary.md</summary>",
+            "",
+            summary.rstrip(),
+            "",
+            "</details>",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+async def notify_source_task(loop_id: str) -> bool:
+    """Inject a completion system-message into the loop's source agent task.
+
+    Returns ``True`` if a fresh notification was posted, ``False`` if skipped
+    (already notified, status not notifiable, no source task, etc.). The
+    function is idempotent: every skip path that consumes a chance (no
+    source task, task deleted) still stamps ``notified_at`` so we never
+    retry. Genuine "not finished yet" cases (running) leave the flag alone.
+
+    Concurrency: a per-loop ``asyncio.Lock`` plus a ``notified_at`` stamp
+    written *before* any ``await`` ensures two concurrent triggers (GET
+    refresh + 60s sweep, or two simultaneous GETs) cannot both append a
+    system-message. Whichever coroutine grabs the lock first claims the
+    slot; the second sees ``notified_at`` set and bails.
+    """
+    async with _get_notify_lock(loop_id):
+        entry = _find(loop_id)
+        if not entry:
+            return False
+        if entry.get("notified_at"):
+            return False
+
+        status = (entry.get("status") or "").lower()
+        if status not in _NOTIFIABLE_STATUSES:
+            # ``running`` / ``stopped`` / unrecognised: leave for the next refresh.
+            # ``stopped`` is intentional — user asked for it, no need to ping back.
+            return False
+
+        source_task_id = entry.get("source_task_id")
+        if not source_task_id:
+            # No origin recorded — nothing we can deliver to. Stamp so we don't
+            # waste cycles re-checking on every poll/refresh.
+            _update_fields(loop_id, notified_at=_utcnow())
+            return False
+
+        # Imports kept local to avoid a circular at module-load time
+        # (agentloop_manager is imported by routes_agentloop, which is imported
+        # by main.py before app_state is fully wired).
+        from server.state import app_state
+        from server.models import Message
+        from server.routes_ws import broadcast, task_updated_message
+
+        task = app_state.get_task(source_task_id)
+        if task is None:
+            # Source task was deleted before the loop finished — stamp and skip.
+            _update_fields(loop_id, notified_at=_utcnow())
+            return False
+
+        try:
+            ws = _entry_workspace(entry)
+        except ValueError:
+            logger.exception("notify_source_task: cannot resolve workspace for %s", loop_id)
+            return False
+
+        try:
+            content = _render_completion_message(entry, ws)
+        except Exception:  # noqa: BLE001
+            logger.exception("notify_source_task: failed to render message for %s", loop_id)
+            return False
+
+        # Stamp ``notified_at`` BEFORE any ``await`` so that even if a
+        # concurrent trigger somehow bypassed the lock (e.g. across
+        # processes via the registry file), the second one would see
+        # the stamp and bail out. Combined with the lock above, this
+        # gives us strong idempotency under the in-process event loop.
+        _update_fields(loop_id, notified_at=_utcnow())
+
+        msg = Message(role="agent", type="system", streaming=False, content=content)
+        task.messages.append(msg)
+        # Bump the task's updated_at so the UI surfaces this completed
+        # task at the top of its agent's task list and the unseen badge
+        # logic (driven by updated_at, not just message append) fires
+        # for users who don't have the task currently open.
+        from server.models import _utcnow as _model_utcnow
+        task.updated_at = _model_utcnow()
+
+        try:
+            await broadcast({
+                "type": "message",
+                "task_id": source_task_id,
+                "message": msg.model_dump(),
+            })
+        except Exception:  # noqa: BLE001
+            # Broadcast failures shouldn't block persistence — the message is
+            # already in memory and will be saved below.
+            logger.exception("notify_source_task: broadcast failed for %s", loop_id)
+
+        # Notify list views / sidebar that the task's recency changed so
+        # finished loops bubble up even when the source task isn't open.
+        try:
+            await broadcast(task_updated_message(task))
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "notify_source_task: task_updated broadcast failed for %s", loop_id
+            )
+
+        # Persist the message — this is mandatory for already-finished tasks since
+        # the normal save_agent_tasks calls (driven by agent_runner) won't fire.
+        try:
+            app_state.save_agent_tasks(task.agent_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("notify_source_task: persist failed for %s", loop_id)
+
+        logger.info(
+            "AgentLoop %s notified source task %s (status=%s)",
+            loop_id, source_task_id, status,
+        )
+        return True
+
+
+async def notify_pending() -> int:
+    """Sweep the registry and notify every entry whose status is finalized
+    but ``notified_at`` is still empty. Returns the number of fresh
+    notifications delivered. Safe to call repeatedly — fully idempotent.
+    """
+    delivered = 0
+    # ``list_all`` invokes ``_refresh_status`` for each entry, so any newly
+    # finished loops get their status updated to one of the notifiable values
+    # before we read them back here.
+    for entry in list_all(include_dismissed=True):
+        if entry.get("notified_at"):
+            continue
+        if (entry.get("status") or "").lower() not in _NOTIFIABLE_STATUSES:
+            continue
+        try:
+            if await notify_source_task(entry["loop_id"]):
+                delivered += 1
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "notify_pending: error notifying loop %s", entry.get("loop_id")
+            )
+    return delivered

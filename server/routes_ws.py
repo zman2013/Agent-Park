@@ -18,9 +18,11 @@ logger = logging.getLogger(__name__)
 clients: set[WebSocket] = set()
 SEND_TIMEOUT_SECONDS = 2.0
 HEARTBEAT_INTERVAL_SECONDS = 20.0
+AGENTLOOP_NOTIFY_INTERVAL_SECONDS = 60.0
 _heartbeat_task: asyncio.Task | None = None
 _daily_summary_task: asyncio.Task | None = None
 _wiki_ingest_task: asyncio.Task | None = None
+_agentloop_notify_task: asyncio.Task | None = None
 
 
 async def broadcast(msg: dict[str, Any]) -> None:
@@ -489,3 +491,44 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
             "agent_id": agent_id,
             "error": str(exc),
         })
+
+
+# ── AgentLoop Completion Notify ────────────────────────────────────────────
+
+
+def ensure_agentloop_notify_task() -> None:
+    """Start the periodic agentloop completion-notify loop if not running.
+
+    The route handlers (``GET /api/agentloops*``) also schedule notifications
+    on demand, but only when something queries them. This background poller
+    is the fallback path: even if the user never opens the UI, finished loops
+    still get reported back to their source agent task within a minute.
+    """
+    global _agentloop_notify_task
+    if _agentloop_notify_task is None or _agentloop_notify_task.done():
+        _agentloop_notify_task = asyncio.create_task(
+            _agentloop_notify_loop(), name="agentloop-notify"
+        )
+
+
+async def _agentloop_notify_loop() -> None:
+    """Sweep the agentloop registry every 60 s and notify any newly finished
+    loops back to their source agent task. Idempotency lives in
+    ``agentloop_manager.notify_source_task`` (``notified_at`` flag), so this
+    loop is safe to run alongside the route-handler triggered path.
+    """
+    from server import agentloop_manager
+
+    while True:
+        try:
+            await asyncio.sleep(AGENTLOOP_NOTIFY_INTERVAL_SECONDS)
+            delivered = await agentloop_manager.notify_pending()
+            if delivered:
+                logger.info("AgentLoop notify: delivered %d completion message(s)", delivered)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            # Never let a single iteration error kill the long-lived task —
+            # log and keep looping. The 60 s sleep above already provides
+            # natural backoff.
+            logger.exception("AgentLoop notify loop iteration failed")
