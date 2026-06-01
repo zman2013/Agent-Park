@@ -428,6 +428,12 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         # the stale flag and unexpectedly auto-send /compact.
         await runner.maybe_dispatch_auto_compact(task_id, success=False)
 
+        # Same for handoff: a stopped step-1+2 turn would otherwise leave
+        # _handoff_pending / _handoff_finishing dangling, so the next
+        # unrelated successful turn on this task would auto-send step 3
+        # and merge to the global wiki even though the user cancelled.
+        await runner.maybe_dispatch_handoff(task_id, success=False)
+
         # Finalize any in-flight streaming bubbles. kill_task() cancels the
         # subprocess before the adapter can emit content_block_stop /
         # message_done, so without this the stopped transcript would keep

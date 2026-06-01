@@ -41,8 +41,15 @@ If the user passed arguments, treat them as a description of what the next sessi
 
 
 # 步骤 2：同步 sync-principles
+# 注意：sync-principles 这个 skill 文件不一定在项目本地，需要按以下顺序回退：
+#   1. 项目本地 docs/handoff/skills/sync-principles/SKILL.md（首选）
+#   2. 全局 /data1/common/wiki/handoff/skills/sync-principles/SKILL.md（回退）
+# 两处都不存在时跳过此步并说明，避免引用不存在文件导致 agent 卡住。
 STEP_2_PROMPT = """\
-执行 docs/handoff/skills/sync-principles/SKILL.md
+执行 sync-principles skill：按以下顺序定位并执行该 skill 文件：
+1. 优先使用项目本地路径：docs/handoff/skills/sync-principles/SKILL.md
+2. 若项目本地不存在，使用全局 wiki 路径：/data1/common/wiki/handoff/skills/sync-principles/SKILL.md
+3. 若两处都不存在，输出一行说明 “sync-principles skill 不可用，跳过本步”，然后直接进入下一步。
 """
 
 
