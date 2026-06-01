@@ -45,6 +45,13 @@
         class="ml-3 text-gray-600 hover:text-gray-300 transition-colors px-1"
         title="复制全部对话（排除工具交互）"
       >复制对话</button>
+      <button
+        @click="triggerHandoff"
+        class="ml-3 text-gray-600 hover:text-blue-300 transition-colors px-1"
+        title="整理 docs/handoff/ 知识树并 merge 到全局 wiki（运行中禁用）"
+        :disabled="task.status === 'running'"
+        :class="{ 'opacity-40 cursor-not-allowed': task.status === 'running' }"
+      >📤 Handoff</button>
     </div>
     <div ref="chatContainer" class="flex-1 overflow-auto p-6 space-y-3" @scroll="onScroll">
       <div v-if="!task.messages_loaded && task.messages.length === 0" class="text-gray-600 text-sm text-center mt-20">
@@ -310,5 +317,16 @@ function triggerStop() {
     detail: { taskId: props.task.id }
   }))
   store.addToast('已发送停止指令', 'info')
+}
+
+function triggerHandoff() {
+  if (props.task.status === 'running') {
+    store.addToast('任务进行中，无法发起 Handoff', 'warning')
+    return
+  }
+  window.dispatchEvent(new CustomEvent('trigger-handoff', {
+    detail: { taskId: props.task.id }
+  }))
+  store.addToast('已发起 Handoff 流程', 'info')
 }
 </script>

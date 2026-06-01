@@ -278,6 +278,10 @@ export function useWebSocket() {
     send({ type: 'trigger_compact', task_id: taskId })
   }
 
+  function triggerHandoff(taskId) {
+    send({ type: 'trigger_handoff', task_id: taskId })
+  }
+
   function stopTask(taskId) {
     send({ type: 'stop_task', task_id: taskId })
   }
@@ -294,12 +298,17 @@ export function useWebSocket() {
     stopTask(e.detail.taskId)
   }
 
+  function onTriggerHandoffEvent(e) {
+    triggerHandoff(e.detail.taskId)
+  }
+
   onMounted(() => {
     disposed = false
     connect()
     window.addEventListener('generate-summary', onGenerateSummaryEvent)
     window.addEventListener('trigger-compact', onTriggerCompactEvent)
     window.addEventListener('trigger-stop-task', onTriggerStopTaskEvent)
+    window.addEventListener('trigger-handoff', onTriggerHandoffEvent)
   })
 
   onUnmounted(() => {
@@ -311,6 +320,7 @@ export function useWebSocket() {
     window.removeEventListener('generate-summary', onGenerateSummaryEvent)
     window.removeEventListener('trigger-compact', onTriggerCompactEvent)
     window.removeEventListener('trigger-stop-task', onTriggerStopTaskEvent)
+    window.removeEventListener('trigger-handoff', onTriggerHandoffEvent)
     if (ws) {
       const socket = ws
       ws = null
@@ -328,6 +338,7 @@ export function useWebSocket() {
     forkTask,
     generateSummary,
     triggerCompact,
+    triggerHandoff,
     stopTask,
   }
 }
