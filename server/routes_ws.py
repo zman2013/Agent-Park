@@ -394,7 +394,7 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
             role="agent",
             type="system",
             streaming=False,
-            content="📤 已发起 Handoff 流程，第 1/2 步：整理 docs/handoff/ 并同步 sync-principles…",
+            content="📤 已发起 Handoff 流程：整理 docs/handoff/ 并同步 sync-principles…",
         )
         task.messages.append(notice)
         app_state.save_agent_tasks(task.agent_id)
@@ -404,10 +404,7 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
             "message": notice.model_dump(),
         })
 
-        # Mark this task so that when the upcoming turn finishes successfully,
-        # _finish_task → maybe_dispatch_handoff() will auto-send step 3.
         runner._handoff_pending.add(task_id)
-        runner._handoff_finishing.discard(task_id)
         await runner.send_input(task_id, step_1_and_2())
 
     elif msg_type == "stop_task":
@@ -428,10 +425,9 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         # the stale flag and unexpectedly auto-send /compact.
         await runner.maybe_dispatch_auto_compact(task_id, success=False)
 
-        # Same for handoff: a stopped step-1+2 turn would otherwise leave
-        # _handoff_pending / _handoff_finishing dangling, so the next
-        # unrelated successful turn on this task would auto-send step 3
-        # and merge to the global wiki even though the user cancelled.
+        # Same for handoff: a stopped turn would otherwise leave _handoff_pending
+        # dangling, so the next unrelated successful turn on this task would
+        # unexpectedly auto-send the handoff prompt again.
         await runner.maybe_dispatch_handoff(task_id, success=False)
 
         # Finalize any in-flight streaming bubbles. kill_task() cancels the

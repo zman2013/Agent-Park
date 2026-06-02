@@ -1,14 +1,7 @@
 """Prompts used by the Handoff feature.
 
-Handoff 流程将当前 agent session 的上下文整理为 docs/handoff/ 知识树，
-然后融合到全局 /data1/common/wiki/handoff/ 仓库。整体分两轮发送：
-
-第一轮（STEP_1_AND_2）：整理 docs/handoff/ + 同步 sync-principles。
-该 prompt 直接发给当前 session 的 agent，复用其上下文。
-
-第二轮（STEP_3_MERGE）：在当前 session 内继续触发，让 agent 把
-docs/handoff/ 融合到 /data1/common/wiki/handoff/。完成后由后端
-发送 system 消息通知 handoff 流程结束。
+Handoff 流程将当前 agent session 的上下文整理为 docs/handoff/ 知识树。
+整理完成后同步执行 sync-principles skill。
 """
 
 from __future__ import annotations
@@ -49,45 +42,18 @@ STEP_2_PROMPT = """\
 执行 sync-principles skill：按以下顺序定位并执行该 skill 文件：
 1. 优先使用项目本地路径：docs/handoff/skills/sync-principles/SKILL.md
 2. 若项目本地不存在，使用全局 wiki 路径：/data1/common/wiki/handoff/skills/sync-principles/SKILL.md
-3. 若两处都不存在，输出一行说明 “sync-principles skill 不可用，跳过本步”，然后直接进入下一步。
-"""
-
-
-# 步骤 3：merge 到全局 wiki
-STEP_3_PROMPT = """\
-把 docs/handoff/ 的内容融合到 /data1/common/wiki/handoff/：
-diff 两边 INDEX.md，只把本项目新增/更新的内容融合到目标仓
-共享段（持久知识来源、跨切面规则）两边对齐
-不删除本项目源文件——完成后两边都有副本
-
-完成后请输出一份简短的 summary：列出本次 merge 涉及的关键文件和决策要点。
+3. 若两处都不存在，输出一行说明 "sync-principles skill 不可用，跳过本步"，然后直接进入下一步。
 """
 
 
 def step_1_and_2() -> str:
     """合并步骤 1 和步骤 2 为一段顺序 prompt，单次发送给当前 session。"""
     return (
-        "Handoff 流程 (1/2)：先执行下面这段（整理 docs/handoff/），"
-        "完成后接着执行第二段（同步 sync-principles）。\n\n"
+        "Handoff 流程：先执行下面这段（整理 docs/handoff/），"
+        "完成后接着执行第二段（同步 sync-principles）。\n"
+        "【重要】直接在当前对话中执行，禁止启动 workflow、子 agent 或任何后台任务。\n\n"
         "─── 第一步 ───\n"
         f"{STEP_1_PROMPT}\n"
         "─── 第二步 ───\n"
         f"{STEP_2_PROMPT}"
     )
-
-
-def step_3() -> str:
-    """步骤 3：merge 到全局 wiki。"""
-    return (
-        "Handoff 流程 (2/2)：现在请把本项目 docs/handoff/ 融合到全局仓。\n\n"
-        f"{STEP_3_PROMPT}"
-    )
-
-
-# 完成 handoff 后由后端写入 task 的系统消息文案
-COMPLETION_SYSTEM_MESSAGE = (
-    "✅ Handoff 流程完成。\n"
-    "- 步骤 1/2：已整理 docs/handoff/ 并同步 sync-principles\n"
-    "- 步骤 3：已 merge 到 /data1/common/wiki/handoff/\n"
-    "请检查 agent 输出的 summary 确认细节。"
-)
