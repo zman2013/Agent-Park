@@ -68,7 +68,8 @@ def step_1_and_2() -> str:
     """合并步骤 1 和步骤 2 为一段顺序 prompt，单次发送给当前 session。"""
     return (
         "Handoff 流程 (1/2)：先执行下面这段（整理 docs/handoff/），"
-        "完成后接着执行第二段（同步 sync-principles）。\n\n"
+        "完成后接着执行第二段（同步 sync-principles）。\n"
+        "【重要】直接在当前对话中执行，禁止启动 workflow、子 agent 或任何后台任务。\n\n"
         "─── 第一步 ───\n"
         f"{STEP_1_PROMPT}\n"
         "─── 第二步 ───\n"
@@ -79,7 +80,8 @@ def step_1_and_2() -> str:
 def step_3() -> str:
     """步骤 3：merge 到全局 wiki。"""
     return (
-        "Handoff 流程 (2/2)：现在请把本项目 docs/handoff/ 融合到全局仓。\n\n"
+        "Handoff 流程 (2/2)：现在请把本项目 docs/handoff/ 融合到全局仓。\n"
+        "【重要】直接在当前对话中执行，禁止启动 workflow、子 agent 或任何后台任务。\n\n"
         f"{STEP_3_PROMPT}"
     )
 
