@@ -528,10 +528,8 @@ class AgentRunner:
         self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
         self._compact_warned: set[str] = set()    # task_ids that already got a compact warning this round
         self._compact_pending: set[str] = set()   # task_ids slated to receive an auto /compact after this turn
-        # task_ids whose handoff step 1+2 turn just finished — dispatch step 3 next.
+        # task_ids whose handoff turn just finished — broadcast completion notice next.
         self._handoff_pending: set[str] = set()
-        # task_ids whose handoff step 3 turn just finished — broadcast completion notice next.
-        self._handoff_finishing: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
@@ -781,65 +779,14 @@ class AgentRunner:
         await asyncio.sleep(0)
 
     async def maybe_dispatch_handoff(self, task_id: str, *, success: bool) -> None:
-        """Drive the multi-turn handoff state machine after a turn finishes.
+        """Clear handoff pending flag after a turn finishes.
 
-        Two stages:
-          1. ``_handoff_pending`` set → step 1+2 turn just finished, send step 3.
-          2. ``_handoff_finishing`` set → step 3 turn just finished, broadcast
-             a completion system message.
-
-        Always clears the corresponding flag so a failed turn does not leak a
+        Always clears ``_handoff_pending`` so a failed turn does not leak a
         stale flag onto an unrelated subsequent run.
         """
-        from server.handoff_prompts import COMPLETION_SYSTEM_MESSAGE, step_3
-        from server.routes_ws import broadcast
-
-        # Stage 2: step 3 finished → completion notice.
-        if task_id in self._handoff_finishing:
-            self._handoff_finishing.discard(task_id)
-            task = app_state.get_task(task_id)
-            if task and success:
-                notice = Message(
-                    role="agent",
-                    type="system",
-                    streaming=False,
-                    content=COMPLETION_SYSTEM_MESSAGE,
-                )
-                task.messages.append(notice)
-                app_state.save_agent_tasks(task.agent_id)
-                await broadcast({
-                    "type": "message",
-                    "task_id": task_id,
-                    "message": notice.model_dump(),
-                })
-            return
-
-        # Stage 1: step 1+2 finished → kick off step 3.
         if task_id not in self._handoff_pending:
             return
         self._handoff_pending.discard(task_id)
-        if not success:
-            return
-        task = app_state.get_task(task_id)
-        if task:
-            notice = Message(
-                role="agent",
-                type="system",
-                streaming=False,
-                content="🤖 Handoff 步骤 1/2 完成，正在执行步骤 2/2：merge 到全局 wiki…",
-            )
-            task.messages.append(notice)
-            app_state.save_agent_tasks(task.agent_id)
-            await broadcast({
-                "type": "message",
-                "task_id": task_id,
-                "message": notice.model_dump(),
-            })
-        self._handoff_finishing.add(task_id)
-        await self.send_input(task_id, step_3(), kill_existing=False)
-        # Yield so the new run claims ownership before any pending finally-block
-        # cleanup in the just-finished subprocess fires (mirrors auto-compact).
-        await asyncio.sleep(0)
 
     # ── PTY mode (cco/ccs) ──────────────────────────────────────────────
 
@@ -1204,7 +1151,6 @@ class AgentRunner:
         self._compact_warned.discard(task_id)
         self._compact_pending.discard(task_id)
         self._handoff_pending.discard(task_id)
-        self._handoff_finishing.discard(task_id)
 
     # ── orphan task restore ─────────────────────────────────────────────
 

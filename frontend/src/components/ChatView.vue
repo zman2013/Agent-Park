@@ -48,7 +48,7 @@
       <button
         @click="triggerHandoff"
         class="ml-3 text-gray-600 hover:text-blue-300 transition-colors px-1"
-        title="整理 docs/handoff/ 知识树并 merge 到全局 wiki（运行中禁用）"
+        title="整理 docs/handoff/ 知识树并同步 sync-principles（运行中禁用）"
         :disabled="task.status === 'running'"
         :class="{ 'opacity-40 cursor-not-allowed': task.status === 'running' }"
       >📤 Handoff</button>
