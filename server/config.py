@@ -103,6 +103,11 @@ def knowledge_config() -> dict:
     }
 
 
+def prompt_contexts_config() -> list[dict]:
+    """Return prompt context checkbox list with defaults."""
+    return get_config().get("prompt_contexts", [])
+
+
 def wiki_search_config() -> dict:
     """Return wiki search configuration with defaults.
 
