@@ -137,13 +137,18 @@ async function fetchPromptContexts() {
     if (!res.ok) return
     const list = await res.json()
     promptContexts.value = list
+    if (!list.length) return
     const saved = loadCheckedContexts()
     if (saved !== null) {
-      checkedContexts.value = saved
+      // Merge any newly added default contexts that weren't present when the user last saved
+      const knownIds = new Set(list.map(c => c.id))
+      const savedIds = new Set([...saved].filter(id => knownIds.has(id)))
+      const newDefaults = list.filter(c => c.default && !saved.has(c.id)).map(c => c.id)
+      checkedContexts.value = new Set([...savedIds, ...newDefaults])
     } else {
       checkedContexts.value = new Set(list.filter(c => c.default).map(c => c.id))
-      saveCheckedContexts()
     }
+    saveCheckedContexts()
   } catch {}
 }
 
