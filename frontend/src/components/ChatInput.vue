@@ -109,17 +109,26 @@ const promptContexts = ref([])
 const checkedContexts = ref(new Set())
 
 const CONTEXT_STORAGE_KEY = 'prompt_context_checked'
+const CONTEXT_SEEN_KEY = 'prompt_context_seen'
 
-function loadCheckedContexts() {
+function loadContextState() {
   try {
     const saved = localStorage.getItem(CONTEXT_STORAGE_KEY)
-    if (saved) return new Set(JSON.parse(saved))
+    const seen = localStorage.getItem(CONTEXT_SEEN_KEY)
+    if (saved !== null) {
+      return {
+        checked: new Set(JSON.parse(saved)),
+        seen: seen ? new Set(JSON.parse(seen)) : null,
+      }
+    }
   } catch {}
   return null
 }
 
-function saveCheckedContexts() {
+function saveContextState() {
+  const ids = promptContexts.value.map(c => c.id)
   localStorage.setItem(CONTEXT_STORAGE_KEY, JSON.stringify([...checkedContexts.value]))
+  localStorage.setItem(CONTEXT_SEEN_KEY, JSON.stringify(ids))
 }
 
 function toggleContext(id) {
@@ -128,7 +137,7 @@ function toggleContext(id) {
   } else {
     checkedContexts.value.add(id)
   }
-  saveCheckedContexts()
+  saveContextState()
 }
 
 async function fetchPromptContexts() {
@@ -138,17 +147,19 @@ async function fetchPromptContexts() {
     const list = await res.json()
     promptContexts.value = list
     if (!list.length) return
-    const saved = loadCheckedContexts()
-    if (saved !== null) {
-      // Merge any newly added default contexts that weren't present when the user last saved
+    const state = loadContextState()
+    if (state !== null) {
       const knownIds = new Set(list.map(c => c.id))
-      const savedIds = new Set([...saved].filter(id => knownIds.has(id)))
-      const newDefaults = list.filter(c => c.default && !saved.has(c.id)).map(c => c.id)
-      checkedContexts.value = new Set([...savedIds, ...newDefaults])
+      // Keep checked ids that still exist in current list
+      const preserved = new Set([...state.checked].filter(id => knownIds.has(id)))
+      // Only auto-check defaults for ids that were never seen before (truly new)
+      const seenIds = state.seen ?? new Set()
+      const newDefaults = list.filter(c => c.default && !seenIds.has(c.id)).map(c => c.id)
+      checkedContexts.value = new Set([...preserved, ...newDefaults])
     } else {
       checkedContexts.value = new Set(list.filter(c => c.default).map(c => c.id))
     }
-    saveCheckedContexts()
+    saveContextState()
   } catch {}
 }
 
