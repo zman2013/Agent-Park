@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from server.config import upload_config
+from server.config import upload_config, prompt_contexts_config
 from server.state import app_state
 
 router = APIRouter(prefix="/api")
@@ -809,6 +809,23 @@ async def delete_upload(agent_id: str, rel_path: str = "", abs_path: str = ""):
     except OSError as e:
         raise HTTPException(500, f"failed to delete: {e}")
     return {"ok": True, "removed": True}
+
+
+@router.get("/prompt-contexts")
+async def list_prompt_contexts():
+    """Return configured prompt context checkboxes from config.json."""
+    from pathlib import Path
+    project_root = Path(__file__).resolve().parent.parent
+    items = []
+    for ctx in prompt_contexts_config():
+        abs_path = str((project_root / ctx["path"]).resolve())
+        items.append({
+            "id": ctx["id"],
+            "label": ctx["label"],
+            "path": abs_path,
+            "default": ctx.get("default", False),
+        })
+    return items
 
 
 @router.post("/shell/exec")

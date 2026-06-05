@@ -7,6 +7,23 @@
       Agent is waiting for your input...
     </div>
 
+    <!-- Prompt context checkboxes -->
+    <div v-if="promptContexts.length > 0" class="flex flex-wrap gap-x-3 gap-y-1 mb-2 px-1">
+      <label
+        v-for="ctx in promptContexts"
+        :key="ctx.id"
+        class="flex items-center gap-1 cursor-pointer select-none"
+      >
+        <input
+          type="checkbox"
+          class="w-3 h-3 accent-gray-500 cursor-pointer"
+          :checked="checkedContexts.has(ctx.id)"
+          @change="toggleContext(ctx.id)"
+        />
+        <span class="text-xs text-gray-500 hover:text-gray-400 transition-colors">{{ ctx.label }}</span>
+      </label>
+    </div>
+
     <!-- Skill autocomplete dropdown -->
     <div
       v-if="showSkillMenu && filteredSkills.length > 0"
@@ -87,6 +104,49 @@ const activeIndex = ref(0)
 // Attachments state — not persisted across reloads (File objects + physical files)
 const attachments = ref([])
 
+// Prompt context checkboxes
+const promptContexts = ref([])
+const checkedContexts = ref(new Set())
+
+const CONTEXT_STORAGE_KEY = 'prompt_context_checked'
+
+function loadCheckedContexts() {
+  try {
+    const saved = localStorage.getItem(CONTEXT_STORAGE_KEY)
+    if (saved) return new Set(JSON.parse(saved))
+  } catch {}
+  return null
+}
+
+function saveCheckedContexts() {
+  localStorage.setItem(CONTEXT_STORAGE_KEY, JSON.stringify([...checkedContexts.value]))
+}
+
+function toggleContext(id) {
+  if (checkedContexts.value.has(id)) {
+    checkedContexts.value.delete(id)
+  } else {
+    checkedContexts.value.add(id)
+  }
+  saveCheckedContexts()
+}
+
+async function fetchPromptContexts() {
+  try {
+    const res = await fetch('/api/prompt-contexts')
+    if (!res.ok) return
+    const list = await res.json()
+    promptContexts.value = list
+    const saved = loadCheckedContexts()
+    if (saved !== null) {
+      checkedContexts.value = saved
+    } else {
+      checkedContexts.value = new Set(list.filter(c => c.default).map(c => c.id))
+      saveCheckedContexts()
+    }
+  } catch {}
+}
+
 const DRAFT_KEY = 'chat_draft'
 
 // Debounce timer for saving draft
@@ -152,6 +212,8 @@ onMounted(async () => {
   } catch {
     // ignore
   }
+
+  fetchPromptContexts()
 })
 
 onUnmounted(() => {
@@ -423,6 +485,12 @@ function send() {
   if (ready.length > 0) {
     const lines = ready.map((a, i) => `${i + 1}. ${a.absPath}`).join('\n')
     content = (trimmed ? `${trimmed}\n\n` : '') + `附件列表：\n${lines}`
+  }
+
+  const activeContexts = promptContexts.value.filter(c => checkedContexts.value.has(c.id))
+  if (activeContexts.length > 0) {
+    const paths = activeContexts.map(c => `- ${c.path}`).join('\n')
+    content = content + `\n\n---\nBackground context (read if relevant):\n${paths}`
   }
 
   const evt = new CustomEvent('send-message', {
