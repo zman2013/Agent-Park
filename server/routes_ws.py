@@ -377,6 +377,20 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         runner._compact_pending.discard(task_id)
         await runner.send_input(task_id, "/compact")
 
+    elif msg_type == "toggle_auto_compact":
+        task_id = data.get("task_id", "")
+        disabled = bool(data.get("disabled", False))
+        task = app_state.get_task(task_id)
+        if not task:
+            return
+        from server.agent_runner import runner
+        runner.toggle_auto_compact(task_id, disabled)
+        await broadcast({
+            "type": "auto_compact_toggled",
+            "task_id": task_id,
+            "disabled": disabled,
+        })
+
     elif msg_type == "trigger_handoff":
         task_id = data.get("task_id", "")
         task = app_state.get_task(task_id)

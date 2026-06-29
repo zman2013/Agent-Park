@@ -24,6 +24,13 @@ export const useAgentStore = defineStore('agent', () => {
   // Prompts panel state
   const promptsPanelOpen = ref(false)
 
+  // Auto-compact per-task disabled state (synced from server via WS)
+  const autoCompactDisabled = ref({})  // { task_id: bool }
+
+  function setAutoCompactDisabled(taskId, disabled) {
+    autoCompactDisabled.value[taskId] = disabled
+  }
+
   // Archived agent filter
   const showArchived = ref(false)
 
@@ -803,5 +810,8 @@ export const useAgentStore = defineStore('agent', () => {
     startAgentLoop,
     findAgentLoopByCwd,
     findAgentLoopsByCwd,
+    // auto-compact
+    autoCompactDisabled,
+    setAutoCompactDisabled,
   }
 })

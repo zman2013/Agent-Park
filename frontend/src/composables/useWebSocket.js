@@ -229,6 +229,10 @@ export function useWebSocket() {
         store.updateTaskSession(data.task_id, data.session_id)
         break
 
+      case 'auto_compact_toggled':
+        store.setAutoCompactDisabled(data.task_id, data.disabled)
+        break
+
       case 'ping':
         break
 
@@ -278,6 +282,10 @@ export function useWebSocket() {
     send({ type: 'trigger_compact', task_id: taskId })
   }
 
+  function toggleAutoCompact(taskId, disabled) {
+    send({ type: 'toggle_auto_compact', task_id: taskId, disabled })
+  }
+
   function triggerHandoff(taskId) {
     send({ type: 'trigger_handoff', task_id: taskId })
   }
@@ -302,6 +310,10 @@ export function useWebSocket() {
     triggerHandoff(e.detail.taskId)
   }
 
+  function onToggleAutoCompactEvent(e) {
+    toggleAutoCompact(e.detail.taskId, e.detail.disabled)
+  }
+
   onMounted(() => {
     disposed = false
     connect()
@@ -309,6 +321,7 @@ export function useWebSocket() {
     window.addEventListener('trigger-compact', onTriggerCompactEvent)
     window.addEventListener('trigger-stop-task', onTriggerStopTaskEvent)
     window.addEventListener('trigger-handoff', onTriggerHandoffEvent)
+    window.addEventListener('toggle-auto-compact', onToggleAutoCompactEvent)
   })
 
   onUnmounted(() => {
@@ -321,6 +334,7 @@ export function useWebSocket() {
     window.removeEventListener('trigger-compact', onTriggerCompactEvent)
     window.removeEventListener('trigger-stop-task', onTriggerStopTaskEvent)
     window.removeEventListener('trigger-handoff', onTriggerHandoffEvent)
+    window.removeEventListener('toggle-auto-compact', onToggleAutoCompactEvent)
     if (ws) {
       const socket = ws
       ws = null
@@ -340,5 +354,6 @@ export function useWebSocket() {
     triggerCompact,
     triggerHandoff,
     stopTask,
+    toggleAutoCompact,
   }
 }
