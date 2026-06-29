@@ -286,8 +286,10 @@ async def websocket_endpoint(ws: WebSocket):
     # Send initial state before adding to broadcast list, so concurrent
     # broadcasts don't race against a connection that isn't ready yet.
     from server.agent_runner import runner as _runner
+    sync_data = app_state.snapshot(_runner._session_ids)
+    sync_data["auto_compact_disabled"] = list(_runner._auto_compact_disabled)
     await ws.send_text(
-        json.dumps({"type": "state_sync", "data": app_state.snapshot(_runner._session_ids)}, ensure_ascii=False)
+        json.dumps({"type": "state_sync", "data": sync_data}, ensure_ascii=False)
     )
 
     clients.add(ws)

@@ -790,6 +790,7 @@ class AgentRunner:
             self._auto_compact_disabled.discard(task_id)
 
     async def maybe_dispatch_handoff(self, task_id: str, *, success: bool) -> None:
+        """Dispatch a pending handoff as next input once this turn completes.
 
         Always clears ``_handoff_pending`` so a failed turn does not leak a
         stale flag onto an unrelated subsequent run.

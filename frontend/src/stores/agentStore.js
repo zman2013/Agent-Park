@@ -31,6 +31,10 @@ export const useAgentStore = defineStore('agent', () => {
     autoCompactDisabled.value[taskId] = disabled
   }
 
+  function resetAutoCompactDisabled(newState) {
+    autoCompactDisabled.value = newState
+  }
+
   // Archived agent filter
   const showArchived = ref(false)
 
@@ -813,5 +817,6 @@ export const useAgentStore = defineStore('agent', () => {
     // auto-compact
     autoCompactDisabled,
     setAutoCompactDisabled,
+    resetAutoCompactDisabled,
   }
 })

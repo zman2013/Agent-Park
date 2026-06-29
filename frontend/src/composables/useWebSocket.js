@@ -144,6 +144,12 @@ export function useWebSocket() {
         // Detect newly added tasks before syncing
         const prevTaskIds = new Set(Object.keys(store.tasks))
         store.syncState(data.data)
+        // Hydrate auto-compact disabled state on reconnect
+        if (Array.isArray(data.data.auto_compact_disabled)) {
+          const newDisabled = {}
+          data.data.auto_compact_disabled.forEach(tid => { newDisabled[tid] = true })
+          store.resetAutoCompactDisabled(newDisabled)
+        }
         // If exactly one new task appeared, auto-select it
         const newTaskIds = Object.keys(store.tasks).filter(id => !prevTaskIds.has(id))
         if (newTaskIds.length === 1) {
