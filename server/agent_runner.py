@@ -256,7 +256,9 @@ class _RunContext:
         if auto_enabled and not task_disabled and auto_tokens and used >= auto_tokens:
             self._runner._compact_pending.add(self.task_id)
 
-        # Warning notification (one-shot per compact cycle).
+        # Warning notification (one-shot per compact cycle). Skip when disabled.
+        if task_disabled:
+            return
         if self.task_id in self._runner._compact_warned:
             return
         if not warn_tokens or used < warn_tokens:
