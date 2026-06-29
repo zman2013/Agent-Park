@@ -1,5 +1,27 @@
 <template>
   <div class="border-t border-gray-800 p-3 relative">
+    <!-- Top action bar -->
+    <div class="flex items-center gap-2 mb-2">
+      <button
+        class="text-xs px-2 py-0.5 rounded border transition-colors"
+        :class="isAutoCompactDisabled
+          ? 'border-orange-600/60 text-orange-400 hover:border-orange-500 hover:text-orange-300'
+          : 'border-gray-700 text-gray-500 hover:border-gray-500 hover:text-gray-300'"
+        :title="isAutoCompactDisabled ? '点击开启自动压缩' : '点击关闭自动压缩'"
+        @click="toggleAutoCompact"
+      >
+        {{ isAutoCompactDisabled ? '自动压缩：关' : '自动压缩：开' }}
+      </button>
+      <button
+        class="text-xs px-2 py-0.5 rounded border border-gray-700 text-gray-500 hover:border-yellow-600/60 hover:text-yellow-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        :disabled="task.status === 'running'"
+        title="立即压缩上下文"
+        @click="compactNow"
+      >
+        开始压缩
+      </button>
+    </div>
+
     <div
       v-if="task.status === 'waiting'"
       class="text-xs text-blue-400 mb-2 px-1"
@@ -193,6 +215,7 @@ watch(() => props.task.id, (_newId, oldId) => {
 
 const agent = computed(() => store.agents.find(a => a.id === props.task.agent_id))
 const canUpload = computed(() => !!agent.value?.cwd)
+const isAutoCompactDisabled = computed(() => !!store.autoCompactDisabled[props.task.id])
 const uploadTitle = computed(() =>
   canUpload.value ? 'Upload files' : 'Configure agent cwd to enable uploads'
 )
@@ -486,6 +509,20 @@ function discardAttachments() {
       fetch(url, { method: 'DELETE' }).catch(() => {})
     }
   }
+}
+
+function toggleAutoCompact() {
+  const newDisabled = !isAutoCompactDisabled.value
+  window.dispatchEvent(new CustomEvent('toggle-auto-compact', {
+    detail: { taskId: props.task.id, disabled: newDisabled }
+  }))
+}
+
+function compactNow() {
+  if (props.task.status === 'running') return
+  window.dispatchEvent(new CustomEvent('trigger-compact', {
+    detail: { taskId: props.task.id }
+  }))
 }
 
 function send() {

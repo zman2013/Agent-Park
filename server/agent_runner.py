@@ -252,10 +252,13 @@ class _RunContext:
         # Auto-compact: latch a pending flag when used tokens cross the auto threshold.
         # The actual /compact dispatch happens after finish() returns control,
         # so we don't interrupt the in-flight turn.
-        if auto_enabled and auto_tokens and used >= auto_tokens:
+        task_disabled = self.task_id in self._runner._auto_compact_disabled
+        if auto_enabled and not task_disabled and auto_tokens and used >= auto_tokens:
             self._runner._compact_pending.add(self.task_id)
 
-        # Warning notification (one-shot per compact cycle).
+        # Warning notification (one-shot per compact cycle). Skip when disabled.
+        if task_disabled:
+            return
         if self.task_id in self._runner._compact_warned:
             return
         if not warn_tokens or used < warn_tokens:
@@ -528,6 +531,7 @@ class AgentRunner:
         self._session_renewed: set[str] = set()   # task_ids whose session auto-renewed
         self._compact_warned: set[str] = set()    # task_ids that already got a compact warning this round
         self._compact_pending: set[str] = set()   # task_ids slated to receive an auto /compact after this turn
+        self._auto_compact_disabled: set[str] = set()  # task_ids with auto-compact manually disabled
         # task_ids whose handoff turn just finished — broadcast completion notice next.
         self._handoff_pending: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
@@ -778,8 +782,22 @@ class AgentRunner:
         # finally-block cleanup in the just-finished subprocess fires.
         await asyncio.sleep(0)
 
+    def toggle_auto_compact(self, task_id: str, disabled: bool) -> None:
+        """Enable or disable automatic /compact dispatch for a specific task."""
+        if disabled:
+            self._auto_compact_disabled.add(task_id)
+            # Clear any pending flag that was already set this turn
+            self._compact_pending.discard(task_id)
+        else:
+            self._auto_compact_disabled.discard(task_id)
+        # Persist toggle state so it survives server restarts
+        task = app_state.tasks.get(task_id)
+        if task is not None:
+            object.__setattr__(task, "auto_compact_disabled", disabled)
+            app_state.save_agent_tasks(task.agent_id)
+
     async def maybe_dispatch_handoff(self, task_id: str, *, success: bool) -> None:
-        """Clear handoff pending flag after a turn finishes.
+        """Dispatch a pending handoff as next input once this turn completes.
 
         Always clears ``_handoff_pending`` so a failed turn does not leak a
         stale flag onto an unrelated subsequent run.
@@ -1239,6 +1257,10 @@ class AgentRunner:
             )
             app_state.save_agent_tasks(task.agent_id)
             cleaned.append(task_id)
+        # Restore persisted auto-compact opt-outs across all tasks
+        for task in app_state.tasks.values():
+            if getattr(task, "auto_compact_disabled", False):
+                self._auto_compact_disabled.add(task.id)
         return cleaned
 
 

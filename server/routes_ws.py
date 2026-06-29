@@ -286,8 +286,10 @@ async def websocket_endpoint(ws: WebSocket):
     # Send initial state before adding to broadcast list, so concurrent
     # broadcasts don't race against a connection that isn't ready yet.
     from server.agent_runner import runner as _runner
+    sync_data = app_state.snapshot(_runner._session_ids)
+    sync_data["auto_compact_disabled"] = list(_runner._auto_compact_disabled)
     await ws.send_text(
-        json.dumps({"type": "state_sync", "data": app_state.snapshot(_runner._session_ids)}, ensure_ascii=False)
+        json.dumps({"type": "state_sync", "data": sync_data}, ensure_ascii=False)
     )
 
     clients.add(ws)
@@ -376,6 +378,20 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         })
         runner._compact_pending.discard(task_id)
         await runner.send_input(task_id, "/compact")
+
+    elif msg_type == "toggle_auto_compact":
+        task_id = data.get("task_id", "")
+        disabled = bool(data.get("disabled", False))
+        task = app_state.get_task(task_id)
+        if not task:
+            return
+        from server.agent_runner import runner
+        runner.toggle_auto_compact(task_id, disabled)
+        await broadcast({
+            "type": "auto_compact_toggled",
+            "task_id": task_id,
+            "disabled": disabled,
+        })
 
     elif msg_type == "trigger_handoff":
         task_id = data.get("task_id", "")
