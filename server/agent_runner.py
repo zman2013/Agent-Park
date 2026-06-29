@@ -788,6 +788,11 @@ class AgentRunner:
             self._compact_pending.discard(task_id)
         else:
             self._auto_compact_disabled.discard(task_id)
+        # Persist toggle state so it survives server restarts
+        task = app_state.tasks.get(task_id)
+        if task is not None:
+            object.__setattr__(task, "auto_compact_disabled", disabled)
+            app_state.save_agent_tasks(task.agent_id)
 
     async def maybe_dispatch_handoff(self, task_id: str, *, success: bool) -> None:
         """Dispatch a pending handoff as next input once this turn completes.
@@ -1250,6 +1255,10 @@ class AgentRunner:
             )
             app_state.save_agent_tasks(task.agent_id)
             cleaned.append(task_id)
+        # Restore persisted auto-compact opt-outs across all tasks
+        for task in app_state.tasks.values():
+            if getattr(task, "auto_compact_disabled", False):
+                self._auto_compact_disabled.add(task.id)
         return cleaned
 
 
