@@ -22,7 +22,7 @@
       </button>
       <button
         class="text-xs px-2 py-0.5 rounded border border-gray-700 text-gray-500 hover:border-blue-600/60 hover:text-blue-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-        :disabled="task.status === 'running' || !canSyncRemote"
+        :disabled="task.status === 'running' || !canSyncRemote || syncPending"
         :title="canSyncRemote ? '同步远端代码到本地（stash → fetch → rebase → stash pop）' : '需要配置 agent 工作目录'"
         @click="syncRemote"
       >
@@ -134,6 +134,9 @@ const activeIndex = ref(0)
 // Attachments state — not persisted across reloads (File objects + physical files)
 const attachments = ref([])
 
+// Pending latch for one-click sync actions, cleared when task becomes running
+const syncPending = ref(false)
+
 // Prompt context checkboxes
 const promptContexts = ref([])
 const checkedContexts = ref(new Set())
@@ -219,6 +222,12 @@ watch(text, (val) => {
 watch(() => props.task.id, (_newId, oldId) => {
   if (oldId === undefined) return
   discardAttachments()
+  syncPending.value = false
+})
+
+// Clear sync latch once the task is actually running (status update from WS)
+watch(() => props.task.status, (status) => {
+  if (status === 'running') syncPending.value = false
 })
 
 const agent = computed(() => store.agents.find(a => a.id === props.task.agent_id))
@@ -535,7 +544,8 @@ function compactNow() {
 }
 
 function syncRemote() {
-  if (props.task.status === 'running' || !canSyncRemote.value) return
+  if (props.task.status === 'running' || !canSyncRemote.value || syncPending.value) return
+  syncPending.value = true
   const ts = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)
   const content = `请帮我同步远端代码到本地。步骤：
 1. 先执行 \`git status --porcelain\` 检查是否有本地改动。
