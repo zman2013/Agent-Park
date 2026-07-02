@@ -20,6 +20,14 @@
       >
         开始压缩
       </button>
+      <button
+        class="text-xs px-2 py-0.5 rounded border border-gray-700 text-gray-500 hover:border-blue-600/60 hover:text-blue-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        :disabled="task.status === 'running' || !canSyncRemote"
+        :title="canSyncRemote ? '同步远端代码到本地（stash → fetch → rebase → stash pop）' : '需要配置 agent 工作目录'"
+        @click="syncRemote"
+      >
+        同步远端代码
+      </button>
     </div>
 
     <div
@@ -215,6 +223,7 @@ watch(() => props.task.id, (_newId, oldId) => {
 
 const agent = computed(() => store.agents.find(a => a.id === props.task.agent_id))
 const canUpload = computed(() => !!agent.value?.cwd)
+const canSyncRemote = computed(() => !!agent.value?.cwd)
 const isAutoCompactDisabled = computed(() => !!store.autoCompactDisabled[props.task.id])
 const uploadTitle = computed(() =>
   canUpload.value ? 'Upload files' : 'Configure agent cwd to enable uploads'
@@ -523,6 +532,16 @@ function compactNow() {
   window.dispatchEvent(new CustomEvent('trigger-compact', {
     detail: { taskId: props.task.id }
   }))
+}
+
+function syncRemote() {
+  if (props.task.status === 'running' || !canSyncRemote.value) return
+  const content = '请帮我同步远端代码到本地。步骤：先用 git stash 保存本地改动（如有），然后 fetch 并 rebase 远端最新代码，最后 stash pop 恢复本地改动（如有）。如有冲突请协助解决。'
+  const evt = new CustomEvent('send-message', {
+    cancelable: true,
+    detail: { taskId: props.task.id, content },
+  })
+  window.dispatchEvent(evt)
 }
 
 function send() {

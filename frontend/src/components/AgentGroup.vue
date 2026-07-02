@@ -186,16 +186,26 @@
 
     <!-- Tasks -->
     <div v-if="isOpen" class="ml-2">
-      <!-- New Task Button (top) -->
-      <div
-        class="flex items-center gap-1 px-4 py-1 text-xs text-gray-600 cursor-pointer hover:text-gray-400 transition-colors"
-        @click="handleNewTask"
-      >
-        <span>+</span>
-        <span>new task</span>
+      <!-- New Task Button + Show more/less (same row) -->
+      <div class="flex items-center px-4 py-1 text-xs text-gray-600">
+        <div
+          class="flex items-center gap-1 cursor-pointer hover:text-gray-400 transition-colors"
+          @click="handleNewTask"
+        >
+          <span>+</span>
+          <span>new task</span>
+        </div>
+        <div
+          v-if="taskCount > TASK_LIMIT"
+          class="ml-auto cursor-pointer hover:text-gray-400 transition-colors"
+          @click="showAllTasks = !showAllTasks"
+        >
+          <span v-if="!showAllTasks">▸ show {{ taskCount - TASK_LIMIT }} more</span>
+          <span v-else>▴ show less</span>
+        </div>
       </div>
 
-      <!-- Visible tasks (reversed, limited to 5 unless expanded) -->
+      <!-- Visible tasks (reversed, limited to TASK_LIMIT unless expanded) -->
       <template v-for="taskId in visibleTaskIds" :key="taskId">
         <TaskItem
           v-if="store.tasks[taskId]"
@@ -203,16 +213,6 @@
           :data-task-id="taskId"
         />
       </template>
-
-      <!-- Show more / less toggle -->
-      <div
-        v-if="taskCount > TASK_LIMIT"
-        class="flex items-center gap-1 px-4 py-1 text-xs text-gray-600 cursor-pointer hover:text-gray-400 transition-colors"
-        @click="showAllTasks = !showAllTasks"
-      >
-        <span v-if="!showAllTasks">▸ show {{ taskCount - TASK_LIMIT }} more</span>
-        <span v-else>▴ show less</span>
-      </div>
     </div>
   </div>
 </template>

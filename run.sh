@@ -29,17 +29,76 @@ print(c.get('frontend',{}).get('port',3000))
 "
 }
 
+# 判断 pid 是否为僵尸进程（已退出但未被父进程 reap）
+# 僵尸进程 kill -0 仍返回成功，但实际已死，必须视为「未运行」
+is_zombie() {
+    local pid="$1"
+    local state
+    # /proc/<pid>/stat 第 3 个字段是进程状态，Z 表示僵尸
+    state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) || return 1
+    [ "$state" = "Z" ]
+}
+
 is_running() {
     local pid_file="$1"
     if [ -f "$pid_file" ]; then
         local pid
         pid=$(cat "$pid_file")
-        if kill -0 "$pid" 2>/dev/null; then
+        if kill -0 "$pid" 2>/dev/null && ! is_zombie "$pid"; then
             return 0
         fi
+        # 进程不存在或为僵尸：清理陈旧 pidfile
         rm -f "$pid_file"
     fi
     return 1
+}
+
+# 清理占用指定端口的孤儿进程（pidfile 丢失但进程仍卡在端口上时会发生）
+# 仅在确认对应服务「未运行」后调用，避免误杀正常进程。
+# 不依赖 ss/lsof/fuser（本机未安装），纯 /proc 实现：
+#   1. 从 /proc/net/tcp{,6} 找到 LISTEN 该端口的 socket inode
+#   2. 扫描 /proc/*/fd 反查持有该 inode 的进程
+free_port() {
+    local port="$1"
+    local name="$2"
+    local port_hex inodes pids=""
+
+    # 端口转大写十六进制（/proc/net/tcp 中本地端口为 HEX）
+    port_hex=$(printf '%04X' "$port")
+
+    # 收集 st=0A(LISTEN) 且本地端口匹配的 socket inode
+    inodes=$(awk -v ph=":$port_hex" '
+        NR>1 && $2 ~ ph"$" && $4=="0A" { print $10 }
+    ' /proc/net/tcp /proc/net/tcp6 2>/dev/null | sort -u)
+
+    [ -z "$inodes" ] && return 0
+
+    local pid inode link
+    for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+        for link in /proc/"$pid"/fd/*; do
+            [ -e "$link" ] || continue
+            # socket fd 的符号链接形如 socket:[<inode>]
+            local target
+            target=$(readlink "$link" 2>/dev/null) || continue
+            case "$target" in
+                socket:\[*\])
+                    inode="${target#socket:[}"
+                    inode="${inode%]}"
+                    if echo "$inodes" | grep -qx "$inode"; then
+                        case " $pids " in *" $pid "*) ;; *) pids="$pids $pid" ;; esac
+                    fi
+                    ;;
+            esac
+        done
+    done
+
+    pids="${pids# }"
+    if [ -n "$pids" ]; then
+        echo "检测到端口 ${port} 被孤儿 ${name} 进程占用 (PID: ${pids})，清理中..."
+        # shellcheck disable=SC2086
+        kill -9 $pids 2>/dev/null || true
+        sleep 1
+    fi
 }
 
 do_start() {
@@ -60,6 +119,7 @@ do_start() {
 
     # 启动 backend
     if ! is_running "$BACKEND_PID"; then
+        free_port "$port" "backend"
         echo "正在启动 backend (${host}:${port})..."
         cd "$SCRIPT_DIR"
         nohup "$PYTHON" -m uvicorn server.main:app \
@@ -77,6 +137,7 @@ do_start() {
 
     # 启动 frontend
     if ! is_running "$FRONTEND_PID"; then
+        free_port "$fe_port" "frontend"
         echo "正在启动 frontend (:${fe_port})..."
         cd "$SCRIPT_DIR/frontend"
         nohup npx vite --host 0.0.0.0 --port "$fe_port" \
