@@ -94,16 +94,27 @@ free_port() {
 
     pids="${pids# }"
     if [ -n "$pids" ]; then
-        # 只清理属于本项目的进程（cmdline 含项目目录），避免误杀同端口的无关服务
+        # 只清理属于本项目的进程，避免误杀同端口的无关服务。
+        # 判据：cmdline 含项目目录（venv python / 含路径参数），
+        # 或 /proc/$pid/cwd 解析为项目目录（全局 python3/npx 从项目目录启动的情况）。
         local safe_pids=""
         for pid in $pids; do
+            local matched=0
             local cmdline
             cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
             case "$cmdline" in
-                *"$SCRIPT_DIR"*)
-                    case " $safe_pids " in *" $pid "*) ;; *) safe_pids="$safe_pids $pid" ;; esac
-                    ;;
+                *"$SCRIPT_DIR"*) matched=1 ;;
             esac
+            if [ "$matched" -eq 0 ]; then
+                local cwd
+                cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null) || true
+                case "$cwd" in
+                    "$SCRIPT_DIR" | "$SCRIPT_DIR/"*) matched=1 ;;
+                esac
+            fi
+            if [ "$matched" -eq 1 ]; then
+                case " $safe_pids " in *" $pid "*) ;; *) safe_pids="$safe_pids $pid" ;; esac
+            fi
         done
         safe_pids="${safe_pids# }"
         if [ -n "$safe_pids" ]; then
