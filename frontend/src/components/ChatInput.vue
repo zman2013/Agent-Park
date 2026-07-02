@@ -539,7 +539,7 @@ function syncRemote() {
   const ts = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)
   const content = `请帮我同步远端代码到本地。步骤：
 1. 先执行 \`git status --porcelain\` 检查是否有本地改动。
-2. 若有改动，用 \`git stash push -m "sync-remote-${ts}"\` 创建具名 stash 保存改动，记下这个 stash name。
+2. 若有改动（包括 tracked 和 untracked 文件），用 \`git stash push --include-untracked -m "sync-remote-${ts}"\` 创建具名 stash 保存所有改动，记下这个 stash name。
 3. 执行 \`git fetch\` 然后 \`git rebase origin/<当前分支>\` 同步远端最新代码。
 4. 若第 2 步创建了 stash，用 \`git stash pop stash@{0}\`（或通过 stash name 定位）恢复改动；若未创建 stash 则跳过此步。
 5. 如有冲突请协助解决。
