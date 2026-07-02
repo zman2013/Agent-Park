@@ -558,7 +558,8 @@ function syncRemote() {
     cancelable: true,
     detail: { taskId: props.task.id, content },
   })
-  window.dispatchEvent(evt)
+  const accepted = window.dispatchEvent(evt)
+  if (!accepted) syncPending.value = false
 }
 
 function send() {
