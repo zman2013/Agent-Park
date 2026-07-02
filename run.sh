@@ -94,10 +94,24 @@ free_port() {
 
     pids="${pids# }"
     if [ -n "$pids" ]; then
-        echo "检测到端口 ${port} 被孤儿 ${name} 进程占用 (PID: ${pids})，清理中..."
-        # shellcheck disable=SC2086
-        kill -9 $pids 2>/dev/null || true
-        sleep 1
+        # 只清理属于本项目的进程（cmdline 含项目目录），避免误杀同端口的无关服务
+        local safe_pids=""
+        for pid in $pids; do
+            local cmdline
+            cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+            case "$cmdline" in
+                *"$SCRIPT_DIR"*)
+                    case " $safe_pids " in *" $pid "*) ;; *) safe_pids="$safe_pids $pid" ;; esac
+                    ;;
+            esac
+        done
+        safe_pids="${safe_pids# }"
+        if [ -n "$safe_pids" ]; then
+            echo "检测到端口 ${port} 被孤儿 ${name} 进程占用 (PID: ${safe_pids})，清理中..."
+            # shellcheck disable=SC2086
+            kill -9 $safe_pids 2>/dev/null || true
+            sleep 1
+        fi
     fi
 }
 
