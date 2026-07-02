@@ -20,6 +20,14 @@
       >
         开始压缩
       </button>
+      <button
+        class="text-xs px-2 py-0.5 rounded border border-gray-700 text-gray-500 hover:border-blue-600/60 hover:text-blue-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+        :disabled="task.status === 'running' || !canSyncRemote || syncPending"
+        :title="canSyncRemote ? '同步远端代码到本地（stash → fetch → rebase → stash pop）' : '需要配置 agent 工作目录'"
+        @click="syncRemote"
+      >
+        同步远端代码
+      </button>
     </div>
 
     <div
@@ -126,6 +134,9 @@ const activeIndex = ref(0)
 // Attachments state — not persisted across reloads (File objects + physical files)
 const attachments = ref([])
 
+// Pending latch for one-click sync actions, cleared when task becomes running
+const syncPending = ref(false)
+
 // Prompt context checkboxes
 const promptContexts = ref([])
 const checkedContexts = ref(new Set())
@@ -211,10 +222,17 @@ watch(text, (val) => {
 watch(() => props.task.id, (_newId, oldId) => {
   if (oldId === undefined) return
   discardAttachments()
+  syncPending.value = false
+})
+
+// Clear sync latch once the task is actually running (status update from WS)
+watch(() => props.task.status, (status) => {
+  if (status === 'running') syncPending.value = false
 })
 
 const agent = computed(() => store.agents.find(a => a.id === props.task.agent_id))
 const canUpload = computed(() => !!agent.value?.cwd)
+const canSyncRemote = computed(() => !!agent.value?.cwd)
 const isAutoCompactDisabled = computed(() => !!store.autoCompactDisabled[props.task.id])
 const uploadTitle = computed(() =>
   canUpload.value ? 'Upload files' : 'Configure agent cwd to enable uploads'
@@ -523,6 +541,25 @@ function compactNow() {
   window.dispatchEvent(new CustomEvent('trigger-compact', {
     detail: { taskId: props.task.id }
   }))
+}
+
+function syncRemote() {
+  if (props.task.status === 'running' || !canSyncRemote.value || syncPending.value) return
+  syncPending.value = true
+  const ts = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)
+  const content = `请帮我同步远端代码到本地。步骤：
+1. 先执行 \`git status --porcelain\` 检查是否有本地改动。
+2. 若有改动（包括 tracked 和 untracked 文件），用 \`git stash push --include-untracked -m "sync-remote-${ts}"\` 创建具名 stash 保存所有改动，记下这个 stash name。
+3. 执行 \`git fetch\` 然后 \`git rebase origin/<当前分支>\` 同步远端最新代码。
+4. 若第 2 步创建了 stash，用 \`git stash pop stash@{0}\`（或通过 stash name 定位）恢复改动；若未创建 stash 则跳过此步。
+5. 如有冲突请协助解决。
+注意：只 pop 本次操作创建的 stash，不要 pop 其他已有 stash。`
+  const evt = new CustomEvent('send-message', {
+    cancelable: true,
+    detail: { taskId: props.task.id, content },
+  })
+  const accepted = window.dispatchEvent(evt)
+  if (!accepted) syncPending.value = false
 }
 
 function send() {
