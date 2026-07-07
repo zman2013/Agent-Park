@@ -75,6 +75,7 @@
         v-for="msg in visibleMessages"
         :key="msg.id"
         :message="msg"
+        :task-id="task.id"
       />
       <div v-if="task.status === 'running'" class="streaming-cursor text-sm px-4"></div>
     </div>

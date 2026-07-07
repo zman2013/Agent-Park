@@ -220,7 +220,7 @@ class AppState:
             self._agent_order.append(agent_id)
         self.save_agents()
 
-    def fork_task(self, source_task_id: str, source_session_id: str) -> Task:
+    def fork_task(self, source_task_id: str, source_session_id: str, resume_at: str | None = None) -> Task:
         """Fork a task: create a new task with copied messages and a fork_session_id."""
         source = self.tasks.get(source_task_id)
         if source is None:
@@ -231,15 +231,23 @@ class AppState:
 
         from server.models import Message, _uid
 
+        # Determine how many messages to copy (truncate at resume_at if given)
+        messages_src = source.messages
+        if resume_at:
+            cut = next((i for i, m in enumerate(messages_src) if m.cco_uuid == resume_at), None)
+            if cut is not None:
+                messages_src = messages_src[:cut + 1]
+
         # Deep-copy messages with new IDs
         forked_messages = []
-        for m in source.messages:
+        for m in messages_src:
             forked_messages.append(Message(
                 role=m.role,
                 type=m.type,
                 content=m.content,
                 tool_name=m.tool_name,
                 streaming=False,
+                cco_uuid=m.cco_uuid,
             ))
 
         task = Task(
@@ -247,6 +255,7 @@ class AppState:
             name=f"{source.name} (fork)",
             messages=forked_messages,
             fork_session_id=source_session_id,
+            fork_resume_at=resume_at,
         )
         self.tasks[task.id] = task
         agent.task_ids.append(task.id)

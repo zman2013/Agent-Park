@@ -631,8 +631,10 @@ class AgentRunner:
 
         # Check if this is a fork: task has a fork_session_id to consume
         fork_sid = task.fork_session_id
+        fork_resume_at = task.fork_resume_at
         if fork_sid:
             task.fork_session_id = None  # consume once
+            task.fork_resume_at = None
             app_state.save_agent_tasks(task.agent_id)
 
         # Strip !wiki prefix before any prompt augmentation
@@ -689,7 +691,7 @@ class AgentRunner:
         # Select adapter and build args
         adapter = get_adapter(command)
         self._adapters[task_id] = adapter
-        args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd)
+        args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd, resume_at=fork_resume_at)
         ctx = _RunContext(self, task_id)
 
         # Validate working directory before spawning subprocess
