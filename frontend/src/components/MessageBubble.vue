@@ -24,7 +24,7 @@
         复制
       </button>
       <button
-        v-if="taskId && message.cco_uuid"
+        v-if="taskId && taskHasSession && message.cco_uuid"
         @click="forkAtMessage"
         class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
         title="从此处 Fork 新 session"
@@ -62,7 +62,7 @@
         复制
       </button>
       <button
-        v-if="taskId && message.cco_uuid"
+        v-if="taskId && taskHasSession && message.cco_uuid"
         @click="forkAtMessage"
         class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
         title="从此处 Fork 新 session"
@@ -153,7 +153,7 @@
         复制
       </button>
       <button
-        v-if="taskId && message.role === 'agent' && !message.streaming && message.cco_uuid"
+        v-if="taskId && taskHasSession && message.role === 'agent' && !message.streaming && message.cco_uuid"
         @click="forkAtMessage"
         class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
         title="从此处 Fork 新 session"
@@ -225,6 +225,8 @@ const props = defineProps({
 const store = useAgentStore()
 const expanded = ref(false)
 const messageExpanded = ref(false)
+
+const taskHasSession = computed(() => !!store.taskSessions[props.taskId])
 
 const parsedToolInput = computed(() => {
   try {
