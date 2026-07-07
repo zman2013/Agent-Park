@@ -41,6 +41,7 @@ class CodexAdapter(BaseAdapter):
         session_id: str | None,
         fork_sid: str | None,
         agent_cwd: str,
+        resume_at: str | None = None,
     ) -> list[str]:
         # command might be "ept codex", "ept codex -m k2", etc.
         parts = shlex.split(command)

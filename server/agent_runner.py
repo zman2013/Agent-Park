@@ -206,12 +206,15 @@ class _RunContext:
         if target is None:
             return
         target.usage = usage
-        await broadcast({
+        payload: dict = {
             "type": "message_usage",
             "task_id": self.task_id,
             "message_id": message_id,
             "usage": usage,
-        })
+        }
+        if getattr(target, "cco_uuid", None):
+            payload["cco_uuid"] = target.cco_uuid
+        await broadcast(payload)
 
     async def _maybe_warn_compact_pending(
         self,
@@ -631,8 +634,10 @@ class AgentRunner:
 
         # Check if this is a fork: task has a fork_session_id to consume
         fork_sid = task.fork_session_id
+        fork_resume_at = task.fork_resume_at
         if fork_sid:
             task.fork_session_id = None  # consume once
+            task.fork_resume_at = None
             app_state.save_agent_tasks(task.agent_id)
 
         # Strip !wiki prefix before any prompt augmentation
@@ -689,7 +694,7 @@ class AgentRunner:
         # Select adapter and build args
         adapter = get_adapter(command)
         self._adapters[task_id] = adapter
-        args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd)
+        args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd, resume_at=fork_resume_at)
         ctx = _RunContext(self, task_id)
 
         # Validate working directory before spawning subprocess

@@ -37,6 +37,9 @@ class Message(BaseModel):
     #    "context_window": int, "model": str}
     # context_window may be 0 when the protocol does not expose it (codex).
     usage: dict | None = None
+    # CCo native message uuid (from stream-json assistant chunk).
+    # Used with --resume-session-at to fork from this message.
+    cco_uuid: str = ""
 
 
 class Task(BaseModel):
@@ -57,6 +60,8 @@ class Task(BaseModel):
     updated_at: str = Field(default_factory=_utcnow)
     # Set when this task was forked from another session; consumed on first message
     fork_session_id: str | None = None
+    # CCo message uuid to truncate history at when forking; consumed on first message
+    fork_resume_at: str | None = None
 
 
 class Agent(BaseModel):

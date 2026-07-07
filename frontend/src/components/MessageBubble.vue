@@ -23,6 +23,12 @@
       >
         复制
       </button>
+      <button
+        v-if="taskId && taskHasSession && message.cco_uuid"
+        @click="forkAtMessage"
+        class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
+        title="从此处 Fork 新 session"
+      >⑂</button>
       <div
         v-if="usageBadge"
         class="mt-1 text-[11px] font-mono"
@@ -55,6 +61,12 @@
       >
         复制
       </button>
+      <button
+        v-if="taskId && taskHasSession && message.cco_uuid"
+        @click="forkAtMessage"
+        class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
+        title="从此处 Fork 新 session"
+      >⑂</button>
       <div
         v-if="usageBadge"
         class="mt-1 text-[11px] font-mono"
@@ -140,6 +152,12 @@
       >
         复制
       </button>
+      <button
+        v-if="taskId && taskHasSession && message.role === 'agent' && !message.streaming && message.cco_uuid"
+        @click="forkAtMessage"
+        class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
+        title="从此处 Fork 新 session"
+      >⑂</button>
     </div>
   </div>
 </template>
@@ -201,11 +219,14 @@ function renderMarkdownCached(message) {
 
 const props = defineProps({
   message: { type: Object, required: true },
+  taskId: { type: String, default: '' },
 })
 
 const store = useAgentStore()
 const expanded = ref(false)
 const messageExpanded = ref(false)
+
+const taskHasSession = computed(() => !!store.taskSessions[props.taskId])
 
 const parsedToolInput = computed(() => {
   try {
@@ -370,5 +391,11 @@ async function copyWriteContent() {
   } catch (err) {
     store.addToast('复制失败', 'error')
   }
+}
+
+function forkAtMessage() {
+  window.dispatchEvent(new CustomEvent('fork-task', {
+    detail: { taskId: props.taskId, messageId: props.message.id }
+  }))
 }
 </script>

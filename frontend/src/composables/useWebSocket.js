@@ -198,7 +198,7 @@ export function useWebSocket() {
         break
 
       case 'message_usage':
-        store.setMessageUsage(data.task_id, data.message_id, data.usage)
+        store.setMessageUsage(data.task_id, data.message_id, data.usage, data.cco_uuid)
         break
 
       case 'turns_info':
@@ -259,6 +259,10 @@ export function useWebSocket() {
           detail: { agentId: data.agent_id, error: data.error }
         }))
         break
+
+      case 'error':
+        store.addToast(data.message || '操作失败', 'error')
+        break
     }
   }
 
@@ -276,8 +280,10 @@ export function useWebSocket() {
     send({ type: 'user_message', task_id: taskId, content })
   }
 
-  function forkTask(taskId) {
-    send({ type: 'fork_task', task_id: taskId })
+  function forkTask(taskId, atMessageId = null) {
+    const payload = { type: 'fork_task', task_id: taskId }
+    if (atMessageId) payload.at_message_id = atMessageId
+    send(payload)
   }
 
   function generateSummary(agentId, dateRange = 'recent_n') {

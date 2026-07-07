@@ -32,6 +32,7 @@ class CcoAdapter(BaseAdapter):
         session_id: str | None,
         fork_sid: str | None,
         agent_cwd: str,
+        resume_at: str | None = None,
     ) -> list[str]:
         base_args = [
             command,
@@ -43,6 +44,8 @@ class CcoAdapter(BaseAdapter):
         ]
 
         if fork_sid:
+            if resume_at:
+                return base_args + ["--resume", fork_sid, "--resume-session-at", resume_at, "--fork-session", prompt]
             return base_args + ["--resume", fork_sid, "--fork-session", prompt]
         elif session_id:
             return base_args + ["--resume", session_id, prompt]
@@ -174,6 +177,9 @@ class CcoAdapter(BaseAdapter):
         if not task:
             return
 
+        # CCo native uuid for this assistant turn (used with --resume-session-at)
+        chunk_uuid = chunk.get("uuid", "")
+
         message_data = chunk.get("message", {})
         content_blocks = message_data.get("content", [])
 
@@ -248,6 +254,9 @@ class CcoAdapter(BaseAdapter):
             # tool_use blocks (or vice versa).
             last_msg = turn_last_msg
             if last_msg is not None:
+                # Attach CCo native uuid to the last message of this turn
+                if chunk_uuid:
+                    last_msg.cco_uuid = chunk_uuid
                 # Fall back to task-level context_window when this turn's
                 # usage lacks it (cco's assistant chunk often omits it and
                 # only the final result chunk carries the full window).

@@ -482,8 +482,17 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         source_session_id = _runner._session_ids.get(source_task_id)
         if not source_session_id:
             return
+        # Resolve at_message_id (agent-park Message.id) to CCo native uuid
+        resume_at = None
+        at_message_id = data.get("at_message_id", "")
+        if at_message_id:
+            msg = next((m for m in source_task.messages if m.id == at_message_id), None)
+            if not msg or not msg.cco_uuid:
+                await broadcast({"type": "error", "message": "该消息没有 cco_uuid，无法从此处 Fork（消息可能来自旧 task）"})
+                return
+            resume_at = msg.cco_uuid
         try:
-            new_task = app_state.fork_task(source_task_id, source_session_id)
+            new_task = app_state.fork_task(source_task_id, source_session_id, resume_at=resume_at)
         except ValueError:
             return
         await broadcast(task_created_message(new_task))

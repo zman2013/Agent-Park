@@ -298,12 +298,12 @@ function onOpenMemory(e) {
 }
 
 function onForkTask(e) {
-  const { taskId } = e.detail
+  const { taskId, messageId } = e.detail
   if (!wsConnected.value) {
     store.addToast('Cannot fork task: WebSocket not connected', 'error')
     return
   }
-  forkTask(taskId)
+  forkTask(taskId, messageId || null)
 }
 
 function onOpenFiles(e) {
