@@ -285,12 +285,13 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
-  function setMessageUsage(taskId, messageId, usage) {
+  function setMessageUsage(taskId, messageId, usage, ccoUuid) {
     const task = tasks.value[taskId]
     if (!task) return
     const msg = task.messages.find(m => m.id === messageId)
     if (msg) {
       msg.usage = usage
+      if (ccoUuid) msg.cco_uuid = ccoUuid
     }
   }
 

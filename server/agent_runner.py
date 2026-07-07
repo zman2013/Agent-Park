@@ -206,12 +206,15 @@ class _RunContext:
         if target is None:
             return
         target.usage = usage
-        await broadcast({
+        payload: dict = {
             "type": "message_usage",
             "task_id": self.task_id,
             "message_id": message_id,
             "usage": usage,
-        })
+        }
+        if getattr(target, "cco_uuid", None):
+            payload["cco_uuid"] = target.cco_uuid
+        await broadcast(payload)
 
     async def _maybe_warn_compact_pending(
         self,

@@ -198,7 +198,7 @@ export function useWebSocket() {
         break
 
       case 'message_usage':
-        store.setMessageUsage(data.task_id, data.message_id, data.usage)
+        store.setMessageUsage(data.task_id, data.message_id, data.usage, data.cco_uuid)
         break
 
       case 'turns_info':
