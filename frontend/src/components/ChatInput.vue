@@ -23,7 +23,7 @@
       <button
         class="text-xs px-2 py-0.5 rounded border border-gray-700 text-gray-500 hover:border-blue-600/60 hover:text-blue-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
         :disabled="task.status === 'running' || !canSyncRemote || syncPending"
-        :title="canSyncRemote ? '同步远端代码到本地（stash → fetch → rebase → stash pop）' : '需要配置 agent 工作目录'"
+        :title="canSyncRemote ? '同步远端代码到本地（仅 stash tracked 改动 → fetch → rebase → stash pop）' : '需要配置 agent 工作目录'"
         @click="syncRemote"
       >
         同步远端代码
@@ -548,12 +548,14 @@ function syncRemote() {
   syncPending.value = true
   const ts = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)
   const content = `请帮我同步远端代码到本地。步骤：
-1. 先执行 \`git status --porcelain\` 检查是否有本地改动。
-2. 若有改动（包括 tracked 和 untracked 文件），用 \`git stash push --include-untracked -m "sync-remote-${ts}"\` 创建具名 stash 保存所有改动，记下这个 stash name。
-3. 执行 \`git fetch\` 然后 \`git rebase origin/<当前分支>\` 同步远端最新代码。
-4. 若第 2 步创建了 stash，用 \`git stash pop stash@{0}\`（或通过 stash name 定位）恢复改动；若未创建 stash 则跳过此步。
-5. 如有冲突请协助解决。
-注意：只 pop 本次操作创建的 stash，不要 pop 其他已有 stash。`
+1. 先执行 \`git status --porcelain -uall\` 检查本地改动，并区分 tracked（\`M\`/\`A\`/\`D\`/\`R\` 等）和 untracked（\`??\`）文件。注意：\`-uall\` 确保未跟踪目录内的文件被逐条列出（而非仅报告目录名），以便后续冲突检测准确。
+2. 【重要】不要用 \`git stash --include-untracked\` 全量 stash。未跟踪文件里常有巨型产物/备份（几 GB 甚至几十 GB 的 .bin / dump 目录），全量 stash 会极慢并撑爆 .git。大多数未跟踪文件无需处理（rebase 不碰它们），但若目标分支引入的路径与本地未跟踪文件存在**路径冲突**，rebase 会报错。处理方式：先执行 \`git fetch\`，然后用 \`git diff --name-only HEAD...<rebase目标>\` 列出目标分支新增/修改文件，与 step 1 中的 \`??\` 列表做**前缀匹配**（不只是精确匹配）：即目标文件路径是某个本地未跟踪路径的前缀，或本地未跟踪路径是某个目标文件路径的前缀，均为冲突；若有冲突路径，临时移走（\`mv <dir_or_file> <dir_or_file>.bak\`）对应的文件或目录，rebase 完成后再移回。
+3. 只 stash **tracked 的改动**（不带 \`--include-untracked\`）。若 step 1 中有 rename（\`git status --porcelain\` 第一列含 \`R\`），必须用不带 pathspec 的整体 stash：\`git stash push -m "sync-remote-${ts}"\`（不列具体文件），这样 rename 的新旧两端都会被完整 stash。若没有 rename，可显式列出 tracked 文件：\`git stash push -m "sync-remote-${ts}" -- <改动文件列表>\`。记下这个 stash name。若 tracked 改动里有很大的文件（如 2GB+ 的 .bin），**不要自行决定丢弃**；先告知用户「检测到 tracked 大文件有改动（列出文件名和大小），是否可以丢弃这些改动（它们是可重新生成的产物）？」，等用户明确确认可以丢弃后，再用 \`git restore --staged --worktree <该文件路径>\` 丢弃其 index 和工作树改动，然后只 stash 真正需要保护的源码/配置文件。若没有任何 tracked 改动需要保护，则跳过 stash。**重要：进入 step 5 之前，必须确保所有 tracked 文件都已 stash 或通过 \`git restore --staged --worktree\` 完全丢弃改动（包括 index），否则 \`git rebase\` 会因 dirty index/unstaged changes 报错中止。**
+4. 确认 rebase 目标：优先用 \`git rev-parse --abbrev-ref @{u}\` 获取当前分支的 upstream；若命令报错（detached HEAD 或无 upstream），不要猜测或使用仓库特定的硬编码分支，而是**询问用户**「当前分支无 upstream，请告知要 rebase 到哪个远端分支（如 origin/main）？」，等用户回答后再继续。
+5. 执行 \`git fetch\`，然后 rebase 到 step 4 确定的目标。
+6. 若 step 3 创建了 stash，用 stash name 定位并 pop（例如 \`git stash pop\` 前先 \`git stash list\` 确认自己那条的下标）；未创建则跳过。
+7. 如有冲突请协助解决。
+注意：只 pop 本次操作创建的 stash，先 \`git stash list\` 核对下标/name，绝不要误 pop 其他已有 stash。`
   const evt = new CustomEvent('send-message', {
     cancelable: true,
     detail: { taskId: props.task.id, content },
