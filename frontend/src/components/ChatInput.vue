@@ -23,7 +23,7 @@
       <button
         class="text-xs px-2 py-0.5 rounded border border-gray-700 text-gray-500 hover:border-blue-600/60 hover:text-blue-400 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
         :disabled="task.status === 'running' || !canSyncRemote || syncPending"
-        :title="canSyncRemote ? '同步远端代码到本地（stash → fetch → rebase → stash pop）' : '需要配置 agent 工作目录'"
+        :title="canSyncRemote ? '同步远端代码到本地（仅 stash tracked 改动 → fetch → rebase → stash pop）' : '需要配置 agent 工作目录'"
         @click="syncRemote"
       >
         同步远端代码
@@ -548,12 +548,14 @@ function syncRemote() {
   syncPending.value = true
   const ts = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)
   const content = `请帮我同步远端代码到本地。步骤：
-1. 先执行 \`git status --porcelain\` 检查是否有本地改动。
-2. 若有改动（包括 tracked 和 untracked 文件），用 \`git stash push --include-untracked -m "sync-remote-${ts}"\` 创建具名 stash 保存所有改动，记下这个 stash name。
-3. 执行 \`git fetch\` 然后 \`git rebase origin/<当前分支>\` 同步远端最新代码。
-4. 若第 2 步创建了 stash，用 \`git stash pop stash@{0}\`（或通过 stash name 定位）恢复改动；若未创建 stash 则跳过此步。
-5. 如有冲突请协助解决。
-注意：只 pop 本次操作创建的 stash，不要 pop 其他已有 stash。`
+1. 先执行 \`git status --porcelain\` 检查本地改动，并区分 tracked（\`M\`/\`A\`/\`D\` 等）和 untracked（\`??\`）文件。
+2. 【重要】不要用 \`git stash --include-untracked\` 全量 stash。未跟踪文件里常有巨型产物/备份（几 GB 甚至几十 GB 的 .bin / dump 目录），全量 stash 会极慢并撑爆 .git。而且 rebase 只重放 commit、不碰未跟踪文件，所以它们无需 stash，留在原地即可。
+3. 只 stash **tracked 的改动**：\`git stash push -m "sync-remote-${ts}" -- <改动文件列表>\`（显式列出 step 1 里的 tracked 文件；不带 \`--include-untracked\`）。记下这个 stash name。若 tracked 改动里也有很大的文件（如 2GB+ 的 .bin），先判断它是否是可重新生成的产物——如果是，可只 stash 真正需要保护的源码/配置文件。若没有任何 tracked 改动，则跳过 stash。
+4. 确认 rebase 目标：若当前处于 detached HEAD 或分支无 upstream，不要用「当前分支」；按仓库约定选择正确的远端分支（本仓库 qwen3-vl 系列固定 rebase 到 \`origin/tmp/neo\`，其它情况参考 CLAUDE.md 或询问）。
+5. 执行 \`git fetch\`，然后 rebase 到 step 4 确定的目标（如 \`git rebase origin/tmp/neo\`）。
+6. 若 step 3 创建了 stash，用 stash name 定位并 pop（例如 \`git stash pop\` 前先 \`git stash list\` 确认自己那条的下标）；未创建则跳过。
+7. 如有冲突请协助解决。
+注意：只 pop 本次操作创建的 stash，先 \`git stash list\` 核对下标/name，绝不要误 pop 其他已有 stash。`
   const evt = new CustomEvent('send-message', {
     cancelable: true,
     detail: { taskId: props.task.id, content },
