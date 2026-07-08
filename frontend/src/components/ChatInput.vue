@@ -549,7 +549,7 @@ function syncRemote() {
   const ts = new Date().toISOString().replace(/[^0-9]/g, '').slice(0, 14)
   const content = `请帮我同步远端代码到本地。步骤：
 1. 先执行 \`git status --porcelain\` 检查本地改动，并区分 tracked（\`M\`/\`A\`/\`D\` 等）和 untracked（\`??\`）文件。
-2. 【重要】不要用 \`git stash --include-untracked\` 全量 stash。未跟踪文件里常有巨型产物/备份（几 GB 甚至几十 GB 的 .bin / dump 目录），全量 stash 会极慢并撑爆 .git。而且 rebase 只重放 commit、不碰未跟踪文件，所以它们无需 stash，留在原地即可。
+2. 【重要】不要用 \`git stash --include-untracked\` 全量 stash。未跟踪文件里常有巨型产物/备份（几 GB 甚至几十 GB 的 .bin / dump 目录），全量 stash 会极慢并撑爆 .git。大多数未跟踪文件无需处理（rebase 不碰它们），但若目标分支引入了与本地未跟踪文件**同名**的文件，rebase 会报错 "untracked working tree files would be overwritten"。处理方式：先执行 \`git fetch\`，然后用 \`git diff --name-only HEAD...<rebase目标>\` 或 \`git ls-tree -r --name-only <rebase目标>\` 列出目标分支新增文件，与 step 1 中的 \`??\` 列表做交集；若有冲突路径，临时移走（\`mv <file> <file>.bak\`）或单独 stash 这些小文件，rebase 完成后再移回。
 3. 只 stash **tracked 的改动**：\`git stash push -m "sync-remote-${ts}" -- <改动文件列表>\`（显式列出 step 1 里的 tracked 文件；不带 \`--include-untracked\`）。记下这个 stash name。若 tracked 改动里也有很大的文件（如 2GB+ 的 .bin），先判断它是否是可重新生成的产物——如果是，用 \`git restore --staged --worktree <该文件路径>\`（或 \`git checkout HEAD -- <该文件路径>\`）丢弃其 index 和工作树改动（无需保护，rebase 后可重新生成），然后只 stash 真正需要保护的源码/配置文件。若没有任何 tracked 改动需要保护，则跳过 stash。**重要：进入 step 5 之前，必须确保所有 tracked 文件都已 stash 或通过 \`git restore --staged --worktree\` 完全丢弃改动（包括 index），否则 \`git rebase\` 会因 dirty index/unstaged changes 报错中止。**
 4. 确认 rebase 目标：若当前处于 detached HEAD 或分支无 upstream，不要用「当前分支」；按仓库约定选择正确的远端分支（本仓库 qwen3-vl 系列固定 rebase 到 \`origin/tmp/neo\`，其它情况参考 CLAUDE.md 或询问）。
 5. 执行 \`git fetch\`，然后 rebase 到 step 4 确定的目标（如 \`git rebase origin/tmp/neo\`）。
