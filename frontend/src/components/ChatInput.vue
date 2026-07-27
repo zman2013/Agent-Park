@@ -355,10 +355,6 @@ function handleKeydown(e) {
     }
   }
 
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault()
-    send()
-  }
 }
 
 function autoResize() {
