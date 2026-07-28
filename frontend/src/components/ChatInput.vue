@@ -355,6 +355,10 @@ function handleKeydown(e) {
     }
   }
 
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault()
+    send()
+  }
 }
 
 function autoResize() {
