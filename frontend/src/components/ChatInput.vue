@@ -344,7 +344,7 @@ function handleKeydown(e) {
       activeIndex.value = (activeIndex.value - 1 + filteredSkills.value.length) % filteredSkills.value.length
       return
     }
-    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey && !e.metaKey && !e.ctrlKey)) {
       e.preventDefault()
       selectSkill(filteredSkills.value[activeIndex.value])
       return
