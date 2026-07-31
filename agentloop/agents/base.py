@@ -279,8 +279,15 @@ def _child_env() -> dict[str, str]:
     ``_MAX_OUTPUT_TOKENS`` …) carry legitimate backend auth / routing config
     and must be preserved, otherwise Bedrock/Vertex-AI setups lose their
     routing and fall back to public API (or fail entirely).
+
+    ``EPT_CLAUDE_RUNNING`` is the ``ept claude`` wrapper's own re-entrancy
+    guard: when agent-park itself runs under ``ept claude``, agentloop's
+    subprocess (cco/ccs) inherits it and the wrapper treats that as a nested
+    launch, printing its usage text and exiting before reaching the claude
+    binary. Stripping it here mirrors ``server/agent_runner.py:_clean_env``.
     """
     env = os.environ.copy()
-    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
+    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT",
+                   "EPT_CLAUDE_RUNNING"):
         env.pop(marker, None)
     return env
