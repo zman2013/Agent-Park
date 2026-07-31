@@ -1305,6 +1305,13 @@ def _clean_env(task_id: str = "") -> dict[str, str]:
     Bedrock/Vertex-AI setups lose their routing and fall back to public API
     (or fail entirely).
 
+    ``EPT_CLAUDE_RUNNING`` is the ``ept claude`` wrapper's own re-entrancy
+    guard. When agent-park itself runs under ``ept claude``, the server
+    inherits it, and every ``ccs`` child would then see it too — the wrapper
+    treats that as a nested launch, prints its usage text to stderr and exits
+    1 before ever reaching the claude binary. Stripping it lets child agents
+    launch normally.
+
     When ``task_id`` is non-empty we inject ``AGENTPARK_TASK_ID``. Skills
     running inside the agent process (e.g. the agentloop skill) read this to
     self-identify when calling back into agent-park's REST API. The variable
@@ -1315,7 +1322,8 @@ def _clean_env(task_id: str = "") -> dict[str, str]:
     env = os.environ.copy()
     venv = env.pop("VIRTUAL_ENV", None)
     env.pop("VIRTUAL_ENV_PROMPT", None)
-    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"):
+    for marker in ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT",
+                   "EPT_CLAUDE_RUNNING"):
         env.pop(marker, None)
     if venv:
         venv_bin = os.path.join(venv, "bin")
