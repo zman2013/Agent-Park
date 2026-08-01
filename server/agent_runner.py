@@ -1343,6 +1343,16 @@ class AgentRunner:
                 except Exception:
                     pass
 
+        # Pipe-mode (codex) children live in _async_procs, not _pids — the
+        # PTY-only loop above never reaches them, so without this a pipe-mode
+        # run neither dies with the server nor ever reaches _finish_task.
+        for task_id, proc in list(self._async_procs.items()):
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
+
         # Let killed runs reach their own finalization (_finish_task, which
         # schedules the completion card) before we snapshot _notify_tasks below.
         # Without this, a run killed by the SIGTERM above hasn't necessarily
