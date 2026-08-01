@@ -1236,8 +1236,18 @@ class AgentRunner:
         await self._broadcast_status(task_id, TaskStatus.running)
 
         if kill_existing:
-            # Mark as resuming so the dying subprocess doesn't overwrite status with failed
-            self._resuming.add(task_id)
+            # Only mark as resuming if there's an actual live run to kill —
+            # user_message's handler (routes_ws.py) calls send_input() for
+            # BOTH a brand new task's first message and a follow-up resume,
+            # always with the default kill_existing=True. For a brand new
+            # task there is no previous run, so unconditionally adding to
+            # _resuming here would leave a stale entry that suppresses the
+            # very first _finish_task(failed) call for THIS run (e.g. if
+            # shutdown() cancels it while it's still in pre-spawn setup),
+            # leaving the task stuck at running with no completion card.
+            if task_id in self._subprocess_tasks:
+                # Mark as resuming so the dying subprocess doesn't overwrite status with failed
+                self._resuming.add(task_id)
             # Kill current process if still running
             await self.kill_task(task_id)
 
