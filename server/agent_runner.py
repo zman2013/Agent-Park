@@ -1078,30 +1078,53 @@ class AgentRunner:
         if task and not was_terminal:
             task.status = status
             task.updated_at = _model_utcnow()
+
+        # A pending auto-compact continuation means this success is not the
+        # real end of the turn — maybe_dispatch_auto_compact (called right
+        # after _finish_task returns) will flip the task back to running and
+        # dispatch /compact. Notifying now would report "done" mid-turn and
+        # again when the continuation actually finishes.
+        compact_will_continue = (
+            task is not None and status == TaskStatus.success and task_id in self._compact_pending
+        )
+        # Snapshot BEFORE the first await below: a concurrent send_input() for
+        # the same task_id can flip task.status back to running and advance
+        # _run_start_index to the next run while we're suspended, so anything
+        # read after the await could belong to the wrong run.
+        notify_args = None
+        if task and not was_terminal and not compact_will_continue:
+            notify_args = self._prepare_notify(task_id, task)
+
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
             app_state.save_agent_tasks(task.agent_id)
-            # A pending auto-compact continuation means this success is not the
-            # real end of the turn — maybe_dispatch_auto_compact (called right
-            # after _finish_task returns) will flip the task back to running and
-            # dispatch /compact. Notifying now would report "done" mid-turn and
-            # again when the continuation actually finishes.
-            compact_will_continue = (
-                status == TaskStatus.success and task_id in self._compact_pending
-            )
-            if not was_terminal and not compact_will_continue:
-                agent = app_state.get_agent(task.agent_id)
-                self._schedule_notify(agent.name if agent else task.agent_id, task)
+        if notify_args:
+            self._schedule_notify(*notify_args)
 
-    def _schedule_notify(self, agent_name: str, task: Task) -> None:
+    def _prepare_notify(self, task_id: str, task: Task) -> tuple[str, Task, int] | None:
+        """Build the (agent_name, task_snapshot, start_index) args for
+        _schedule_notify, or None if notifications are disabled.
+
+        Checks config before the deep copy so a disabled (default) setup
+        never pays for copying a potentially large transcript.
+        """
+        from server.config import task_notify_config
+        if not task_notify_config()["feishu_notify"].get("enabled"):
+            return None
+        agent = app_state.get_agent(task.agent_id)
+        return (
+            agent.name if agent else task.agent_id,
+            task.model_copy(deep=True),
+            self._run_start_index.get(task_id, 0),
+        )
+
+    def _schedule_notify(self, agent_name: str, task_snapshot: Task, start_index: int) -> None:
         """Fire the Feishu notification on a task detached from the runner's
         cancellable subprocess lifecycle, so a resume's cancel_existing=True
         can't cut off the CLI call mid-send."""
         from server.task_notify import notify_task_finished
 
-        start_index = self._run_start_index.get(task.id, 0)
-        snapshot = task.model_copy(deep=True)
-        t = asyncio.create_task(notify_task_finished(agent_name, snapshot, start_index))
+        t = asyncio.create_task(notify_task_finished(agent_name, task_snapshot, start_index))
         self._notify_tasks.add(t)
         t.add_done_callback(self._notify_tasks.discard)
 
