@@ -68,6 +68,15 @@
       "env_file": ""
     }
   },
+  "task_notify": {
+    "_comment": "每个 task 会话结束时（success/failed）发送最后一条 agent 消息到飞书，独立于 wiki_ingest 的 feishu_notify",
+    "feishu_notify": {
+      "enabled": false,
+      "cli_path": "",
+      "chat_id": "",
+      "env_file": ""
+    }
+  },
   "agents": [
     {
       "name": "my-agent",

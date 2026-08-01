@@ -186,6 +186,7 @@ do_start() {
 stop_one() {
     local name="$1"
     local pid_file="$2"
+    local grace="${3:-10}"
 
     if ! is_running "$pid_file"; then
         echo "${name} 未在运行"
@@ -201,7 +202,7 @@ stop_one() {
     while kill -0 "$pid" 2>/dev/null; do
         sleep 1
         count=$((count + 1))
-        if [ "$count" -ge 10 ]; then
+        if [ "$count" -ge "$grace" ]; then
             echo "${name} 未响应，强制终止..."
             kill -9 "$pid" 2>/dev/null || true
             break
@@ -213,7 +214,10 @@ stop_one() {
 
 do_stop() {
     stop_one "frontend" "$FRONTEND_PID"
-    stop_one "backend"  "$BACKEND_PID"
+    # backend's shutdown() waits up to 10s for in-flight agent subprocesses to
+    # finalize, then up to 40s for pending Feishu completion notifications —
+    # give it enough grace to clear both before force-killing.
+    stop_one "backend"  "$BACKEND_PID" 55
     echo "所有服务已停止"
 }
 

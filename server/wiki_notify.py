@@ -248,7 +248,13 @@ async def send_feishu_card(feishu_cfg: dict, message: str) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.error("Feishu notification timed out")
+            proc.kill()
+            await proc.wait()
+            return False
         if proc.returncode == 0:
             logger.info("Feishu notification sent successfully")
             return True
@@ -256,9 +262,6 @@ async def send_feishu_card(feishu_cfg: dict, message: str) -> bool:
             err_msg = stderr.decode("utf-8", errors="replace").strip()
             logger.error("Feishu notification failed: %s", err_msg)
             return False
-    except asyncio.TimeoutError:
-        logger.error("Feishu notification timed out")
-        return False
     except Exception:
         logger.exception("Feishu notification error")
         return False

@@ -24,7 +24,7 @@ from typing import Any
 
 from server.adapters import get_adapter
 from server.adapters.base import BaseAdapter
-from server.models import Message, TaskStatus
+from server.models import Message, Task, TaskStatus
 from server.models import _utcnow as _model_utcnow
 from server.state import app_state
 
@@ -538,6 +538,28 @@ class AgentRunner:
         # task_ids whose handoff turn just finished — broadcast completion notice next.
         self._handoff_pending: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
+        self._notify_tasks: set[asyncio.Task] = set()  # detached feishu-notify tasks (survive runner cancellation)
+        # PTY read transports currently awaiting EOF, so shutdown() can force
+        # them closed instead of waiting out their internal 60s lingering-
+        # grandchild safety net (see _run_pty_mode) within its own bounded
+        # stop window.
+        self._pty_read_transports: dict[str, asyncio.ReadTransport] = {}
+        # Shutdown-only registry keyed by run_id (unique per _run_subprocess
+        # call), NOT task_id. _pids/_async_procs/_pty_read_transports/
+        # _subprocess_tasks are all keyed by task_id and represent "the
+        # current run for this task" — a kill_existing=False continuation
+        # (max-turns auto-resume, auto-compact) can register its own run
+        # under the same task_id while the previous run is still finishing
+        # (e.g. draining a lingering PTY writer), overwriting those entries
+        # and making the old run invisible to shutdown(). This registry never
+        # gets overwritten by an unrelated run, so shutdown() can terminate
+        # and await every live run, not just the newest one per task_id.
+        self._live_runs: dict[str, dict] = {}  # run_id -> {task, pid, proc, transport}
+        # Index into task.messages marking the start of the CURRENT run, so
+        # notification can scan only this run's output — internal continuations
+        # (/compact, handoff auto-resume) don't append a user Message, so a
+        # role=="user" boundary can't detect them.
+        self._run_start_index: dict[str, int] = {}  # task_id -> message count when this run started
         # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
         # Track which run owns shared resources (_adapters, _session_baselines)
@@ -590,22 +612,41 @@ class AgentRunner:
         ):
             old.cancel()
 
+        import uuid as _uuid
+        run_id = _uuid.uuid4().hex[:8]
+        # Registered under run_id (not task_id) so shutdown() can always find
+        # and terminate every live run — a kill_existing=False continuation
+        # (max-turns auto-resume, auto-compact) can register its own run
+        # under the same task_id while the previous run is still finishing
+        # (e.g. draining a lingering PTY writer), overwriting the task_id-
+        # keyed _subprocess_tasks/_pids/_async_procs/_pty_read_transports
+        # entries below and making the old run invisible to a task_id-keyed
+        # lookup.
+        self._live_runs[run_id] = {}
+
         t = asyncio.create_task(
-            self._run_subprocess(task_id, prompt),
+            self._run_subprocess(task_id, prompt, run_id),
             name=f"subprocess-{task_id}",
         )
+        self._live_runs[run_id]["task"] = t
         self._subprocess_tasks[task_id] = t
 
         def _on_done(fut: asyncio.Task) -> None:
             if self._subprocess_tasks.get(task_id) is fut:
                 self._subprocess_tasks.pop(task_id, None)
+            # Guaranteed cleanup regardless of how the coroutine ended
+            # (normal return, exception, or cancellation before it ever
+            # reached its own try/finally — e.g. cancelled while awaiting
+            # wiki search, or the task was deleted before this Task got its
+            # first chance to run). Relying on _run_subprocess's internal
+            # cleanup alone leaves _live_runs entries stale in exactly the
+            # cases shutdown() most needs them gone: a cancelled/dead run
+            # that will never call _finish_task on its own.
+            self._live_runs.pop(run_id, None)
 
         t.add_done_callback(_on_done)
 
-    async def _run_subprocess(self, task_id: str, prompt: str) -> None:
-        import uuid as _uuid
-        run_id = _uuid.uuid4().hex[:8]
-
+    async def _run_subprocess(self, task_id: str, prompt: str, run_id: str) -> None:
         task = app_state.get_task(task_id)
         if not task:
             return
@@ -620,93 +661,108 @@ class AgentRunner:
 
         # Claim ownership for this run
         self._run_ids[task_id] = run_id
+        self._run_start_index[task_id] = len(task.messages)
 
-        # Ensure running status is set
-        if task.status not in (TaskStatus.running,):
-            task.status = TaskStatus.running
-            await self._broadcast_status(task_id, TaskStatus.running)
+        try:
+            # Ensure running status is set
+            if task.status not in (TaskStatus.running,):
+                task.status = TaskStatus.running
+                await self._broadcast_status(task_id, TaskStatus.running)
 
-        agent = app_state.get_agent(task.agent_id)
-        command = agent.command if agent else "cco"
-        agent_cwd = agent.cwd if agent and agent.cwd else ""
+            agent = app_state.get_agent(task.agent_id)
+            command = agent.command if agent else "cco"
+            agent_cwd = agent.cwd if agent and agent.cwd else ""
 
-        session_id = self._session_ids.get(task_id)
+            session_id = self._session_ids.get(task_id)
 
-        # Check if this is a fork: task has a fork_session_id to consume
-        fork_sid = task.fork_session_id
-        fork_resume_at = task.fork_resume_at
-        if fork_sid:
-            task.fork_session_id = None  # consume once
-            task.fork_resume_at = None
-            app_state.save_agent_tasks(task.agent_id)
+            # Check if this is a fork: task has a fork_session_id to consume
+            fork_sid = task.fork_session_id
+            fork_resume_at = task.fork_resume_at
+            if fork_sid:
+                task.fork_session_id = None  # consume once
+                task.fork_resume_at = None
+                app_state.save_agent_tasks(task.agent_id)
 
-        # Strip !wiki prefix before any prompt augmentation
-        skip_wiki = False
-        if prompt.startswith("!wiki"):
-            skip_wiki = True
-            prompt = prompt[len("!wiki"):].lstrip()
+            # Strip !wiki prefix before any prompt augmentation
+            skip_wiki = False
+            if prompt.startswith("!wiki"):
+                skip_wiki = True
+                prompt = prompt[len("!wiki"):].lstrip()
 
-        # Inject memory and wiki context only on new sessions (no existing session_id and not a fork)
-        if not session_id and not fork_sid:
-            from server.memory import load_memory
-            from server.config import memory_config
-            mem_cfg = memory_config()
-            memory_lines = load_memory(task.agent_id, mem_cfg["max_lines"])
+            # Inject memory and wiki context only on new sessions (no existing session_id and not a fork)
+            if not session_id and not fork_sid:
+                from server.memory import load_memory
+                from server.config import memory_config
+                mem_cfg = memory_config()
+                memory_lines = load_memory(task.agent_id, mem_cfg["max_lines"])
 
-            parts: list[str] = []
-            if memory_lines:
-                memory_text = "\n".join(memory_lines)
-                parts.append(f"<memory>\n{memory_text}\n</memory>")
+                parts: list[str] = []
+                if memory_lines:
+                    memory_text = "\n".join(memory_lines)
+                    parts.append(f"<memory>\n{memory_text}\n</memory>")
 
-            if not skip_wiki and agent and agent.wiki:
-                try:
-                    from server.wiki_search import search_wiki
-                    from server.routes_ws import broadcast
-                    # Notify user that wiki search is starting
-                    _notice_start = Message(
-                        role="agent", type="system", streaming=False,
-                        content=f"🔍 正在检索 wiki 知识库（{agent.wiki}）...",
-                    )
-                    task.messages.append(_notice_start)
-                    await broadcast({"type": "message", "task_id": task_id, "message": _notice_start.model_dump()})
-
-                    wiki_context = await search_wiki(prompt, agent.wiki)
-
-                    if wiki_context:
-                        parts.append(wiki_context)
-                        _notice_done = Message(
+                if not skip_wiki and agent and agent.wiki:
+                    try:
+                        from server.wiki_search import search_wiki
+                        from server.routes_ws import broadcast
+                        # Notify user that wiki search is starting
+                        _notice_start = Message(
                             role="agent", type="system", streaming=False,
-                            content=f"📚 Wiki 检索完成，已注入上下文：\n\n{wiki_context}",
+                            content=f"🔍 正在检索 wiki 知识库（{agent.wiki}）...",
                         )
-                    else:
-                        _notice_done = Message(
-                            role="agent", type="system", streaming=False,
-                            content=f"📭 Wiki 检索完成，未找到相关页面。",
-                        )
-                    task.messages.append(_notice_done)
-                    await broadcast({"type": "message", "task_id": task_id, "message": _notice_done.model_dump()})
-                except Exception:
-                    logger.exception("Wiki search failed for task %s, skipping", task_id)
+                        task.messages.append(_notice_start)
+                        await broadcast({"type": "message", "task_id": task_id, "message": _notice_start.model_dump()})
 
-            parts.append(prompt)
-            prompt = "\n\n".join(parts)
+                        wiki_context = await search_wiki(prompt, agent.wiki)
 
-        # Select adapter and build args
-        adapter = get_adapter(command)
-        self._adapters[task_id] = adapter
-        args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd, resume_at=fork_resume_at)
-        ctx = _RunContext(self, task_id)
+                        if wiki_context:
+                            parts.append(wiki_context)
+                            _notice_done = Message(
+                                role="agent", type="system", streaming=False,
+                                content=f"📚 Wiki 检索完成，已注入上下文：\n\n{wiki_context}",
+                            )
+                        else:
+                            _notice_done = Message(
+                                role="agent", type="system", streaming=False,
+                                content=f"📭 Wiki 检索完成，未找到相关页面。",
+                            )
+                        task.messages.append(_notice_done)
+                        await broadcast({"type": "message", "task_id": task_id, "message": _notice_done.model_dump()})
+                    except Exception:
+                        logger.exception("Wiki search failed for task %s, skipping", task_id)
 
-        # Validate working directory before spawning subprocess
-        if agent_cwd and not os.path.isdir(agent_cwd):
-            from server.routes_ws import broadcast
-            err_msg = f"工作目录不存在：{agent_cwd}\n请检查 Agent 配置中的路径是否正确。"
-            notice = Message(role="agent", type="system", streaming=False, content=err_msg)
-            task.messages.append(notice)
-            await broadcast({"type": "message", "task_id": task_id, "message": notice.model_dump()})
+                parts.append(prompt)
+                prompt = "\n\n".join(parts)
+
+            # Select adapter and build args
+            adapter = get_adapter(command)
+            self._adapters[task_id] = adapter
+            args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd, resume_at=fork_resume_at)
+            ctx = _RunContext(self, task_id)
+
+            # Validate working directory before spawning subprocess
+            if agent_cwd and not os.path.isdir(agent_cwd):
+                from server.routes_ws import broadcast
+                err_msg = f"工作目录不存在：{agent_cwd}\n请检查 Agent 配置中的路径是否正确。"
+                notice = Message(role="agent", type="system", streaming=False, content=err_msg)
+                task.messages.append(notice)
+                await broadcast({"type": "message", "task_id": task_id, "message": notice.model_dump()})
+                await self._finish_task(task_id, TaskStatus.failed)
+                self._cleanup_run_resources(task_id, run_id)
+                return
+        except asyncio.CancelledError:
+            # Cancelled before any child was ever spawned (e.g. shutdown()
+            # cancelling a run still stuck in search_wiki(), or a resume's
+            # cancel_existing=True racing this same pre-spawn window). The
+            # post-spawn try/finally below already finalizes on cancellation
+            # via its own `finally`; this section has no such wrapper, so
+            # without this the task would stay stuck at running with no
+            # completion card. _finish_task no-ops via the _resuming flag
+            # when this is a normal resume cancellation, same as the
+            # post-spawn path.
             await self._finish_task(task_id, TaskStatus.failed)
             self._cleanup_run_resources(task_id, run_id)
-            return
+            raise
 
         try:
             if adapter.needs_pty():
@@ -740,6 +796,14 @@ class AgentRunner:
         self._async_procs.pop(task_id, None)
         self._adapters.pop(task_id, None)
         self._session_baselines.pop(task_id, None)
+        # Note: _run_start_index is intentionally NOT cleared here, for the same
+        # reason as _compact_warned below: stop_task (routes_ws.py) cancels the
+        # subprocess Task via kill_task() *before* calling _finish_task directly,
+        # so this cleanup and that finalization race. Popping the boundary here
+        # would make the notification fall back to index 0 (the whole transcript)
+        # depending on which runs first. The next _run_subprocess overwrites this
+        # entry anyway, so leaving it stale between runs is harmless; forget_task
+        # clears it on real teardown.
         # Note: _compact_warned is intentionally NOT cleared here. Per-run cleanup
         # fires at the end of every subprocess run (including max-turns resume and
         # short turns between the warn threshold and the compact boundary). The
@@ -844,6 +908,8 @@ class AgentRunner:
             os.close(slave_fd)
             self._pids[task_id] = pid
             self._master_fds[task_id] = master_fd
+            if run_id in self._live_runs:
+                self._live_runs[run_id]["pid"] = pid
             # Persist PID to task for orphan recovery
             task = app_state.get_task(task_id)
             if task:
@@ -873,21 +939,43 @@ class AgentRunner:
             read_transport, _ = await loop.connect_read_pipe(
                 lambda: read_protocol, os.fdopen(master_fd, "rb", 0)
             )
+            self._pty_read_transports[task_id] = read_transport
+            if run_id in self._live_runs:
+                self._live_runs[run_id]["transport"] = read_transport
+
+            # Safety net for a lingering grandchild that still holds the pty
+            # slave fd open after the immediate child exits — in that case
+            # read() on the master fd never sees EOF and _read_json_lines
+            # would hang forever. This timer is intentionally generous (well
+            # beyond how long draining a large buffered turn can legitimately
+            # take under backpressure) and is cancelled below the moment the
+            # read loop returns on its own, so it never races a slow-but-still
+            # -progressing drain into truncating output. shutdown() closes
+            # this transport directly (bounded by its own stop window) rather
+            # than waiting out this timer, so a lingering grandchild at process
+            # exit doesn't strand this coroutine past the 60s mark.
+            lingering_writer_timer = None
 
             def _on_ept_exit(fut: asyncio.Future) -> None:
-                read_transport.close()
-                rc = fut.result() if not fut.cancelled() else -1
-                status = TaskStatus.success if rc == 0 else TaskStatus.failed
-                # Skip if this run no longer owns the task (replaced by auto-resume)
-                if self._run_ids.get(task_id) != run_id:
-                    return
-                agent_task = app_state.get_task(task_id)
-                if agent_task and agent_task.status == TaskStatus.running:
-                    asyncio.ensure_future(self._finish_task(task_id, status))
+                nonlocal lingering_writer_timer
+                lingering_writer_timer = loop.call_later(60.0, read_transport.close)
 
             wait_future.add_done_callback(_on_ept_exit)
 
-            await self._read_json_lines(reader, read_transport, adapter, ctx, strip_ansi=True)
+            try:
+                await self._read_json_lines(reader, read_transport, adapter, ctx, strip_ansi=True)
+            finally:
+                if lingering_writer_timer:
+                    lingering_writer_timer.cancel()
+                # Only remove if this run still owns the entry: kill_existing=False
+                # continuations (max-turns auto-resume, auto-compact) start a new
+                # _run_pty_mode for the same task_id without cancelling this one,
+                # so if the new run has already registered its own transport by
+                # the time this (stale, finishing) run reaches here, popping
+                # unconditionally would strip shutdown()'s only handle on the
+                # transport that's actually still in use.
+                if self._pty_read_transports.get(task_id) is read_transport:
+                    self._pty_read_transports.pop(task_id, None)
 
             returncode = await wait_future
             logger.info("%s pid=%d exited with code %d", args[0], pid, returncode)
@@ -927,6 +1015,8 @@ class AgentRunner:
             env=env,
         )
         self._async_procs[task_id] = proc
+        if run_id in self._live_runs:
+            self._live_runs[run_id]["proc"] = proc
 
         logger.info("Spawned %s pid=%d for task %s (pipe mode)", args[0], proc.pid, task_id)
 
@@ -1066,12 +1156,59 @@ class AgentRunner:
             return
 
         task = app_state.get_task(task_id)
-        if task and task.status not in (TaskStatus.success, TaskStatus.failed):
+        was_terminal = task and task.status in (TaskStatus.success, TaskStatus.failed)
+        if task and not was_terminal:
             task.status = status
             task.updated_at = _model_utcnow()
+
+        # A pending auto-compact continuation means this success is not the
+        # real end of the turn — maybe_dispatch_auto_compact (called right
+        # after _finish_task returns) will flip the task back to running and
+        # dispatch /compact. Notifying now would report "done" mid-turn and
+        # again when the continuation actually finishes.
+        compact_will_continue = (
+            task is not None and status == TaskStatus.success and task_id in self._compact_pending
+        )
+        # Snapshot BEFORE the first await below: a concurrent send_input() for
+        # the same task_id can flip task.status back to running and advance
+        # _run_start_index to the next run while we're suspended, so anything
+        # read after the await could belong to the wrong run.
+        notify_args = None
+        if task and not was_terminal and not compact_will_continue:
+            notify_args = self._prepare_notify(task_id, task)
+
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
             app_state.save_agent_tasks(task.agent_id)
+        if notify_args:
+            self._schedule_notify(*notify_args)
+
+    def _prepare_notify(self, task_id: str, task: Task) -> tuple[str, Task, int] | None:
+        """Build the (agent_name, task_snapshot, start_index) args for
+        _schedule_notify, or None if notifications are disabled.
+
+        Checks config before the deep copy so a disabled (default) setup
+        never pays for copying a potentially large transcript.
+        """
+        from server.config import task_notify_config
+        if not task_notify_config()["feishu_notify"].get("enabled"):
+            return None
+        agent = app_state.get_agent(task.agent_id)
+        return (
+            agent.name if agent else task.agent_id,
+            task.model_copy(deep=True),
+            self._run_start_index.get(task_id, 0),
+        )
+
+    def _schedule_notify(self, agent_name: str, task_snapshot: Task, start_index: int) -> None:
+        """Fire the Feishu notification on a task detached from the runner's
+        cancellable subprocess lifecycle, so a resume's cancel_existing=True
+        can't cut off the CLI call mid-send."""
+        from server.task_notify import notify_task_finished
+
+        t = asyncio.create_task(notify_task_finished(agent_name, task_snapshot, start_index))
+        self._notify_tasks.add(t)
+        t.add_done_callback(self._notify_tasks.discard)
 
     async def _broadcast_status(self, task_id: str, status: TaskStatus) -> None:
         from server.routes_ws import broadcast
@@ -1099,8 +1236,18 @@ class AgentRunner:
         await self._broadcast_status(task_id, TaskStatus.running)
 
         if kill_existing:
-            # Mark as resuming so the dying subprocess doesn't overwrite status with failed
-            self._resuming.add(task_id)
+            # Only mark as resuming if there's an actual live run to kill —
+            # user_message's handler (routes_ws.py) calls send_input() for
+            # BOTH a brand new task's first message and a follow-up resume,
+            # always with the default kill_existing=True. For a brand new
+            # task there is no previous run, so unconditionally adding to
+            # _resuming here would leave a stale entry that suppresses the
+            # very first _finish_task(failed) call for THIS run (e.g. if
+            # shutdown() cancels it while it's still in pre-spawn setup),
+            # leaving the task stuck at running with no completion card.
+            if task_id in self._subprocess_tasks:
+                # Mark as resuming so the dying subprocess doesn't overwrite status with failed
+                self._resuming.add(task_id)
             # Kill current process if still running
             await self.kill_task(task_id)
 
@@ -1174,6 +1321,7 @@ class AgentRunner:
         self._compact_warned.discard(task_id)
         self._compact_pending.discard(task_id)
         self._handoff_pending.discard(task_id)
+        self._run_start_index.pop(task_id, None)
 
     # ── orphan task restore ─────────────────────────────────────────────
 
@@ -1271,14 +1419,134 @@ class AgentRunner:
 
     async def shutdown(self) -> None:
         """Graceful shutdown: kill any tracked subprocesses."""
-        for task_id, pid in list(self._pids.items()):
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except Exception:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except Exception:
-                    pass
+        loop = asyncio.get_event_loop()
+
+        def _sigterm_all() -> None:
+            # Iterate _live_runs (keyed by run_id, never overwritten by an
+            # unrelated run) rather than the task_id-keyed _pids/_async_procs
+            # — a kill_existing=False continuation started for the same
+            # task_id while an older run is still finishing would otherwise
+            # make that older run's pid/proc invisible here.
+            for run in list(self._live_runs.values()):
+                pid = run.get("pid")
+                if pid is not None:
+                    try:
+                        os.killpg(pid, signal.SIGTERM)
+                    except Exception:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except Exception:
+                            pass
+                proc = run.get("proc")
+                if proc is not None and proc.returncode is None:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+
+        _sigterm_all()
+
+        # Let killed runs reach their own finalization (_finish_task, which
+        # schedules the completion card) before we snapshot _notify_tasks below.
+        # Loop rather than snapshot-once: a run that finishes cleanly on its
+        # own (not killed by the SIGTERM above) can dispatch a kill_existing=
+        # False continuation (max-turns auto-resume, successful auto-compact),
+        # registering a brand new _live_runs entry after we've already taken
+        # our snapshot. Repeatedly re-snapshotting and SIGTERM'ing any
+        # newcomers until the set actually drains (or the overall budget below
+        # runs out) keeps such continuations from being silently orphaned.
+        deadline = loop.time() + 10
+        while self._live_runs and loop.time() < deadline:
+            _sigterm_all()  # catch pids/procs registered by new continuations
+            tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
+            if not tasks:
+                break
+            # Poll on a short interval rather than waiting the full remaining
+            # budget: asyncio.wait's default ALL_COMPLETED means a single
+            # still-running task (e.g. a PTY reader blocked on a lingering
+            # grandchild) makes this call block for its entire timeout, so a
+            # continuation registered moments later never gets re-snapshotted
+            # or SIGTERM'd until the whole budget is already gone.
+            await asyncio.wait(tasks, timeout=min(1.0, max(0.0, deadline - loop.time())))
+
+        if self._live_runs:
+            # SIGTERM didn't finish the job in time — escalate to SIGKILL
+            # and give finalization a second, shorter window. run.sh's
+            # stop grace was sized to cover this (see do_stop). Without
+            # this, a child that ignores/delays SIGTERM would never reach
+            # _finish_task, leaving its task stuck at running with no
+            # completion card and no exit.
+            def _sigkill_all() -> None:
+                for run in list(self._live_runs.values()):
+                    pid = run.get("pid")
+                    if pid is not None:
+                        try:
+                            os.killpg(pid, signal.SIGKILL)
+                        except Exception:
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                            except Exception:
+                                pass
+                    proc = run.get("proc")
+                    if proc is not None and proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                    # SIGKILL to the recorded pid/pgid can't reach a detached
+                    # grandchild that still holds the pty slave fd open — that
+                    # case only unblocks via the internal 60s lingering-writer
+                    # timer (see _run_pty_mode), which is longer than this
+                    # shutdown's own bounded wait. Close the transport directly
+                    # so the pending _read_json_lines loop sees EOF/error now
+                    # instead of stranding this shutdown past run.sh's kill deadline.
+                    transport = run.get("transport")
+                    if transport is not None:
+                        transport.close()
+
+            # Loop here too (mirrors the SIGTERM phase above): a run still
+            # inside result handling when the SIGTERM deadline hit (e.g.
+            # awaiting a bounded broadcast) can still dispatch a
+            # kill_existing=False continuation during this escalation window,
+            # registering yet another _live_runs entry that a one-shot
+            # snapshot+wait would silently miss.
+            kill_deadline = loop.time() + 5
+            while self._live_runs and loop.time() < kill_deadline:
+                _sigkill_all()
+                tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
+                if not tasks:
+                    break
+                # Same reasoning as the SIGTERM loop above: poll on a short
+                # interval so a continuation registered mid-drain gets
+                # re-snapshotted and SIGKILL'd instead of waiting out this
+                # whole (already short) escalation budget unattended.
+                await asyncio.wait(tasks, timeout=min(1.0, max(0.0, kill_deadline - loop.time())))
+
+            if self._live_runs:
+                # Some run(s) never spawned a child to signal — e.g. still
+                # awaiting a pre-spawn step like search_wiki() (default
+                # timeout 30s, longer than the 10s+5s SIGTERM/SIGKILL budget
+                # above), so _sigkill_all() was a no-op for them. Their asyncio
+                # coroutine is the only handle left; cancel it directly rather
+                # than let lifespan's own event-loop teardown do it implicitly
+                # (which would skip _finish_task and its failure notification).
+                for run in list(self._live_runs.values()):
+                    task_obj = run.get("task")
+                    if task_obj and not task_obj.done():
+                        task_obj.cancel()
+                tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
+                if tasks:
+                    await asyncio.wait(tasks, timeout=2)
+
+        # Give in-flight Feishu notifications a bounded window to finish before
+        # the event loop closes and cancels them. send_feishu_card's own CLI
+        # timeout is 30s (wiki_notify.py); this outer wait must exceed that
+        # with real margin — asyncio.wait's timeout doesn't cancel the pending
+        # task, so if both timers were equal and this one fired first,
+        # shutdown would return with the notification's own timeout handler
+        # (which kills its CLI child) never having run.
+        if self._notify_tasks:
+            await asyncio.wait(list(self._notify_tasks), timeout=40)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────

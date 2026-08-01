@@ -128,6 +128,20 @@ def wiki_search_config() -> dict:
     }
 
 
+def task_notify_config() -> dict:
+    """Return the task-finish notification configuration with defaults."""
+    cfg = get_config().get("task_notify", {})
+    feishu_cfg = cfg.get("feishu_notify", {})
+    return {
+        "feishu_notify": {
+            "enabled": feishu_cfg.get("enabled", False),
+            "cli_path": feishu_cfg.get("cli_path", ""),
+            "chat_id": feishu_cfg.get("chat_id", ""),
+            "env_file": feishu_cfg.get("env_file", ""),
+        },
+    }
+
+
 def wiki_ingest_config() -> dict:
     """Return the wiki ingest configuration with defaults.
 
