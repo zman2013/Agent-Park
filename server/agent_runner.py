@@ -539,6 +539,11 @@ class AgentRunner:
         self._handoff_pending: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         self._notify_tasks: set[asyncio.Task] = set()  # detached feishu-notify tasks (survive runner cancellation)
+        # Index into task.messages marking the start of the CURRENT run, so
+        # notification can scan only this run's output — internal continuations
+        # (/compact, handoff auto-resume) don't append a user Message, so a
+        # role=="user" boundary can't detect them.
+        self._run_start_index: dict[str, int] = {}  # task_id -> message count when this run started
         # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
         # Track which run owns shared resources (_adapters, _session_baselines)
@@ -621,6 +626,7 @@ class AgentRunner:
 
         # Claim ownership for this run
         self._run_ids[task_id] = run_id
+        self._run_start_index[task_id] = len(task.messages)
 
         # Ensure running status is set
         if task.status not in (TaskStatus.running,):
@@ -741,6 +747,7 @@ class AgentRunner:
         self._async_procs.pop(task_id, None)
         self._adapters.pop(task_id, None)
         self._session_baselines.pop(task_id, None)
+        self._run_start_index.pop(task_id, None)
         # Note: _compact_warned is intentionally NOT cleared here. Per-run cleanup
         # fires at the end of every subprocess run (including max-turns resume and
         # short turns between the warn threshold and the compact boundary). The
@@ -1092,8 +1099,9 @@ class AgentRunner:
         can't cut off the CLI call mid-send."""
         from server.task_notify import notify_task_finished
 
+        start_index = self._run_start_index.get(task.id, 0)
         snapshot = task.model_copy(deep=True)
-        t = asyncio.create_task(notify_task_finished(agent_name, snapshot))
+        t = asyncio.create_task(notify_task_finished(agent_name, snapshot, start_index))
         self._notify_tasks.add(t)
         t.add_done_callback(self._notify_tasks.discard)
 
@@ -1303,6 +1311,12 @@ class AgentRunner:
                     os.kill(pid, signal.SIGTERM)
                 except Exception:
                     pass
+
+        # Give in-flight Feishu notifications (up to ~30s each, see
+        # wiki_notify.send_feishu_card) a bounded window to finish before the
+        # event loop closes and cancels them.
+        if self._notify_tasks:
+            await asyncio.wait(list(self._notify_tasks), timeout=30)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────

@@ -19,17 +19,16 @@ _STATUS_LABELS = {"success": "✅ 成功", "failed": "❌ 失败"}
 _NO_OUTPUT_FALLBACK = {"success": "(任务已完成，无输出)", "failed": "(任务失败，无输出)"}
 
 
-def _last_agent_text(task: Task) -> str:
-    """Return the last agent text message from the CURRENT turn only.
+def _last_agent_text(task: Task, start_index: int = 0) -> str:
+    """Return the last agent text message from the CURRENT run only.
 
-    A resumed turn (auto-continue, /compact, handoff) that produces no new
-    text must not fall back to an earlier turn's output — that would report
-    stale content under the current turn's status. Scanning stops at the most
-    recent user message, which marks the start of the current turn.
+    Internal continuations (auto-continue, /compact, handoff) resume the
+    subprocess without appending a user Message, so a role=="user" boundary
+    can't detect them. ``start_index`` is the message count captured by the
+    runner when this run started, giving an exact boundary regardless of
+    whether the continuation was user- or system-initiated.
     """
-    for m in reversed(task.messages):
-        if m.role == "user":
-            break
+    for m in reversed(task.messages[start_index:]):
         if m.role == "agent" and m.type == "text" and m.content.strip():
             return m.content.strip()
     return ""
@@ -45,7 +44,7 @@ def format_task_card(*, agent_name: str, task_name: str, status: str, last_messa
     return "\n".join(lines)
 
 
-async def notify_task_finished(agent_name: str, task: Task) -> None:
+async def notify_task_finished(agent_name: str, task: Task, start_index: int = 0) -> None:
     """Send a Feishu card with the task's last agent message, if enabled."""
     cfg = task_notify_config()["feishu_notify"]
     if not cfg.get("enabled"):
@@ -54,7 +53,7 @@ async def notify_task_finished(agent_name: str, task: Task) -> None:
         agent_name=agent_name,
         task_name=task.name or task.id,
         status=task.status.value,
-        last_message=_last_agent_text(task),
+        last_message=_last_agent_text(task, start_index),
     )
     try:
         await send_feishu_card(cfg, message)
