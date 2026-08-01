@@ -16,7 +16,7 @@ from server.wiki_notify import send_feishu_card
 logger = logging.getLogger(__name__)
 
 _STATUS_LABELS = {"success": "✅ 成功", "failed": "❌ 失败"}
-_NO_OUTPUT_FALLBACK = "(任务失败，无输出)"
+_NO_OUTPUT_FALLBACK = {"success": "(任务已完成，无输出)", "failed": "(任务失败，无输出)"}
 
 
 def _last_agent_text(task: Task) -> str:
@@ -31,7 +31,7 @@ def format_task_card(*, agent_name: str, task_name: str, status: str, last_messa
         f"🤖 {agent_name} / {task_name}",
         f"**状态**: {_STATUS_LABELS.get(status, status)}",
         "",
-        last_message or _NO_OUTPUT_FALLBACK,
+        last_message or _NO_OUTPUT_FALLBACK.get(status, _NO_OUTPUT_FALLBACK["failed"]),
     ]
     return "\n".join(lines)
 

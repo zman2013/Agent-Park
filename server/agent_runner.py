@@ -24,7 +24,7 @@ from typing import Any
 
 from server.adapters import get_adapter
 from server.adapters.base import BaseAdapter
-from server.models import Message, TaskStatus
+from server.models import Message, Task, TaskStatus
 from server.models import _utcnow as _model_utcnow
 from server.state import app_state
 
@@ -538,6 +538,7 @@ class AgentRunner:
         # task_ids whose handoff turn just finished — broadcast completion notice next.
         self._handoff_pending: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
+        self._notify_tasks: set[asyncio.Task] = set()  # detached feishu-notify tasks (survive runner cancellation)
         # Snapshot of cumulative token/cost values at the START of each session.
         self._session_baselines: dict[str, dict] = {}  # task_id -> baseline snapshot
         # Track which run owns shared resources (_adapters, _session_baselines)
@@ -1074,10 +1075,19 @@ class AgentRunner:
         if task:
             app_state.save_agent_tasks(task.agent_id)
             if not was_terminal:
-                from server.task_notify import notify_task_finished
-
                 agent = app_state.get_agent(task.agent_id)
-                await notify_task_finished(agent.name if agent else task.agent_id, task)
+                self._schedule_notify(agent.name if agent else task.agent_id, task)
+
+    def _schedule_notify(self, agent_name: str, task: Task) -> None:
+        """Fire the Feishu notification on a task detached from the runner's
+        cancellable subprocess lifecycle, so a resume's cancel_existing=True
+        can't cut off the CLI call mid-send."""
+        from server.task_notify import notify_task_finished
+
+        snapshot = task.model_copy(deep=True)
+        t = asyncio.create_task(notify_task_finished(agent_name, snapshot))
+        self._notify_tasks.add(t)
+        t.add_done_callback(self._notify_tasks.discard)
 
     async def _broadcast_status(self, task_id: str, status: TaskStatus) -> None:
         from server.routes_ws import broadcast
