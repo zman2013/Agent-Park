@@ -539,6 +539,11 @@ class AgentRunner:
         self._handoff_pending: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         self._notify_tasks: set[asyncio.Task] = set()  # detached feishu-notify tasks (survive runner cancellation)
+        # PTY read transports currently awaiting EOF, so shutdown() can force
+        # them closed instead of waiting out their internal 60s lingering-
+        # grandchild safety net (see _run_pty_mode) within its own bounded
+        # stop window.
+        self._pty_read_transports: dict[str, asyncio.ReadTransport] = {}
         # Index into task.messages marking the start of the CURRENT run, so
         # notification can scan only this run's output — internal continuations
         # (/compact, handoff auto-resume) don't append a user Message, so a
@@ -888,6 +893,7 @@ class AgentRunner:
             read_transport, _ = await loop.connect_read_pipe(
                 lambda: read_protocol, os.fdopen(master_fd, "rb", 0)
             )
+            self._pty_read_transports[task_id] = read_transport
 
             # Safety net for a lingering grandchild that still holds the pty
             # slave fd open after the immediate child exits — in that case
@@ -896,7 +902,10 @@ class AgentRunner:
             # beyond how long draining a large buffered turn can legitimately
             # take under backpressure) and is cancelled below the moment the
             # read loop returns on its own, so it never races a slow-but-still
-            # -progressing drain into truncating output.
+            # -progressing drain into truncating output. shutdown() closes
+            # this transport directly (bounded by its own stop window) rather
+            # than waiting out this timer, so a lingering grandchild at process
+            # exit doesn't strand this coroutine past the 60s mark.
             lingering_writer_timer = None
 
             def _on_ept_exit(fut: asyncio.Future) -> None:
@@ -910,6 +919,7 @@ class AgentRunner:
             finally:
                 if lingering_writer_timer:
                     lingering_writer_timer.cancel()
+                self._pty_read_transports.pop(task_id, None)
 
             returncode = await wait_future
             logger.info("%s pid=%d exited with code %d", args[0], pid, returncode)
@@ -1391,6 +1401,15 @@ class AgentRunner:
                             proc.kill()
                         except ProcessLookupError:
                             pass
+                # SIGKILL to the recorded pid/pgid can't reach a detached
+                # grandchild that still holds the pty slave fd open — that
+                # case only unblocks via the internal 60s lingering-writer
+                # timer (see _run_pty_mode), which is longer than this
+                # shutdown's own bounded wait. Close the transports directly
+                # so the pending _read_json_lines loops see EOF/error now
+                # instead of stranding this shutdown past run.sh's kill deadline.
+                for transport in list(self._pty_read_transports.values()):
+                    transport.close()
                 await asyncio.wait(pending, timeout=5)
 
         # Give in-flight Feishu notifications a bounded window to finish before
