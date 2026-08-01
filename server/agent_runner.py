@@ -747,7 +747,14 @@ class AgentRunner:
         self._async_procs.pop(task_id, None)
         self._adapters.pop(task_id, None)
         self._session_baselines.pop(task_id, None)
-        self._run_start_index.pop(task_id, None)
+        # Note: _run_start_index is intentionally NOT cleared here, for the same
+        # reason as _compact_warned below: stop_task (routes_ws.py) cancels the
+        # subprocess Task via kill_task() *before* calling _finish_task directly,
+        # so this cleanup and that finalization race. Popping the boundary here
+        # would make the notification fall back to index 0 (the whole transcript)
+        # depending on which runs first. The next _run_subprocess overwrites this
+        # entry anyway, so leaving it stale between runs is harmless; forget_task
+        # clears it on real teardown.
         # Note: _compact_warned is intentionally NOT cleared here. Per-run cleanup
         # fires at the end of every subprocess run (including max-turns resume and
         # short turns between the warn threshold and the compact boundary). The
@@ -883,15 +890,15 @@ class AgentRunner:
             )
 
             def _on_ept_exit(fut: asyncio.Future) -> None:
+                # Only unblock the reader here; do NOT finalize the task. That
+                # would race the _read_json_lines drain below and can finish
+                # (and notify) on a truncated transcript. The code right after
+                # `await self._read_json_lines(...)` is the single place that
+                # finalizes PTY runs, once output is fully drained. If this
+                # Task gets cancelled before reaching that point (e.g. resume's
+                # kill_task), _run_subprocess's own finally block already
+                # handles the failed-fallback.
                 read_transport.close()
-                rc = fut.result() if not fut.cancelled() else -1
-                status = TaskStatus.success if rc == 0 else TaskStatus.failed
-                # Skip if this run no longer owns the task (replaced by auto-resume)
-                if self._run_ids.get(task_id) != run_id:
-                    return
-                agent_task = app_state.get_task(task_id)
-                if agent_task and agent_task.status == TaskStatus.running:
-                    asyncio.ensure_future(self._finish_task(task_id, status))
 
             wait_future.add_done_callback(_on_ept_exit)
 
@@ -1229,6 +1236,7 @@ class AgentRunner:
         self._compact_warned.discard(task_id)
         self._compact_pending.discard(task_id)
         self._handoff_pending.discard(task_id)
+        self._run_start_index.pop(task_id, None)
 
     # ── orphan task restore ─────────────────────────────────────────────
 
