@@ -919,7 +919,15 @@ class AgentRunner:
             finally:
                 if lingering_writer_timer:
                     lingering_writer_timer.cancel()
-                self._pty_read_transports.pop(task_id, None)
+                # Only remove if this run still owns the entry: kill_existing=False
+                # continuations (max-turns auto-resume, auto-compact) start a new
+                # _run_pty_mode for the same task_id without cancelling this one,
+                # so if the new run has already registered its own transport by
+                # the time this (stale, finishing) run reaches here, popping
+                # unconditionally would strip shutdown()'s only handle on the
+                # transport that's actually still in use.
+                if self._pty_read_transports.get(task_id) is read_transport:
+                    self._pty_read_transports.pop(task_id, None)
 
             returncode = await wait_future
             logger.info("%s pid=%d exited with code %d", args[0], pid, returncode)
