@@ -20,9 +20,15 @@ _NO_OUTPUT_FALLBACK = {"success": "(任务已完成，无输出)", "failed": "(�
 # feishu-bot CLI applies --max-len only after argv is parsed inside the
 # subprocess; an oversized single argv entry can exceed the kernel's
 # ARG_MAX and make process creation itself fail before that truncation
-# ever runs. Trim here so the argv we hand to exec() stays small regardless
-# of how long the agent's last message was.
+# ever runs. Trim every interpolated field, and the fully-assembled card as a
+# final safety net, so the argv we hand to exec() stays small regardless of
+# how long the agent's message or the agent/task names were.
 _MAX_MESSAGE_CHARS = 4000
+_MAX_NAME_CHARS = 200
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _last_agent_text(task: Task, start_index: int = 0) -> str:
@@ -41,9 +47,10 @@ def _last_agent_text(task: Task, start_index: int = 0) -> str:
 
 
 def format_task_card(*, agent_name: str, task_name: str, status: str, last_message: str) -> str:
+    agent_name = _truncate(agent_name, _MAX_NAME_CHARS)
+    task_name = _truncate(task_name, _MAX_NAME_CHARS)
     last_message = last_message or _NO_OUTPUT_FALLBACK.get(status, _NO_OUTPUT_FALLBACK["failed"])
-    if len(last_message) > _MAX_MESSAGE_CHARS:
-        last_message = last_message[:_MAX_MESSAGE_CHARS] + "…（已截断）"
+    last_message = _truncate(last_message, _MAX_MESSAGE_CHARS)
     lines = [
         f"🤖 {agent_name} / {task_name}",
         f"**状态**: {_STATUS_LABELS.get(status, status)}",

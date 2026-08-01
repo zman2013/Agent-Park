@@ -890,15 +890,19 @@ class AgentRunner:
             )
 
             def _on_ept_exit(fut: asyncio.Future) -> None:
-                # Only unblock the reader here; do NOT finalize the task. That
-                # would race the _read_json_lines drain below and can finish
-                # (and notify) on a truncated transcript. The code right after
-                # `await self._read_json_lines(...)` is the single place that
-                # finalizes PTY runs, once output is fully drained. If this
-                # Task gets cancelled before reaching that point (e.g. resume's
-                # kill_task), _run_subprocess's own finally block already
-                # handles the failed-fallback.
-                read_transport.close()
+                # Do NOT finalize the task here — see the comment at the
+                # await below. Also don't close read_transport synchronously:
+                # the child exiting doesn't guarantee the kernel's pty buffer
+                # has been fully drained into our StreamReader yet, and closing
+                # discards whatever is still sitting there unread. Give the
+                # read loop a short grace window to reach its own natural EOF
+                # (finally block in _read_json_lines closes the transport);
+                # this scheduled close is a safety net for the case where a
+                # lingering grandchild process still holds the pty slave open
+                # and EOF never arrives on its own. Transport.close() is a
+                # no-op if already closed, so this is harmless when the read
+                # loop finishes first.
+                loop.call_later(2.0, read_transport.close)
 
             wait_future.add_done_callback(_on_ept_exit)
 
@@ -1360,7 +1364,31 @@ class AgentRunner:
         # wouldn't exist yet, and this shutdown would drain an empty/incomplete
         # set and let the event loop close out from under it.
         if self._subprocess_tasks:
-            await asyncio.wait(list(self._subprocess_tasks.values()), timeout=10)
+            done, pending = await asyncio.wait(
+                list(self._subprocess_tasks.values()), timeout=10
+            )
+            if pending:
+                # SIGTERM didn't finish the job in time — escalate to SIGKILL
+                # and give finalization a second, shorter window. run.sh's
+                # stop grace was sized to cover this (see do_stop). Without
+                # this, a child that ignores/delays SIGTERM would never reach
+                # _finish_task, leaving its task stuck at running with no
+                # completion card and no exit.
+                for pid in list(self._pids.values()):
+                    try:
+                        os.killpg(pid, signal.SIGKILL)
+                    except Exception:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except Exception:
+                            pass
+                for proc in list(self._async_procs.values()):
+                    if proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
+                            pass
+                await asyncio.wait(pending, timeout=5)
 
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
