@@ -634,6 +634,15 @@ class AgentRunner:
         def _on_done(fut: asyncio.Task) -> None:
             if self._subprocess_tasks.get(task_id) is fut:
                 self._subprocess_tasks.pop(task_id, None)
+            # Guaranteed cleanup regardless of how the coroutine ended
+            # (normal return, exception, or cancellation before it ever
+            # reached its own try/finally — e.g. cancelled while awaiting
+            # wiki search, or the task was deleted before this Task got its
+            # first chance to run). Relying on _run_subprocess's internal
+            # cleanup alone leaves _live_runs entries stale in exactly the
+            # cases shutdown() most needs them gone: a cancelled/dead run
+            # that will never call _finish_task on its own.
+            self._live_runs.pop(run_id, None)
 
         t.add_done_callback(_on_done)
 
@@ -739,7 +748,6 @@ class AgentRunner:
             await broadcast({"type": "message", "task_id": task_id, "message": notice.model_dump()})
             await self._finish_task(task_id, TaskStatus.failed)
             self._cleanup_run_resources(task_id, run_id)
-            self._live_runs.pop(run_id, None)
             return
 
         try:
@@ -757,11 +765,6 @@ class AgentRunner:
         finally:
             # Only clean up if this run still owns the resources (not replaced by resume)
             self._cleanup_run_resources(task_id, run_id)
-            # Unlike _cleanup_run_resources above, this always fires for THIS
-            # run once it's truly done — _live_runs is keyed by run_id, so it
-            # can never be an ownership-overwrite victim the way the task_id-
-            # keyed dicts can.
-            self._live_runs.pop(run_id, None)
             # Fallback: if the task is still marked running AND this run still owns it, mark failed
             if self._run_ids.get(task_id) in (run_id, None):
                 task = app_state.get_task(task_id)
@@ -1443,35 +1446,47 @@ class AgentRunner:
             # this, a child that ignores/delays SIGTERM would never reach
             # _finish_task, leaving its task stuck at running with no
             # completion card and no exit.
-            for run in list(self._live_runs.values()):
-                pid = run.get("pid")
-                if pid is not None:
-                    try:
-                        os.killpg(pid, signal.SIGKILL)
-                    except Exception:
+            def _sigkill_all() -> None:
+                for run in list(self._live_runs.values()):
+                    pid = run.get("pid")
+                    if pid is not None:
                         try:
-                            os.kill(pid, signal.SIGKILL)
+                            os.killpg(pid, signal.SIGKILL)
                         except Exception:
+                            try:
+                                os.kill(pid, signal.SIGKILL)
+                            except Exception:
+                                pass
+                    proc = run.get("proc")
+                    if proc is not None and proc.returncode is None:
+                        try:
+                            proc.kill()
+                        except ProcessLookupError:
                             pass
-                proc = run.get("proc")
-                if proc is not None and proc.returncode is None:
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
-                # SIGKILL to the recorded pid/pgid can't reach a detached
-                # grandchild that still holds the pty slave fd open — that
-                # case only unblocks via the internal 60s lingering-writer
-                # timer (see _run_pty_mode), which is longer than this
-                # shutdown's own bounded wait. Close the transport directly
-                # so the pending _read_json_lines loop sees EOF/error now
-                # instead of stranding this shutdown past run.sh's kill deadline.
-                transport = run.get("transport")
-                if transport is not None:
-                    transport.close()
-            tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
-            if tasks:
-                await asyncio.wait(tasks, timeout=5)
+                    # SIGKILL to the recorded pid/pgid can't reach a detached
+                    # grandchild that still holds the pty slave fd open — that
+                    # case only unblocks via the internal 60s lingering-writer
+                    # timer (see _run_pty_mode), which is longer than this
+                    # shutdown's own bounded wait. Close the transport directly
+                    # so the pending _read_json_lines loop sees EOF/error now
+                    # instead of stranding this shutdown past run.sh's kill deadline.
+                    transport = run.get("transport")
+                    if transport is not None:
+                        transport.close()
+
+            # Loop here too (mirrors the SIGTERM phase above): a run still
+            # inside result handling when the SIGTERM deadline hit (e.g.
+            # awaiting a bounded broadcast) can still dispatch a
+            # kill_existing=False continuation during this escalation window,
+            # registering yet another _live_runs entry that a one-shot
+            # snapshot+wait would silently miss.
+            kill_deadline = loop.time() + 5
+            while self._live_runs and loop.time() < kill_deadline:
+                _sigkill_all()
+                tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
+                if not tasks:
+                    break
+                await asyncio.wait(tasks, timeout=max(0.0, kill_deadline - loop.time()))
 
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
