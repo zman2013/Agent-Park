@@ -1362,11 +1362,15 @@ class AgentRunner:
         if self._subprocess_tasks:
             await asyncio.wait(list(self._subprocess_tasks.values()), timeout=10)
 
-        # Give in-flight Feishu notifications (up to ~30s each, see
-        # wiki_notify.send_feishu_card) a bounded window to finish before the
-        # event loop closes and cancels them.
+        # Give in-flight Feishu notifications a bounded window to finish before
+        # the event loop closes and cancels them. send_feishu_card's own CLI
+        # timeout is 30s (wiki_notify.py); this outer wait must exceed that
+        # with real margin — asyncio.wait's timeout doesn't cancel the pending
+        # task, so if both timers were equal and this one fired first,
+        # shutdown would return with the notification's own timeout handler
+        # (which kills its CLI child) never having run.
         if self._notify_tasks:
-            await asyncio.wait(list(self._notify_tasks), timeout=30)
+            await asyncio.wait(list(self._notify_tasks), timeout=40)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
