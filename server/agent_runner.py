@@ -663,92 +663,106 @@ class AgentRunner:
         self._run_ids[task_id] = run_id
         self._run_start_index[task_id] = len(task.messages)
 
-        # Ensure running status is set
-        if task.status not in (TaskStatus.running,):
-            task.status = TaskStatus.running
-            await self._broadcast_status(task_id, TaskStatus.running)
+        try:
+            # Ensure running status is set
+            if task.status not in (TaskStatus.running,):
+                task.status = TaskStatus.running
+                await self._broadcast_status(task_id, TaskStatus.running)
 
-        agent = app_state.get_agent(task.agent_id)
-        command = agent.command if agent else "cco"
-        agent_cwd = agent.cwd if agent and agent.cwd else ""
+            agent = app_state.get_agent(task.agent_id)
+            command = agent.command if agent else "cco"
+            agent_cwd = agent.cwd if agent and agent.cwd else ""
 
-        session_id = self._session_ids.get(task_id)
+            session_id = self._session_ids.get(task_id)
 
-        # Check if this is a fork: task has a fork_session_id to consume
-        fork_sid = task.fork_session_id
-        fork_resume_at = task.fork_resume_at
-        if fork_sid:
-            task.fork_session_id = None  # consume once
-            task.fork_resume_at = None
-            app_state.save_agent_tasks(task.agent_id)
+            # Check if this is a fork: task has a fork_session_id to consume
+            fork_sid = task.fork_session_id
+            fork_resume_at = task.fork_resume_at
+            if fork_sid:
+                task.fork_session_id = None  # consume once
+                task.fork_resume_at = None
+                app_state.save_agent_tasks(task.agent_id)
 
-        # Strip !wiki prefix before any prompt augmentation
-        skip_wiki = False
-        if prompt.startswith("!wiki"):
-            skip_wiki = True
-            prompt = prompt[len("!wiki"):].lstrip()
+            # Strip !wiki prefix before any prompt augmentation
+            skip_wiki = False
+            if prompt.startswith("!wiki"):
+                skip_wiki = True
+                prompt = prompt[len("!wiki"):].lstrip()
 
-        # Inject memory and wiki context only on new sessions (no existing session_id and not a fork)
-        if not session_id and not fork_sid:
-            from server.memory import load_memory
-            from server.config import memory_config
-            mem_cfg = memory_config()
-            memory_lines = load_memory(task.agent_id, mem_cfg["max_lines"])
+            # Inject memory and wiki context only on new sessions (no existing session_id and not a fork)
+            if not session_id and not fork_sid:
+                from server.memory import load_memory
+                from server.config import memory_config
+                mem_cfg = memory_config()
+                memory_lines = load_memory(task.agent_id, mem_cfg["max_lines"])
 
-            parts: list[str] = []
-            if memory_lines:
-                memory_text = "\n".join(memory_lines)
-                parts.append(f"<memory>\n{memory_text}\n</memory>")
+                parts: list[str] = []
+                if memory_lines:
+                    memory_text = "\n".join(memory_lines)
+                    parts.append(f"<memory>\n{memory_text}\n</memory>")
 
-            if not skip_wiki and agent and agent.wiki:
-                try:
-                    from server.wiki_search import search_wiki
-                    from server.routes_ws import broadcast
-                    # Notify user that wiki search is starting
-                    _notice_start = Message(
-                        role="agent", type="system", streaming=False,
-                        content=f"🔍 正在检索 wiki 知识库（{agent.wiki}）...",
-                    )
-                    task.messages.append(_notice_start)
-                    await broadcast({"type": "message", "task_id": task_id, "message": _notice_start.model_dump()})
-
-                    wiki_context = await search_wiki(prompt, agent.wiki)
-
-                    if wiki_context:
-                        parts.append(wiki_context)
-                        _notice_done = Message(
+                if not skip_wiki and agent and agent.wiki:
+                    try:
+                        from server.wiki_search import search_wiki
+                        from server.routes_ws import broadcast
+                        # Notify user that wiki search is starting
+                        _notice_start = Message(
                             role="agent", type="system", streaming=False,
-                            content=f"📚 Wiki 检索完成，已注入上下文：\n\n{wiki_context}",
+                            content=f"🔍 正在检索 wiki 知识库（{agent.wiki}）...",
                         )
-                    else:
-                        _notice_done = Message(
-                            role="agent", type="system", streaming=False,
-                            content=f"📭 Wiki 检索完成，未找到相关页面。",
-                        )
-                    task.messages.append(_notice_done)
-                    await broadcast({"type": "message", "task_id": task_id, "message": _notice_done.model_dump()})
-                except Exception:
-                    logger.exception("Wiki search failed for task %s, skipping", task_id)
+                        task.messages.append(_notice_start)
+                        await broadcast({"type": "message", "task_id": task_id, "message": _notice_start.model_dump()})
 
-            parts.append(prompt)
-            prompt = "\n\n".join(parts)
+                        wiki_context = await search_wiki(prompt, agent.wiki)
 
-        # Select adapter and build args
-        adapter = get_adapter(command)
-        self._adapters[task_id] = adapter
-        args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd, resume_at=fork_resume_at)
-        ctx = _RunContext(self, task_id)
+                        if wiki_context:
+                            parts.append(wiki_context)
+                            _notice_done = Message(
+                                role="agent", type="system", streaming=False,
+                                content=f"📚 Wiki 检索完成，已注入上下文：\n\n{wiki_context}",
+                            )
+                        else:
+                            _notice_done = Message(
+                                role="agent", type="system", streaming=False,
+                                content=f"📭 Wiki 检索完成，未找到相关页面。",
+                            )
+                        task.messages.append(_notice_done)
+                        await broadcast({"type": "message", "task_id": task_id, "message": _notice_done.model_dump()})
+                    except Exception:
+                        logger.exception("Wiki search failed for task %s, skipping", task_id)
 
-        # Validate working directory before spawning subprocess
-        if agent_cwd and not os.path.isdir(agent_cwd):
-            from server.routes_ws import broadcast
-            err_msg = f"工作目录不存在：{agent_cwd}\n请检查 Agent 配置中的路径是否正确。"
-            notice = Message(role="agent", type="system", streaming=False, content=err_msg)
-            task.messages.append(notice)
-            await broadcast({"type": "message", "task_id": task_id, "message": notice.model_dump()})
+                parts.append(prompt)
+                prompt = "\n\n".join(parts)
+
+            # Select adapter and build args
+            adapter = get_adapter(command)
+            self._adapters[task_id] = adapter
+            args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd, resume_at=fork_resume_at)
+            ctx = _RunContext(self, task_id)
+
+            # Validate working directory before spawning subprocess
+            if agent_cwd and not os.path.isdir(agent_cwd):
+                from server.routes_ws import broadcast
+                err_msg = f"工作目录不存在：{agent_cwd}\n请检查 Agent 配置中的路径是否正确。"
+                notice = Message(role="agent", type="system", streaming=False, content=err_msg)
+                task.messages.append(notice)
+                await broadcast({"type": "message", "task_id": task_id, "message": notice.model_dump()})
+                await self._finish_task(task_id, TaskStatus.failed)
+                self._cleanup_run_resources(task_id, run_id)
+                return
+        except asyncio.CancelledError:
+            # Cancelled before any child was ever spawned (e.g. shutdown()
+            # cancelling a run still stuck in search_wiki(), or a resume's
+            # cancel_existing=True racing this same pre-spawn window). The
+            # post-spawn try/finally below already finalizes on cancellation
+            # via its own `finally`; this section has no such wrapper, so
+            # without this the task would stay stuck at running with no
+            # completion card. _finish_task no-ops via the _resuming flag
+            # when this is a normal resume cancellation, same as the
+            # post-spawn path.
             await self._finish_task(task_id, TaskStatus.failed)
             self._cleanup_run_resources(task_id, run_id)
-            return
+            raise
 
         try:
             if adapter.needs_pty():
