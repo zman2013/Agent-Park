@@ -889,24 +889,27 @@ class AgentRunner:
                 lambda: read_protocol, os.fdopen(master_fd, "rb", 0)
             )
 
+            # Safety net for a lingering grandchild that still holds the pty
+            # slave fd open after the immediate child exits — in that case
+            # read() on the master fd never sees EOF and _read_json_lines
+            # would hang forever. This timer is intentionally generous (well
+            # beyond how long draining a large buffered turn can legitimately
+            # take under backpressure) and is cancelled below the moment the
+            # read loop returns on its own, so it never races a slow-but-still
+            # -progressing drain into truncating output.
+            lingering_writer_timer = None
+
             def _on_ept_exit(fut: asyncio.Future) -> None:
-                # Do NOT finalize the task here — see the comment at the
-                # await below. Also don't close read_transport synchronously:
-                # the child exiting doesn't guarantee the kernel's pty buffer
-                # has been fully drained into our StreamReader yet, and closing
-                # discards whatever is still sitting there unread. Give the
-                # read loop a short grace window to reach its own natural EOF
-                # (finally block in _read_json_lines closes the transport);
-                # this scheduled close is a safety net for the case where a
-                # lingering grandchild process still holds the pty slave open
-                # and EOF never arrives on its own. Transport.close() is a
-                # no-op if already closed, so this is harmless when the read
-                # loop finishes first.
-                loop.call_later(2.0, read_transport.close)
+                nonlocal lingering_writer_timer
+                lingering_writer_timer = loop.call_later(60.0, read_transport.close)
 
             wait_future.add_done_callback(_on_ept_exit)
 
-            await self._read_json_lines(reader, read_transport, adapter, ctx, strip_ansi=True)
+            try:
+                await self._read_json_lines(reader, read_transport, adapter, ctx, strip_ansi=True)
+            finally:
+                if lingering_writer_timer:
+                    lingering_writer_timer.cancel()
 
             returncode = await wait_future
             logger.info("%s pid=%d exited with code %d", args[0], pid, returncode)
