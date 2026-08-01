@@ -1498,6 +1498,22 @@ class AgentRunner:
                 # whole (already short) escalation budget unattended.
                 await asyncio.wait(tasks, timeout=min(1.0, max(0.0, kill_deadline - loop.time())))
 
+            if self._live_runs:
+                # Some run(s) never spawned a child to signal — e.g. still
+                # awaiting a pre-spawn step like search_wiki() (default
+                # timeout 30s, longer than the 10s+5s SIGTERM/SIGKILL budget
+                # above), so _sigkill_all() was a no-op for them. Their asyncio
+                # coroutine is the only handle left; cancel it directly rather
+                # than let lifespan's own event-loop teardown do it implicitly
+                # (which would skip _finish_task and its failure notification).
+                for run in list(self._live_runs.values()):
+                    task_obj = run.get("task")
+                    if task_obj and not task_obj.done():
+                        task_obj.cancel()
+                tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
+                if tasks:
+                    await asyncio.wait(tasks, timeout=2)
+
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
         # timeout is 30s (wiki_notify.py); this outer wait must exceed that
