@@ -1359,66 +1359,75 @@ class AgentRunner:
 
     async def shutdown(self) -> None:
         """Graceful shutdown: kill any tracked subprocesses."""
-        for task_id, pid in list(self._pids.items()):
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except Exception:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except Exception:
-                    pass
+        loop = asyncio.get_event_loop()
 
-        # Pipe-mode (codex) children live in _async_procs, not _pids — the
-        # PTY-only loop above never reaches them, so without this a pipe-mode
-        # run neither dies with the server nor ever reaches _finish_task.
-        for task_id, proc in list(self._async_procs.items()):
-            if proc.returncode is None:
+        def _sigterm_all() -> None:
+            for pid in list(self._pids.values()):
                 try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
+                    os.killpg(pid, signal.SIGTERM)
+                except Exception:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                    except Exception:
+                        pass
+            # Pipe-mode (codex) children live in _async_procs, not _pids.
+            for proc in list(self._async_procs.values()):
+                if proc.returncode is None:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
+
+        _sigterm_all()
 
         # Let killed runs reach their own finalization (_finish_task, which
         # schedules the completion card) before we snapshot _notify_tasks below.
-        # Without this, a run killed by the SIGTERM above hasn't necessarily
-        # reached _run_subprocess's finally block yet — its notification task
-        # wouldn't exist yet, and this shutdown would drain an empty/incomplete
-        # set and let the event loop close out from under it.
-        if self._subprocess_tasks:
-            done, pending = await asyncio.wait(
-                list(self._subprocess_tasks.values()), timeout=10
+        # Loop rather than snapshot-once: a run that finishes cleanly on its
+        # own (not killed by the SIGTERM above) can dispatch a kill_existing=
+        # False continuation (max-turns auto-resume, successful auto-compact),
+        # registering a brand new _subprocess_tasks entry after we've already
+        # taken our snapshot. Repeatedly re-snapshotting and SIGTERM'ing any
+        # newcomers until the set actually drains (or the overall budget below
+        # runs out) keeps such continuations from being silently orphaned.
+        deadline = loop.time() + 10
+        while self._subprocess_tasks and loop.time() < deadline:
+            _sigterm_all()  # catch pids/procs registered by new continuations
+            await asyncio.wait(
+                list(self._subprocess_tasks.values()),
+                timeout=max(0.0, deadline - loop.time()),
             )
-            if pending:
-                # SIGTERM didn't finish the job in time — escalate to SIGKILL
-                # and give finalization a second, shorter window. run.sh's
-                # stop grace was sized to cover this (see do_stop). Without
-                # this, a child that ignores/delays SIGTERM would never reach
-                # _finish_task, leaving its task stuck at running with no
-                # completion card and no exit.
-                for pid in list(self._pids.values()):
+
+        if self._subprocess_tasks:
+            # SIGTERM didn't finish the job in time — escalate to SIGKILL
+            # and give finalization a second, shorter window. run.sh's
+            # stop grace was sized to cover this (see do_stop). Without
+            # this, a child that ignores/delays SIGTERM would never reach
+            # _finish_task, leaving its task stuck at running with no
+            # completion card and no exit.
+            for pid in list(self._pids.values()):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except Exception:
                     try:
-                        os.killpg(pid, signal.SIGKILL)
+                        os.kill(pid, signal.SIGKILL)
                     except Exception:
-                        try:
-                            os.kill(pid, signal.SIGKILL)
-                        except Exception:
-                            pass
-                for proc in list(self._async_procs.values()):
-                    if proc.returncode is None:
-                        try:
-                            proc.kill()
-                        except ProcessLookupError:
-                            pass
-                # SIGKILL to the recorded pid/pgid can't reach a detached
-                # grandchild that still holds the pty slave fd open — that
-                # case only unblocks via the internal 60s lingering-writer
-                # timer (see _run_pty_mode), which is longer than this
-                # shutdown's own bounded wait. Close the transports directly
-                # so the pending _read_json_lines loops see EOF/error now
-                # instead of stranding this shutdown past run.sh's kill deadline.
-                for transport in list(self._pty_read_transports.values()):
-                    transport.close()
-                await asyncio.wait(pending, timeout=5)
+                        pass
+            for proc in list(self._async_procs.values()):
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+            # SIGKILL to the recorded pid/pgid can't reach a detached
+            # grandchild that still holds the pty slave fd open — that
+            # case only unblocks via the internal 60s lingering-writer
+            # timer (see _run_pty_mode), which is longer than this
+            # shutdown's own bounded wait. Close the transports directly
+            # so the pending _read_json_lines loops see EOF/error now
+            # instead of stranding this shutdown past run.sh's kill deadline.
+            for transport in list(self._pty_read_transports.values()):
+                transport.close()
+            await asyncio.wait(list(self._subprocess_tasks.values()), timeout=5)
 
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
