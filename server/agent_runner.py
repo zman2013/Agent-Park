@@ -1066,12 +1066,18 @@ class AgentRunner:
             return
 
         task = app_state.get_task(task_id)
-        if task and task.status not in (TaskStatus.success, TaskStatus.failed):
+        was_terminal = task and task.status in (TaskStatus.success, TaskStatus.failed)
+        if task and not was_terminal:
             task.status = status
             task.updated_at = _model_utcnow()
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
             app_state.save_agent_tasks(task.agent_id)
+            if not was_terminal:
+                from server.task_notify import notify_task_finished
+
+                agent = app_state.get_agent(task.agent_id)
+                await notify_task_finished(agent.name if agent else task.agent_id, task)
 
     async def _broadcast_status(self, task_id: str, status: TaskStatus) -> None:
         from server.routes_ws import broadcast
