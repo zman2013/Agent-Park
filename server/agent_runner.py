@@ -1343,6 +1343,15 @@ class AgentRunner:
                 except Exception:
                     pass
 
+        # Let killed runs reach their own finalization (_finish_task, which
+        # schedules the completion card) before we snapshot _notify_tasks below.
+        # Without this, a run killed by the SIGTERM above hasn't necessarily
+        # reached _run_subprocess's finally block yet — its notification task
+        # wouldn't exist yet, and this shutdown would drain an empty/incomplete
+        # set and let the event loop close out from under it.
+        if self._subprocess_tasks:
+            await asyncio.wait(list(self._subprocess_tasks.values()), timeout=10)
+
         # Give in-flight Feishu notifications (up to ~30s each, see
         # wiki_notify.send_feishu_card) a bounded window to finish before the
         # event loop closes and cancels them.
