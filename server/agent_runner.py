@@ -1437,7 +1437,13 @@ class AgentRunner:
             tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
             if not tasks:
                 break
-            await asyncio.wait(tasks, timeout=max(0.0, deadline - loop.time()))
+            # Poll on a short interval rather than waiting the full remaining
+            # budget: asyncio.wait's default ALL_COMPLETED means a single
+            # still-running task (e.g. a PTY reader blocked on a lingering
+            # grandchild) makes this call block for its entire timeout, so a
+            # continuation registered moments later never gets re-snapshotted
+            # or SIGTERM'd until the whole budget is already gone.
+            await asyncio.wait(tasks, timeout=min(1.0, max(0.0, deadline - loop.time())))
 
         if self._live_runs:
             # SIGTERM didn't finish the job in time — escalate to SIGKILL
@@ -1486,7 +1492,11 @@ class AgentRunner:
                 tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
                 if not tasks:
                     break
-                await asyncio.wait(tasks, timeout=max(0.0, kill_deadline - loop.time()))
+                # Same reasoning as the SIGTERM loop above: poll on a short
+                # interval so a continuation registered mid-drain gets
+                # re-snapshotted and SIGKILL'd instead of waiting out this
+                # whole (already short) escalation budget unattended.
+                await asyncio.wait(tasks, timeout=min(1.0, max(0.0, kill_deadline - loop.time())))
 
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
