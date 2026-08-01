@@ -20,7 +20,16 @@ _NO_OUTPUT_FALLBACK = {"success": "(任务已完成，无输出)", "failed": "(�
 
 
 def _last_agent_text(task: Task) -> str:
+    """Return the last agent text message from the CURRENT turn only.
+
+    A resumed turn (auto-continue, /compact, handoff) that produces no new
+    text must not fall back to an earlier turn's output — that would report
+    stale content under the current turn's status. Scanning stops at the most
+    recent user message, which marks the start of the current turn.
+    """
     for m in reversed(task.messages):
+        if m.role == "user":
+            break
         if m.role == "agent" and m.type == "text" and m.content.strip():
             return m.content.strip()
     return ""

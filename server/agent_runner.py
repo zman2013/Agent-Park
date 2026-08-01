@@ -1074,7 +1074,15 @@ class AgentRunner:
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
             app_state.save_agent_tasks(task.agent_id)
-            if not was_terminal:
+            # A pending auto-compact continuation means this success is not the
+            # real end of the turn — maybe_dispatch_auto_compact (called right
+            # after _finish_task returns) will flip the task back to running and
+            # dispatch /compact. Notifying now would report "done" mid-turn and
+            # again when the continuation actually finishes.
+            compact_will_continue = (
+                status == TaskStatus.success and task_id in self._compact_pending
+            )
+            if not was_terminal and not compact_will_continue:
                 agent = app_state.get_agent(task.agent_id)
                 self._schedule_notify(agent.name if agent else task.agent_id, task)
 
