@@ -544,6 +544,17 @@ class AgentRunner:
         # grandchild safety net (see _run_pty_mode) within its own bounded
         # stop window.
         self._pty_read_transports: dict[str, asyncio.ReadTransport] = {}
+        # Shutdown-only registry keyed by run_id (unique per _run_subprocess
+        # call), NOT task_id. _pids/_async_procs/_pty_read_transports/
+        # _subprocess_tasks are all keyed by task_id and represent "the
+        # current run for this task" — a kill_existing=False continuation
+        # (max-turns auto-resume, auto-compact) can register its own run
+        # under the same task_id while the previous run is still finishing
+        # (e.g. draining a lingering PTY writer), overwriting those entries
+        # and making the old run invisible to shutdown(). This registry never
+        # gets overwritten by an unrelated run, so shutdown() can terminate
+        # and await every live run, not just the newest one per task_id.
+        self._live_runs: dict[str, dict] = {}  # run_id -> {task, pid, proc, transport}
         # Index into task.messages marking the start of the CURRENT run, so
         # notification can scan only this run's output — internal continuations
         # (/compact, handoff auto-resume) don't append a user Message, so a
@@ -601,10 +612,23 @@ class AgentRunner:
         ):
             old.cancel()
 
+        import uuid as _uuid
+        run_id = _uuid.uuid4().hex[:8]
+        # Registered under run_id (not task_id) so shutdown() can always find
+        # and terminate every live run — a kill_existing=False continuation
+        # (max-turns auto-resume, auto-compact) can register its own run
+        # under the same task_id while the previous run is still finishing
+        # (e.g. draining a lingering PTY writer), overwriting the task_id-
+        # keyed _subprocess_tasks/_pids/_async_procs/_pty_read_transports
+        # entries below and making the old run invisible to a task_id-keyed
+        # lookup.
+        self._live_runs[run_id] = {}
+
         t = asyncio.create_task(
-            self._run_subprocess(task_id, prompt),
+            self._run_subprocess(task_id, prompt, run_id),
             name=f"subprocess-{task_id}",
         )
+        self._live_runs[run_id]["task"] = t
         self._subprocess_tasks[task_id] = t
 
         def _on_done(fut: asyncio.Task) -> None:
@@ -613,10 +637,7 @@ class AgentRunner:
 
         t.add_done_callback(_on_done)
 
-    async def _run_subprocess(self, task_id: str, prompt: str) -> None:
-        import uuid as _uuid
-        run_id = _uuid.uuid4().hex[:8]
-
+    async def _run_subprocess(self, task_id: str, prompt: str, run_id: str) -> None:
         task = app_state.get_task(task_id)
         if not task:
             return
@@ -718,6 +739,7 @@ class AgentRunner:
             await broadcast({"type": "message", "task_id": task_id, "message": notice.model_dump()})
             await self._finish_task(task_id, TaskStatus.failed)
             self._cleanup_run_resources(task_id, run_id)
+            self._live_runs.pop(run_id, None)
             return
 
         try:
@@ -735,6 +757,11 @@ class AgentRunner:
         finally:
             # Only clean up if this run still owns the resources (not replaced by resume)
             self._cleanup_run_resources(task_id, run_id)
+            # Unlike _cleanup_run_resources above, this always fires for THIS
+            # run once it's truly done — _live_runs is keyed by run_id, so it
+            # can never be an ownership-overwrite victim the way the task_id-
+            # keyed dicts can.
+            self._live_runs.pop(run_id, None)
             # Fallback: if the task is still marked running AND this run still owns it, mark failed
             if self._run_ids.get(task_id) in (run_id, None):
                 task = app_state.get_task(task_id)
@@ -864,6 +891,8 @@ class AgentRunner:
             os.close(slave_fd)
             self._pids[task_id] = pid
             self._master_fds[task_id] = master_fd
+            if run_id in self._live_runs:
+                self._live_runs[run_id]["pid"] = pid
             # Persist PID to task for orphan recovery
             task = app_state.get_task(task_id)
             if task:
@@ -894,6 +923,8 @@ class AgentRunner:
                 lambda: read_protocol, os.fdopen(master_fd, "rb", 0)
             )
             self._pty_read_transports[task_id] = read_transport
+            if run_id in self._live_runs:
+                self._live_runs[run_id]["transport"] = read_transport
 
             # Safety net for a lingering grandchild that still holds the pty
             # slave fd open after the immediate child exits — in that case
@@ -967,6 +998,8 @@ class AgentRunner:
             env=env,
         )
         self._async_procs[task_id] = proc
+        if run_id in self._live_runs:
+            self._live_runs[run_id]["proc"] = proc
 
         logger.info("Spawned %s pid=%d for task %s (pipe mode)", args[0], proc.pid, task_id)
 
@@ -1362,17 +1395,23 @@ class AgentRunner:
         loop = asyncio.get_event_loop()
 
         def _sigterm_all() -> None:
-            for pid in list(self._pids.values()):
-                try:
-                    os.killpg(pid, signal.SIGTERM)
-                except Exception:
+            # Iterate _live_runs (keyed by run_id, never overwritten by an
+            # unrelated run) rather than the task_id-keyed _pids/_async_procs
+            # — a kill_existing=False continuation started for the same
+            # task_id while an older run is still finishing would otherwise
+            # make that older run's pid/proc invisible here.
+            for run in list(self._live_runs.values()):
+                pid = run.get("pid")
+                if pid is not None:
                     try:
-                        os.kill(pid, signal.SIGTERM)
+                        os.killpg(pid, signal.SIGTERM)
                     except Exception:
-                        pass
-            # Pipe-mode (codex) children live in _async_procs, not _pids.
-            for proc in list(self._async_procs.values()):
-                if proc.returncode is None:
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except Exception:
+                            pass
+                proc = run.get("proc")
+                if proc is not None and proc.returncode is None:
                     try:
                         proc.terminate()
                     except ProcessLookupError:
@@ -1385,49 +1424,54 @@ class AgentRunner:
         # Loop rather than snapshot-once: a run that finishes cleanly on its
         # own (not killed by the SIGTERM above) can dispatch a kill_existing=
         # False continuation (max-turns auto-resume, successful auto-compact),
-        # registering a brand new _subprocess_tasks entry after we've already
-        # taken our snapshot. Repeatedly re-snapshotting and SIGTERM'ing any
+        # registering a brand new _live_runs entry after we've already taken
+        # our snapshot. Repeatedly re-snapshotting and SIGTERM'ing any
         # newcomers until the set actually drains (or the overall budget below
         # runs out) keeps such continuations from being silently orphaned.
         deadline = loop.time() + 10
-        while self._subprocess_tasks and loop.time() < deadline:
+        while self._live_runs and loop.time() < deadline:
             _sigterm_all()  # catch pids/procs registered by new continuations
-            await asyncio.wait(
-                list(self._subprocess_tasks.values()),
-                timeout=max(0.0, deadline - loop.time()),
-            )
+            tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
+            if not tasks:
+                break
+            await asyncio.wait(tasks, timeout=max(0.0, deadline - loop.time()))
 
-        if self._subprocess_tasks:
+        if self._live_runs:
             # SIGTERM didn't finish the job in time — escalate to SIGKILL
             # and give finalization a second, shorter window. run.sh's
             # stop grace was sized to cover this (see do_stop). Without
             # this, a child that ignores/delays SIGTERM would never reach
             # _finish_task, leaving its task stuck at running with no
             # completion card and no exit.
-            for pid in list(self._pids.values()):
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except Exception:
+            for run in list(self._live_runs.values()):
+                pid = run.get("pid")
+                if pid is not None:
                     try:
-                        os.kill(pid, signal.SIGKILL)
+                        os.killpg(pid, signal.SIGKILL)
                     except Exception:
-                        pass
-            for proc in list(self._async_procs.values()):
-                if proc.returncode is None:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except Exception:
+                            pass
+                proc = run.get("proc")
+                if proc is not None and proc.returncode is None:
                     try:
                         proc.kill()
                     except ProcessLookupError:
                         pass
-            # SIGKILL to the recorded pid/pgid can't reach a detached
-            # grandchild that still holds the pty slave fd open — that
-            # case only unblocks via the internal 60s lingering-writer
-            # timer (see _run_pty_mode), which is longer than this
-            # shutdown's own bounded wait. Close the transports directly
-            # so the pending _read_json_lines loops see EOF/error now
-            # instead of stranding this shutdown past run.sh's kill deadline.
-            for transport in list(self._pty_read_transports.values()):
-                transport.close()
-            await asyncio.wait(list(self._subprocess_tasks.values()), timeout=5)
+                # SIGKILL to the recorded pid/pgid can't reach a detached
+                # grandchild that still holds the pty slave fd open — that
+                # case only unblocks via the internal 60s lingering-writer
+                # timer (see _run_pty_mode), which is longer than this
+                # shutdown's own bounded wait. Close the transport directly
+                # so the pending _read_json_lines loop sees EOF/error now
+                # instead of stranding this shutdown past run.sh's kill deadline.
+                transport = run.get("transport")
+                if transport is not None:
+                    transport.close()
+            tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
+            if tasks:
+                await asyncio.wait(tasks, timeout=5)
 
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
