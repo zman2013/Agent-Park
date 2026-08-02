@@ -7,6 +7,7 @@ for the actual CLI call so both pipelines share the same feishu-bot contract.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from server import feishu_threads
@@ -15,6 +16,29 @@ from server.models import Task
 from server.wiki_notify import send_feishu_card
 
 logger = logging.getLogger(__name__)
+
+# Serializes read-root → send → record per task. Two notifications for the
+# same task can overlap (e.g. the task is resumed from the browser and
+# finishes again while the first detached CLI call is still in flight); both
+# would then read an empty root_id, send independent top-level cards, and the
+# later record() would pick one arbitrarily — splitting the thread the
+# reply-to-task flow depends on. Entries are ref-counted so the dict doesn't
+# grow one lock per task for the process lifetime.
+_send_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+
+
+def _acquire_send_lock(task_id: str) -> asyncio.Lock:
+    lock, refs = _send_locks.get(task_id, (asyncio.Lock(), 0))
+    _send_locks[task_id] = (lock, refs + 1)
+    return lock
+
+
+def _release_send_lock(task_id: str) -> None:
+    lock, refs = _send_locks[task_id]
+    if refs <= 1:
+        del _send_locks[task_id]
+    else:
+        _send_locks[task_id] = (lock, refs - 1)
 
 _STATUS_LABELS = {"success": "✅ 成功", "failed": "❌ 失败"}
 _NO_OUTPUT_FALLBACK = {"success": "(任务已完成，无输出)", "failed": "(任务失败，无输出)"}
@@ -81,15 +105,23 @@ async def notify_task_finished(agent_name: str, task: Task, start_index: int = 0
     )
     try:
         chat_id = cfg.get("chat_id", "")
-        # Pass chat_id so a root recorded for a previously-configured group is
-        # ignored rather than replied into.
-        root_id = feishu_threads.get_root_id(task.id, chat_id) or ""
-        message_ids = await send_feishu_card(
-            cfg, message, capture_ids=True, reply_to=root_id
-        )
-        if message_ids:
-            feishu_threads.record(
-                task.id, message_ids, root_id or message_ids[0], chat_id
-            )
+        # Hold the per-task lock across read-send-record so an overlapping
+        # notification for the same task sees the root this one established
+        # and replies into it, instead of opening a second topic.
+        lock = _acquire_send_lock(task.id)
+        try:
+            async with lock:
+                # Pass chat_id so a root recorded for a previously-configured
+                # group is ignored rather than replied into.
+                root_id = feishu_threads.get_root_id(task.id, chat_id) or ""
+                message_ids = await send_feishu_card(
+                    cfg, message, capture_ids=True, reply_to=root_id
+                )
+                if message_ids:
+                    feishu_threads.record(
+                        task.id, message_ids, root_id or message_ids[0], chat_id
+                    )
+        finally:
+            _release_send_lock(task.id)
     except Exception:
         logger.exception("task-finish feishu notification failed for task %s", task.id)

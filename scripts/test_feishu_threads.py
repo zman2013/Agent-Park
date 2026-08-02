@@ -117,6 +117,24 @@ def main() -> None:
         assert "om_fresh" in data["by_message"]
         print("✓ TTL pruning drops entries older than 30 days")
 
+        # ── 7b) TTL also applies on READ. Pruning only runs from record(), so
+        #       a mapping that never sees another notification would otherwise
+        #       stay resolvable forever — the TTL would be write-only.
+        ft._save({
+            "by_message": {
+                "om_expired": {"task_id": "task-exp", "root_id": "om_expired",
+                               "chat_id": "oc_x", "at": stale_at},
+            },
+            "by_task": {
+                "task-exp": {"root_id": "om_expired", "chat_id": "oc_x", "at": stale_at},
+            },
+        })
+        assert ft.resolve("om_expired", None, None) is None, \
+            "a reply to an expired card must not resume its task"
+        assert ft.get_root_id("task-exp", "oc_x") is None, \
+            "an expired topic root must not be reused"
+        print("✓ TTL enforced on reads, not only on writes")
+
         # ── 8) max-size pruning keeps only the most recent 500 ───────────
         ft.THREADS_FILE.unlink()
         base = datetime.now(timezone.utc)

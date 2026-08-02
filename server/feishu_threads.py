@@ -56,6 +56,18 @@ def _empty() -> dict:
     return {"by_message": {}, "by_task": {}}
 
 
+def _is_expired(entry: dict) -> bool:
+    """True if the entry is past the TTL.
+
+    Checked on every read, not just when ``_prune()`` happens to run: pruning
+    only fires from ``record()``, so a mapping that sees no further
+    notifications would otherwise stay resolvable forever and the TTL would
+    apply to writes only.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=_TTL_DAYS)
+    return _parse_at(entry.get("at")) < cutoff
+
+
 def _load() -> dict:
     if not THREADS_FILE.exists():
         return _empty()
@@ -92,10 +104,9 @@ def _save(data: dict) -> None:
 
 def _prune(data: dict) -> dict:
     """Drop entries older than the TTL, then cap each section at the max size."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=_TTL_DAYS)
     for section in ("by_message", "by_task"):
         entries = data.get(section, {})
-        kept = {k: v for k, v in entries.items() if _parse_at(v.get("at")) >= cutoff}
+        kept = {k: v for k, v in entries.items() if not _is_expired(v)}
         if len(kept) > _MAX_ENTRIES:
             newest = sorted(kept.items(), key=lambda kv: kv[1].get("at", ""), reverse=True)
             kept = dict(newest[:_MAX_ENTRIES])
@@ -141,7 +152,7 @@ def get_root_id(task_id: str, chat_id: str = "") -> str | None:
     with _LOCK:
         data = _load()
     entry = data["by_task"].get(task_id)
-    if not entry:
+    if not entry or _is_expired(entry):
         return None
     if chat_id and entry.get("chat_id") and entry["chat_id"] != chat_id:
         return None
@@ -153,7 +164,8 @@ def resolve(parent_id: str | None, root_id: str | None, message_id: str | None) 
 
     Tries ``parent_id`` (the message actually being replied to) first, then
     ``root_id`` (in case the parent itself was pruned but the thread root
-    survives), then ``message_id`` itself. Returns ``None`` if none resolve.
+    survives), then ``message_id`` itself. Entries past the TTL are treated as
+    absent. Returns ``None`` if none resolve.
     """
     with _LOCK:
         data = _load()
@@ -161,6 +173,6 @@ def resolve(parent_id: str | None, root_id: str | None, message_id: str | None) 
         if not mid:
             continue
         entry = data["by_message"].get(mid)
-        if entry and entry.get("task_id"):
+        if entry and entry.get("task_id") and not _is_expired(entry):
             return entry["task_id"]
     return None
