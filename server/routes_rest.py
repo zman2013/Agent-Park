@@ -12,7 +12,7 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from server.config import upload_config, prompt_contexts_config
+from server.config import upload_config, prompt_contexts_config, task_notify_config
 from server.state import app_state
 
 router = APIRouter(prefix="/api")
@@ -826,6 +826,75 @@ async def list_prompt_contexts():
             "default": ctx.get("default", False),
         })
     return items
+
+
+# ── Feishu inbound (reply-to-task) ────────────────────────────────────────────
+
+class FeishuInboundBody(BaseModel):
+    message_id: str = ""
+    root_id: str = ""
+    parent_id: str = ""
+    chat_id: str = ""
+    sender_open_id: str = ""
+    sender_type: str = ""
+    text: str = ""
+
+
+@router.post("/feishu/inbound")
+async def feishu_inbound(body: FeishuInboundBody):
+    """Resolve an inbound Feishu reply to a task and feed it in via send_input.
+
+    Called by the feishu bot on every group message; it does no business logic
+    itself, this endpoint is the sole decision point. See design.md §5/§6.
+    """
+    cfg = task_notify_config()["inbound"]
+    if not cfg.get("enabled"):
+        raise HTTPException(404, "feishu inbound is disabled")
+
+    from server import feishu_threads
+
+    task_id = feishu_threads.resolve(body.parent_id, body.root_id, body.message_id)
+    task = app_state.get_task(task_id) if task_id else None
+    if not task:
+        return {"matched": False, "hint": "请回复 task 卡片以继续该任务"}
+
+    if not cfg.get("chat_id") or body.chat_id != cfg["chat_id"]:
+        return {
+            "matched": True, "action": "rejected", "reason": "chat_not_allowed",
+            "hint": "该群未被允许驱动此 task",
+        }
+
+    if body.sender_type == "app":
+        return {
+            "matched": True, "action": "rejected", "reason": "app_message",
+            "hint": "忽略应用自身消息",
+        }
+
+    from server.models import TaskStatus
+    if task.status == TaskStatus.running:
+        return {
+            "matched": True, "action": "rejected", "reason": "task_running",
+            "hint": "agent 正在处理中，请等当前回合结束后再回复",
+        }
+
+    from server.models import Message
+    from server.routes_ws import broadcast
+    from server.agent_runner import runner
+
+    user_msg = Message(role="user", content=body.text)
+    task.messages.append(user_msg)
+    app_state.save_agent_tasks(task.agent_id)
+    await broadcast({
+        "type": "message",
+        "task_id": task_id,
+        "message": user_msg.model_dump(),
+    })
+    await runner.send_input(task_id, body.text)
+
+    return {
+        "matched": True, "action": "resumed",
+        "task_id": task_id, "task_name": task.name or task.id,
+    }
 
 
 @router.post("/shell/exec")

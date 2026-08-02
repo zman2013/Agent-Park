@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 
+from server import feishu_threads
 from server.config import task_notify_config
 from server.models import Task
 from server.wiki_notify import send_feishu_card
@@ -61,7 +62,14 @@ def format_task_card(*, agent_name: str, task_name: str, status: str, last_messa
 
 
 async def notify_task_finished(agent_name: str, task: Task, start_index: int = 0) -> None:
-    """Send a Feishu card with the task's last agent message, if enabled."""
+    """Send a Feishu card with the task's last agent message, if enabled.
+
+    Captures the sent message_id(s) and records them in ``feishu_threads``
+    so a reply in the group can be resolved back to this task. If the task
+    already has a recorded topic root (an earlier card), the card is sent
+    with ``--reply-to`` that root so multi-round notifications collapse into
+    one thread instead of starting a new one each time.
+    """
     cfg = task_notify_config()["feishu_notify"]
     if not cfg.get("enabled"):
         return
@@ -72,6 +80,13 @@ async def notify_task_finished(agent_name: str, task: Task, start_index: int = 0
         last_message=_last_agent_text(task, start_index),
     )
     try:
-        await send_feishu_card(cfg, message)
+        root_id = feishu_threads.get_root_id(task.id) or ""
+        message_ids = await send_feishu_card(
+            cfg, message, capture_ids=True, reply_to=root_id
+        )
+        if message_ids:
+            feishu_threads.record(
+                task.id, message_ids, root_id or message_ids[0], cfg.get("chat_id", "")
+            )
     except Exception:
         logger.exception("task-finish feishu notification failed for task %s", task.id)
