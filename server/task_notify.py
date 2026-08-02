@@ -80,13 +80,16 @@ async def notify_task_finished(agent_name: str, task: Task, start_index: int = 0
         last_message=_last_agent_text(task, start_index),
     )
     try:
-        root_id = feishu_threads.get_root_id(task.id) or ""
+        chat_id = cfg.get("chat_id", "")
+        # Pass chat_id so a root recorded for a previously-configured group is
+        # ignored rather than replied into.
+        root_id = feishu_threads.get_root_id(task.id, chat_id) or ""
         message_ids = await send_feishu_card(
             cfg, message, capture_ids=True, reply_to=root_id
         )
         if message_ids:
             feishu_threads.record(
-                task.id, message_ids, root_id or message_ids[0], cfg.get("chat_id", "")
+                task.id, message_ids, root_id or message_ids[0], chat_id
             )
     except Exception:
         logger.exception("task-finish feishu notification failed for task %s", task.id)

@@ -111,6 +111,10 @@ bot 退化成一个**薄的双向传输层**：飞书事件 → HTTP → agent-p
 
 **无 `hint` 字段时 bot 必须闭嘴。** 这不是可选优化：bot 回的 hint 本身是 app 消息，会被再次转发进来，若也回 hint 就成了自己答自己的死循环。因此 `app_message` 分支排在反查之前，且响应里不带 `hint`。
 
+**入口串行化。** `task.status` 只在 `runner.send_input()` 内部才翻成 running，而两条入口（WS `user_message`、飞书 inbound）都在那之前先 append Message 并 `await broadcast()`。并发时两者都能过 running 判断，各起一个 run，后者的 `kill_existing=True` 会掐掉前者刚起的子进程、丢掉前者输入。因此二者共用 `runner.input_lock(task_id)`，把「判断状态 → send_input」整段纳入锁内。
+
+两条入口的行为**故意不对称**：WS 是人在浏览器里打字，打断当前运行是既有 UI 语义，无条件 send；飞书回复则让位于 running 的 task（回 `task_running` 提示）。锁保证的是「不交错」，不是「只发一次」。
+
 `data/feishu_threads.json`：
 
 ```jsonc

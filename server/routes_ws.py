@@ -327,22 +327,26 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
             return
 
         from server.models import Message
-
-        user_msg = Message(role="user", content=content)
-        task.messages.append(user_msg)
-        app_state.save_agent_tasks(task.agent_id)
-        await broadcast(
-            {
-                "type": "message",
-                "task_id": task_id,
-                "message": user_msg.model_dump(),
-            }
-        )
-
-        # Send input to agent process
         from server.agent_runner import runner
 
-        await runner.send_input(task_id, content)
+        # Same per-task lock the feishu inbound path takes, so the two input
+        # sources serialize instead of each starting a run and killing the
+        # other's subprocess. A browser message is an explicit user action, so
+        # it queues behind the holder rather than being rejected.
+        async with runner.input_lock(task_id):
+            user_msg = Message(role="user", content=content)
+            task.messages.append(user_msg)
+            app_state.save_agent_tasks(task.agent_id)
+            await broadcast(
+                {
+                    "type": "message",
+                    "task_id": task_id,
+                    "message": user_msg.model_dump(),
+                }
+            )
+
+            # Send input to agent process
+            await runner.send_input(task_id, content)
 
     elif msg_type == "trigger_compact":
         task_id = data.get("task_id", "")

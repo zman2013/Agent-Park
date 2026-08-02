@@ -117,12 +117,23 @@ def record(task_id: str, message_ids: Iterable[str], root_id: str, chat_id: str)
         _save(data)
 
 
-def get_root_id(task_id: str) -> str | None:
-    """Return the recorded topic root for ``task_id``, or ``None`` if absent."""
+def get_root_id(task_id: str, chat_id: str = "") -> str | None:
+    """Return the recorded topic root for ``task_id``, or ``None`` if absent.
+
+    When ``chat_id`` is given, a root recorded for a different chat counts as
+    absent: after the configured destination group changes, the stored root is
+    a message in a chat we no longer post to, so replying to it would either
+    fail or land the card back in the old conversation. Returning None makes
+    the next card start a fresh thread in the new group instead.
+    """
     with _LOCK:
         data = _load()
     entry = data["by_task"].get(task_id)
-    return entry["root_id"] if entry else None
+    if not entry:
+        return None
+    if chat_id and entry.get("chat_id") and entry["chat_id"] != chat_id:
+        return None
+    return entry["root_id"]
 
 
 def resolve(parent_id: str | None, root_id: str | None, message_id: str | None) -> str | None:

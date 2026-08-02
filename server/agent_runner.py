@@ -565,6 +565,19 @@ class AgentRunner:
         # Track which run owns shared resources (_adapters, _session_baselines)
         # to prevent a finishing run from cleaning up a resumed run's state.
         self._run_ids: dict[str, str] = {}  # task_id -> unique run id
+        # Serializes "is the task busy? then take it" across every input path
+        # (WS user_message, feishu inbound). Both append a Message and await
+        # before send_input() flips status to running, so without a shared lock
+        # two concurrent inputs each start a run and the second's kill_existing
+        # tears down the first's subprocess, dropping its input.
+        self._input_locks: dict[str, asyncio.Lock] = {}
+
+    def input_lock(self, task_id: str) -> asyncio.Lock:
+        """Return the per-task lock guarding check-status-then-send_input."""
+        lock = self._input_locks.get(task_id)
+        if lock is None:
+            lock = self._input_locks[task_id] = asyncio.Lock()
+        return lock
 
     def _load_sessions(self) -> dict[str, str]:
         """Load session IDs from disk."""
@@ -1322,6 +1335,7 @@ class AgentRunner:
         self._compact_pending.discard(task_id)
         self._handoff_pending.discard(task_id)
         self._run_start_index.pop(task_id, None)
+        self._input_locks.pop(task_id, None)
 
     # ── orphan task restore ─────────────────────────────────────────────
 

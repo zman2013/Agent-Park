@@ -140,6 +140,56 @@ def main() -> None:
         assert rejected["reason"] == "task_running", rejected
         print("✓ concurrent replies serialize to a single resume")
 
+        # ── 7) cross-path race: a browser user_message over WS and a feishu
+        #      reply for the same task must serialize. Both append a Message
+        #      and await before send_input() flips the status, so a REST-only
+        #      reservation wouldn't cover this pair.
+        #
+        #      Note the two paths are deliberately asymmetric: WS sends
+        #      unconditionally (a human typing in the browser interrupts the
+        #      current run — pre-existing `kill_existing=True` semantics),
+        #      while a feishu reply defers to a running task. So the invariant
+        #      is "no interleaving", not "always exactly one send".
+        def cross_case(order_ws_first: bool):
+            sent.clear()
+            tid = f"task-cross-{'ws' if order_ws_first else 'rest'}"
+            make_task(tid, TaskStatus.success)
+            mid = f"om_{tid}"
+            ft.record(tid, [mid], root_id=mid, chat_id=CHAT)
+
+            async def run():
+                reply = rr.feishu_inbound(rr.FeishuInboundBody(
+                    parent_id=mid, chat_id=CHAT, sender_open_id="ou_human",
+                    sender_type="user", text="from feishu",
+                ))
+                ws_msg = rws._handle_client_message(
+                    {"type": "user_message", "task_id": tid, "content": "from browser"},
+                    None,
+                )
+                if order_ws_first:
+                    _, res = await asyncio.gather(ws_msg, reply)
+                else:
+                    res, _ = await asyncio.gather(reply, ws_msg)
+                return res
+
+            return tid, asyncio.run(run())
+
+        # 7a) WS wins the lock -> the feishu reply must back off, not clobber
+        #     the subprocess the browser message just started.
+        tid, res = cross_case(order_ws_first=True)
+        assert res.get("action") == "rejected", res
+        assert res["reason"] == "task_running", res
+        assert sent == [(tid, "from browser")], sent
+        print("✓ WS-first: feishu reply backs off instead of killing the WS run")
+
+        # 7b) feishu wins -> the browser message still interrupts (existing
+        #     WS semantics), but only after the reply's send_input completed —
+        #     the two never overlap.
+        tid, res = cross_case(order_ws_first=False)
+        assert res.get("action") == "resumed", res
+        assert sent == [(tid, "from feishu"), (tid, "from browser")], sent
+        print("✓ feishu-first: WS interrupt is serialized after, not interleaved")
+
         print("\nAll feishu inbound smoke checks passed.")
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)

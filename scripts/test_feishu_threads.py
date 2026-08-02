@@ -58,6 +58,13 @@ def main() -> None:
         assert ft.resolve("om_c", "om_d", "om_d") == "task-3"
         print("✓ resolve priority parent_id > root_id > message_id")
 
+        # ── 4b) a root recorded for another chat is not reused ────────────
+        assert ft.get_root_id("task-3", "oc_x") == "om_c"
+        assert ft.get_root_id("task-3", "oc_moved") is None, \
+            "root recorded for a different chat must not be replied into"
+        assert ft.get_root_id("task-3") == "om_c", "no chat_id given -> no filtering"
+        print("✓ root from a different chat is discarded")
+
         # ── 5) empty / no-op inputs don't record anything ───────────────
         before = json.loads(ft.THREADS_FILE.read_text())
         ft.record("", ["om_e"], root_id="om_e", chat_id="oc_x")

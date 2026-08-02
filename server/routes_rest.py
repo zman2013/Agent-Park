@@ -872,34 +872,32 @@ async def feishu_inbound(body: FeishuInboundBody):
             "hint": "该群未被允许驱动此 task",
         }
 
-    from server.models import TaskStatus
-    if task.status == TaskStatus.running:
-        return {
-            "matched": True, "action": "rejected", "reason": "task_running",
-            "hint": "agent 正在处理中，请等当前回合结束后再回复",
-        }
-
-    # Claim the task in the same synchronous step as the check above. Without
-    # this, two replies arriving back-to-back both see a terminal status while
-    # the first is parked on `await broadcast()` — status only flips inside
-    # send_input(), too late to reject the second. The loser's send_input()
-    # would then kill the subprocess the winner just started, silently
-    # dropping the winner's input.
-    task.status = TaskStatus.running
-
-    from server.models import Message
+    from server.models import Message, TaskStatus
     from server.routes_ws import broadcast
     from server.agent_runner import runner
 
-    user_msg = Message(role="user", content=body.text)
-    task.messages.append(user_msg)
-    app_state.save_agent_tasks(task.agent_id)
-    await broadcast({
-        "type": "message",
-        "task_id": task_id,
-        "message": user_msg.model_dump(),
-    })
-    await runner.send_input(task_id, body.text)
+    # Hold the per-task input lock across check-status-then-send_input. Status
+    # only flips to running inside send_input(), i.e. after the awaits below —
+    # so without the lock a concurrent input (another reply, or a browser
+    # user_message over WS) also passes the guard, and its send_input() kills
+    # the subprocess this one just started, dropping our input. The lock is
+    # shared with the WS path so both serialize against each other.
+    async with runner.input_lock(task_id):
+        if task.status == TaskStatus.running:
+            return {
+                "matched": True, "action": "rejected", "reason": "task_running",
+                "hint": "agent 正在处理中，请等当前回合结束后再回复",
+            }
+
+        user_msg = Message(role="user", content=body.text)
+        task.messages.append(user_msg)
+        app_state.save_agent_tasks(task.agent_id)
+        await broadcast({
+            "type": "message",
+            "task_id": task_id,
+            "message": user_msg.model_dump(),
+        })
+        await runner.send_input(task_id, body.text)
 
     return {
         "matched": True, "action": "resumed",
