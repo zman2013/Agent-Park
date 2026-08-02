@@ -33,6 +33,20 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 
+# shutdown()'s drain window for pending Feishu notifications. BASE exceeds the
+# CLI's own 30s timeout with margin (so its kill-the-child handler gets to
+# run). Same-task notifications coalesce instead of queueing, so the worst case
+# is a fixed BASE × task_notify.MAX_SERIAL_SENDS — a constant, not a sampled
+# depth (which could miss a coroutine scheduled but not yet started). Must stay
+# under run.sh's force-kill grace for the backend.
+NOTIFY_DRAIN_BASE_SECONDS = 40
+
+
+def _notify_drain_max_seconds() -> int:
+    from server.task_notify import MAX_SERIAL_SENDS
+
+    return NOTIFY_DRAIN_BASE_SECONDS * MAX_SERIAL_SENDS
+
 
 class _RunContext:
     """Implements ChunkContext — callback interface for adapters.
@@ -565,6 +579,19 @@ class AgentRunner:
         # Track which run owns shared resources (_adapters, _session_baselines)
         # to prevent a finishing run from cleaning up a resumed run's state.
         self._run_ids: dict[str, str] = {}  # task_id -> unique run id
+        # Serializes "is the task busy? then take it" across every input path
+        # (WS user_message, feishu inbound). Both append a Message and await
+        # before send_input() flips status to running, so without a shared lock
+        # two concurrent inputs each start a run and the second's kill_existing
+        # tears down the first's subprocess, dropping its input.
+        self._input_locks: dict[str, asyncio.Lock] = {}
+
+    def input_lock(self, task_id: str) -> asyncio.Lock:
+        """Return the per-task lock guarding check-status-then-send_input."""
+        lock = self._input_locks.get(task_id)
+        if lock is None:
+            lock = self._input_locks[task_id] = asyncio.Lock()
+        return lock
 
     def _load_sessions(self) -> dict[str, str]:
         """Load session IDs from disk."""
@@ -825,6 +852,13 @@ class AgentRunner:
 
         Always clears `_compact_pending` so a failed turn does not leave a
         stale flag that would trigger /compact on the next unrelated success.
+
+        Takes the shared per-task input lock and re-checks the status inside
+        it: this runs from the turn-completion path, where the task is briefly
+        terminal, so an input arriving in that window (a feishu reply, a
+        browser message) can claim the task first. Dispatching anyway would
+        start /compact with kill_existing=False alongside that run, leaving two
+        live subprocesses fighting over the task-keyed registries.
         """
         if task_id not in self._compact_pending:
             return
@@ -832,21 +866,28 @@ class AgentRunner:
         if not success:
             return
         from server.routes_ws import broadcast
-        task = app_state.get_task(task_id)
-        if task:
-            notice = Message(
-                role="agent",
-                type="system",
-                streaming=False,
-                content="🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…",
-            )
-            task.messages.append(notice)
-            await broadcast({
-                "type": "message",
-                "task_id": task_id,
-                "message": notice.model_dump(),
-            })
-        await self.send_input(task_id, "/compact", kill_existing=False)
+        async with self.input_lock(task_id):
+            task = app_state.get_task(task_id)
+            if task and task.status == TaskStatus.running:
+                logger.info(
+                    "Skipping auto /compact for task %s: another input already claimed it",
+                    task_id,
+                )
+                return
+            if task:
+                notice = Message(
+                    role="agent",
+                    type="system",
+                    streaming=False,
+                    content="🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…",
+                )
+                task.messages.append(notice)
+                await broadcast({
+                    "type": "message",
+                    "task_id": task_id,
+                    "message": notice.model_dump(),
+                })
+            await self.send_input(task_id, "/compact", kill_existing=False)
         # Yield so the new run claims ownership before any pending
         # finally-block cleanup in the just-finished subprocess fires.
         await asyncio.sleep(0)
@@ -1322,6 +1363,7 @@ class AgentRunner:
         self._compact_pending.discard(task_id)
         self._handoff_pending.discard(task_id)
         self._run_start_index.pop(task_id, None)
+        self._input_locks.pop(task_id, None)
 
     # ── orphan task restore ─────────────────────────────────────────────
 
@@ -1545,8 +1587,16 @@ class AgentRunner:
         # task, so if both timers were equal and this one fired first,
         # shutdown would return with the notification's own timeout handler
         # (which kills its CLI child) never having run.
+        #
+        # Notifications for the SAME task coalesce rather than queue
+        # (task_notify keeps at most one in flight plus one pending slot), so
+        # the worst case is a FIXED MAX_SERIAL_SENDS CLI calls back to back.
+        # The budget is that constant — not a sampled depth, which could miss a
+        # coroutine scheduled but not yet started.
         if self._notify_tasks:
-            await asyncio.wait(list(self._notify_tasks), timeout=40)
+            await asyncio.wait(
+                list(self._notify_tasks), timeout=_notify_drain_max_seconds()
+            )
 
 
 # ── helpers ─────────────────────────────────────────────────────────────

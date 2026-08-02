@@ -132,12 +132,17 @@ def task_notify_config() -> dict:
     """Return the task-finish notification configuration with defaults."""
     cfg = get_config().get("task_notify", {})
     feishu_cfg = cfg.get("feishu_notify", {})
+    inbound_cfg = cfg.get("inbound", {})
     return {
         "feishu_notify": {
             "enabled": feishu_cfg.get("enabled", False),
             "cli_path": feishu_cfg.get("cli_path", ""),
             "chat_id": feishu_cfg.get("chat_id", ""),
             "env_file": feishu_cfg.get("env_file", ""),
+        },
+        "inbound": {
+            "enabled": inbound_cfg.get("enabled", False),
+            "chat_id": inbound_cfg.get("chat_id", ""),
         },
     }
 

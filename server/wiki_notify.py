@@ -208,15 +208,29 @@ def _has_creatable_new_pages(result: dict) -> bool:
 
 # ── Sending ────────────────────────────────────────────────────────────────────
 
-async def send_feishu_card(feishu_cfg: dict, message: str) -> bool:
+async def send_feishu_card(
+    feishu_cfg: dict,
+    message: str,
+    *,
+    capture_ids: bool = False,
+    reply_to: str = "",
+) -> bool | list[str]:
     """Send a Feishu card message using the feishu-bot CLI.
 
     Args:
         feishu_cfg: Configuration dict with keys: cli_path, chat_id, env_file.
         message: Markdown message content.
+        capture_ids: When True, omit ``--quiet`` and parse stdout (one
+            message_id per line, since ``--max-len`` may split the message
+            into several cards) instead of returning a bool. Defaults to
+            False so existing callers (wiki digest) are unaffected.
+        reply_to: Optional message_id to reply into (``--reply-to``), so the
+            card lands in an existing topic instead of starting a new one.
 
     Returns:
-        True if sent successfully, False otherwise.
+        If ``capture_ids`` is False: True if sent successfully, False
+        otherwise (unchanged behaviour). If ``capture_ids`` is True: the list
+        of sent message_ids (empty list on failure).
     """
     cli_path = feishu_cfg.get("cli_path", "")
     chat_id = feishu_cfg.get("chat_id", "")
@@ -224,11 +238,11 @@ async def send_feishu_card(feishu_cfg: dict, message: str) -> bool:
 
     if not cli_path or not Path(cli_path).exists():
         logger.warning("Feishu CLI not found at %s, skipping notification", cli_path)
-        return False
+        return [] if capture_ids else False
 
     if not chat_id:
         logger.warning("Feishu chat_id not configured, skipping notification")
-        return False
+        return [] if capture_ids else False
 
     cmd = [
         "python3", cli_path,
@@ -236,8 +250,11 @@ async def send_feishu_card(feishu_cfg: dict, message: str) -> bool:
         "--chat-id", chat_id,
         "--card",
         "--max-len", "3500",
-        "--quiet",
     ]
+    if reply_to:
+        cmd.extend(["--reply-to", reply_to])
+    if not capture_ids:
+        cmd.append("--quiet")
     if env_file:
         cmd.extend(["--env-file", env_file])
     cmd.append(message)
@@ -254,17 +271,22 @@ async def send_feishu_card(feishu_cfg: dict, message: str) -> bool:
             logger.error("Feishu notification timed out")
             proc.kill()
             await proc.wait()
-            return False
+            return [] if capture_ids else False
         if proc.returncode == 0:
             logger.info("Feishu notification sent successfully")
+            if capture_ids:
+                return [
+                    line.strip() for line in stdout.decode("utf-8", errors="replace").splitlines()
+                    if line.strip().startswith("om_")
+                ]
             return True
         else:
             err_msg = stderr.decode("utf-8", errors="replace").strip()
             logger.error("Feishu notification failed: %s", err_msg)
-            return False
+            return [] if capture_ids else False
     except Exception:
         logger.exception("Feishu notification error")
-        return False
+        return [] if capture_ids else False
 
 
 async def send_wiki_digest(feishu_cfg: dict, results: list[dict], date: str) -> bool:

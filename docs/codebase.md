@@ -26,6 +26,7 @@ agent-park/
 │   ├── routes_rest.py       # REST API（Agent/Task CRUD、Memory、Knowledge）
 │   ├── memory.py            # Agent 记忆读写（JSONL 格式）
 │   ├── knowledge.py         # 知识总结：信号提取、LLM 合并、文档写入、memory 索引
+│   ├── task_notify.py       # Task 终态飞书通知（卡片拼装 + 发送）
 │   └── config.py            # 读取 config.json 配置
 ├── frontend/
 │   └── src/
@@ -199,6 +200,38 @@ _run_subprocess()
 | `summary_progress` | 知识总结进度（`step`, `detail`） |
 | `summary_done` | 知识总结完成（`files_updated`, `memory_entries`） |
 | `summary_error` | 知识总结失败（`error`） |
+
+## Task 完成飞书通知（task_notify.py）
+
+Task 到达终态时把该轮最后一条 Agent 消息推送到飞书。配置段 `task_notify.feishu_notify`（`server/config.py::task_notify_config()`），默认关闭。
+
+### 调用链
+
+```
+agent_runner._finish_task(task_id, status)
+  └─ _prepare_notify()      # 配置未开启则返回 None（避免无谓的深拷贝）
+       ├─ 读 agent.name
+       ├─ task.model_copy(deep=True)          # 在 await 前快照，防并发 resume 污染
+       └─ _run_start_index[task_id]           # 本轮起始消息下标
+  └─ _schedule_notify()     # asyncio.create_task，脱离可取消的子进程协程
+       └─ task_notify.notify_task_finished(agent_name, task_snapshot, start_index)
+            └─ wiki_notify.send_feishu_card()  # 复用同一套 feishu-bot CLI
+```
+
+### 关键约束
+
+| 约束 | 实现 |
+|---|---|
+| 只发一次 | `_finish_task` 的 `was_terminal` 判断，已是终态则跳过 |
+| 只取本轮消息 | `_run_start_index[task_id]`（run 启动时记录 `len(task.messages)`）；内部续接不追加 user 消息，故不能用 role 边界判断 |
+| auto-compact 续接不误报 | `compact_will_continue` 检查 `_compact_pending`，续接完成后才通知 |
+| 快照防污染 | 在首个 `await` 前 `model_copy(deep=True)`；并发 `send_input()` 会改写 status 与 `_run_start_index` |
+| 通知不被 kill | `_schedule_notify` 用独立 task + `_notify_tasks` 强引用，resume 的 `cancel_existing=True` 不会中断发送 |
+| 不超 ARG_MAX | 消息截断 4000 字符、名称 200 字符（CLI 的 `--max-len` 在 argv 解析后才生效，救不了 exec 本身） |
+| 关服不丢通知 | `shutdown()` 用 `asyncio.wait(_notify_tasks, timeout=...)` 兜底等待。单次预算 `NOTIFY_DRAIN_BASE_SECONDS=40` 必须大于 CLI 自身的 30s 超时，否则 CLI 子进程来不及被回收。同一 task 的通知**合并而非排队**（`_inflight` + 单个 `_pending` 槽，新的覆盖旧的），故最坏只有 `MAX_SERIAL_SENDS=2` 次串行调用，预算恒为 40×2=80s，需小于 `run.sh` 的 95s 强杀宽限 —— 定值预算不会漏掉「已 schedule 但尚未开始」的协程，而按运行时深度采样会 |
+| 通知不丢最新结果 | 合并时保留**后到**的卡（`_pending` 覆盖），不是拒绝新来者：若被丢的是最后一轮，飞书会永久停留在旧结果上 |
+
+**配置缓存**：`server/config.py` 的 `_CONFIG` 是模块级单次加载，改 `config.json` 后必须重启服务才生效。
 
 ## 状态持久化（state.py）
 

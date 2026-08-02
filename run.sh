@@ -215,9 +215,12 @@ stop_one() {
 do_stop() {
     stop_one "frontend" "$FRONTEND_PID"
     # backend's shutdown() waits up to 10s for in-flight agent subprocesses to
-    # finalize, then up to 40s for pending Feishu completion notifications —
-    # give it enough grace to clear both before force-killing.
-    stop_one "backend"  "$BACKEND_PID" 55
+    # finalize, then drains pending Feishu notifications. Same-task
+    # notifications coalesce (at most one in flight plus one pending), so that
+    # drain is bounded by NOTIFY_DRAIN_BASE_SECONDS × task_notify.MAX_SERIAL_SENDS
+    # (40 × 2 = 80s in agent_runner.py) — give it enough grace to clear both
+    # before force-killing.
+    stop_one "backend"  "$BACKEND_PID" 95
     echo "所有服务已停止"
 }
 

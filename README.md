@@ -28,6 +28,7 @@ Agent Park 本身不直接与 LLM API 通信。它在后台启动本地 CLI 工�
 - **记忆系统**：每个 Agent 有独立的记忆（JSONL），跨任务积累经验
 - **知识总结**：从任务历史中提取错误经验、项目知识和文件热度，自动汇总为结构化文档
 - **Wiki 知识沉淀**：为 Agent 配置 Wiki 后，自动从成功任务中提取技术决策、Bug 根因、调试方法论等知识点，增量合并到 Markdown Wiki 中
+- **Task 完成飞书通知**：每个 task 会话结束时（成功或失败），自动把该轮最后一条 Agent 消息作为飞书卡片推送，无需盯着浏览器等结果
 - **共享记忆**：多个 Agent 可共享同一份记忆，适用于协同工作场景
 - **文件浏览器**：内置文件浏览器，支持软链接展示与跳转；大文件默认分段加载，可手动 force 加载完整内容（保留 50MB 硬上限以防 OOM）
 - **终端面板**：查看 Agent 执行的原始终端输出
@@ -46,6 +47,49 @@ Agent Park 本身不直接与 LLM API 通信。它在后台启动本地 CLI 工�
 
 - [快速开始](docs/quickstart.md)
 - [代码库说明](docs/codebase.md)
+
+## Task 完成飞书通知
+
+每个 task 会话结束时（`success` / `failed`），把该轮最后一条 Agent 文本消息作为飞书卡片推送到指定群，适合长任务丢后台跑、不用一直盯着浏览器。
+
+卡片格式：
+
+```
+🤖 <Agent 名> / <Task 名>
+**状态**: ✅ 成功
+
+<本轮最后一条 Agent 消息>
+```
+
+### 配置
+
+在 `config.json` 中配置 `task_notify`。这是独立配置段，与 `wiki_ingest.feishu_notify` 互不影响 —— 可以指向不同的群：
+
+```json
+{
+  "task_notify": {
+    "feishu_notify": {
+      "enabled": true,
+      "cli_path": "/data1/zman/feishu/cli.py",
+      "chat_id": "oc_xxx",
+      "env_file": "/data1/zman/feishu/.env"
+    }
+  }
+}
+```
+
+- `enabled`：默认 `false`，需显式打开，避免意外刷群
+- `cli_path` / `chat_id` / `env_file`：与 `wiki_ingest.feishu_notify` 同一套 feishu-bot CLI 契约
+- **改完需重启服务**：`config.json` 在进程内是模块级缓存（`server/config.py` 的 `_CONFIG`），只在首次读取时加载，热改文件不生效
+
+### 行为细节
+
+- **只在首次进入终态时发一次**：resume 后的二次收尾、重复的 `_finish_task` 调用都不会重发
+- **只取本轮消息**：通过 run 起始的消息下标定界，auto-compact / 自动续接 / handoff 等内部续接不会误取上一轮的输出
+- **auto-compact 续接期间不发**：这类 `success` 不是真正的会话结束，等续接跑完才通知
+- **无输出时降级文案**：成功发 `(任务已完成，无输出)`，失败发 `(任务失败，无输出)`
+- **正文本地截断**：消息 4000 字符、名称 200 字符上限，避免超出内核 `ARG_MAX` 导致 CLI 起不来
+- **失败不影响主流程**：CLI 缺失、超时、非零退出都只记日志，不会影响 task 状态
 
 ## Wiki Ingest（知识库增量沉淀）
 
