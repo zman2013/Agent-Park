@@ -215,6 +215,34 @@ def main() -> None:
                 f"{cmd} must back off, not start a second run: {sent}"
             print(f"✓ {cmd} serializes on the shared lock and backs off")
 
+        # ── 9) auto-compact dispatch runs from the turn-completion path, where
+        #      the task is briefly terminal. If a feishu reply claims the task
+        #      in that window, the automatic /compact must stand down — it uses
+        #      kill_existing=False, so dispatching anyway would leave two live
+        #      subprocesses on one task.
+        sent.clear()
+        tid = "task-autocompact"
+        task = make_task(tid, TaskStatus.success)
+        ft.record(tid, ["om_ac"], root_id="om_ac", chat_id=CHAT)
+        runner._compact_pending.add(tid)
+
+        async def auto_compact_race():
+            reply = rr.feishu_inbound(rr.FeishuInboundBody(
+                parent_id="om_ac", chat_id=CHAT, sender_open_id="ou_human",
+                sender_type="user", text="from feishu",
+            ))
+            dispatch = runner.maybe_dispatch_auto_compact(tid, success=True)
+            res, _ = await asyncio.gather(reply, dispatch)
+            return res
+
+        res = asyncio.run(auto_compact_race())
+        assert res.get("action") == "resumed", res
+        assert sent == [(tid, "from feishu")], \
+            f"auto /compact must stand down when an input claimed the task: {sent}"
+        assert not any(m.content.startswith("🤖 上下文已超过") for m in task.messages), \
+            "no auto-compact notice should be posted when the dispatch stands down"
+        print("✓ auto-compact stands down when an input already claimed the task")
+
         print("\nAll feishu inbound smoke checks passed.")
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)

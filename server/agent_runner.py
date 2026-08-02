@@ -838,6 +838,13 @@ class AgentRunner:
 
         Always clears `_compact_pending` so a failed turn does not leave a
         stale flag that would trigger /compact on the next unrelated success.
+
+        Takes the shared per-task input lock and re-checks the status inside
+        it: this runs from the turn-completion path, where the task is briefly
+        terminal, so an input arriving in that window (a feishu reply, a
+        browser message) can claim the task first. Dispatching anyway would
+        start /compact with kill_existing=False alongside that run, leaving two
+        live subprocesses fighting over the task-keyed registries.
         """
         if task_id not in self._compact_pending:
             return
@@ -845,21 +852,28 @@ class AgentRunner:
         if not success:
             return
         from server.routes_ws import broadcast
-        task = app_state.get_task(task_id)
-        if task:
-            notice = Message(
-                role="agent",
-                type="system",
-                streaming=False,
-                content="🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…",
-            )
-            task.messages.append(notice)
-            await broadcast({
-                "type": "message",
-                "task_id": task_id,
-                "message": notice.model_dump(),
-            })
-        await self.send_input(task_id, "/compact", kill_existing=False)
+        async with self.input_lock(task_id):
+            task = app_state.get_task(task_id)
+            if task and task.status == TaskStatus.running:
+                logger.info(
+                    "Skipping auto /compact for task %s: another input already claimed it",
+                    task_id,
+                )
+                return
+            if task:
+                notice = Message(
+                    role="agent",
+                    type="system",
+                    streaming=False,
+                    content="🤖 上下文已超过自动压缩阈值，正在自动发送 /compact 指令…",
+                )
+                task.messages.append(notice)
+                await broadcast({
+                    "type": "message",
+                    "task_id": task_id,
+                    "message": notice.model_dump(),
+                })
+            await self.send_input(task_id, "/compact", kill_existing=False)
         # Yield so the new run claims ownership before any pending
         # finally-block cleanup in the just-finished subprocess fires.
         await asyncio.sleep(0)

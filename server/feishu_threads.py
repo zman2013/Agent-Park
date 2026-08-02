@@ -43,13 +43,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_at(value: str | None) -> datetime:
-    if not value:
+def _parse_at(value: object) -> datetime:
+    """Parse a recorded timestamp, treating anything unusable as "very old".
+
+    Covers every way a damaged-but-valid-JSON entry can break the comparison:
+    a non-string (``{"at": 0}`` raises TypeError inside fromisoformat), an
+    unparseable string, or a timezone-less one (a naive datetime raises when
+    compared against the aware cutoff). Without this, a single bad entry makes
+    every lookup — and record(), via _prune() — fail instead of recovering.
+    """
+    if not isinstance(value, str) or not value:
         return datetime.min.replace(tzinfo=timezone.utc)
     try:
-        return datetime.fromisoformat(value)
-    except ValueError:
+        parsed = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
         return datetime.min.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _empty() -> dict:
@@ -128,7 +139,14 @@ def record(task_id: str, message_ids: Iterable[str], root_id: str, chat_id: str)
     at = _now()
     with _LOCK:
         data = _load()
-        for mid in message_ids:
+        # Refresh the root's own reverse mapping alongside the new cards. In a
+        # long-lived topic every later notification only touches by_task and
+        # the new child message, so the original root entry would age out under
+        # the TTL / size cap while by_task still points at it — then get_root_id
+        # keeps replying into a root that resolve() can no longer map, and
+        # inbound events (whose parent_id and root_id are both that root) stop
+        # matching the task.
+        for mid in {*message_ids, *([root_id] if root_id else [])}:
             data["by_message"][mid] = {
                 "task_id": task_id,
                 "root_id": root_id,

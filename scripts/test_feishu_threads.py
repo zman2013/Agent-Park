@@ -135,6 +135,44 @@ def main() -> None:
             "an expired topic root must not be reused"
         print("✓ TTL enforced on reads, not only on writes")
 
+        # ── 7c) refreshing a task also refreshes the ROOT's reverse mapping.
+        #       Otherwise a long-lived topic ages its root out of by_message
+        #       while by_task still points at it: get_root_id keeps replying
+        #       into a root that resolve() can no longer map, and inbound
+        #       events (parent_id == root_id == that root) stop matching.
+        ft.THREADS_FILE.unlink()
+        ft.record("task-live", ["om_root"], root_id="om_root", chat_id="oc_x")
+        # Age the root entry as if 29 days of child cards had gone by.
+        aged = json.loads(ft.THREADS_FILE.read_text())
+        old_at = (datetime.now(timezone.utc) - timedelta(days=29)).isoformat()
+        aged["by_message"]["om_root"]["at"] = old_at
+        ft._save(aged)
+        ft.record("task-live", ["om_child"], root_id="om_root", chat_id="oc_x")
+        data = json.loads(ft.THREADS_FILE.read_text())
+        assert data["by_message"]["om_root"]["at"] != old_at, \
+            "reusing a root must refresh its own reverse mapping"
+        assert ft.resolve("om_root", "om_root", "om_evt") == "task-live"
+        assert ft.get_root_id("task-live", "oc_x") == "om_root"
+        print("✓ reusing a root refreshes its reverse mapping")
+
+        # ── 7d) malformed timestamps don't break lookups. Only ValueError was
+        #       caught before, so `{"at": 0}` raised TypeError and a naive ISO
+        #       string raised on comparison against the aware cutoff.
+        for bad_at in (0, None, [], "not-a-date", "2026-08-01T00:00:00"):
+            ft._save({
+                "by_message": {"om_bad": {"task_id": "task-bad", "root_id": "om_bad",
+                                          "chat_id": "oc_x", "at": bad_at}},
+                "by_task": {"task-bad": {"root_id": "om_bad", "chat_id": "oc_x",
+                                         "at": bad_at}},
+            })
+            # Must not raise; naive-but-recent is honoured, junk counts as old.
+            resolved = ft.resolve("om_bad", None, None)
+            assert resolved in ("task-bad", None), (bad_at, resolved)
+            ft.get_root_id("task-bad", "oc_x")
+            ft.record("task-bad2", ["om_bad2"], root_id="om_bad2", chat_id="oc_x")
+            assert ft.resolve("om_bad2", None, None) == "task-bad2", bad_at
+        print("✓ malformed timestamps degrade gracefully instead of raising")
+
         # ── 8) max-size pruning keeps only the most recent 500 ───────────
         ft.THREADS_FILE.unlink()
         base = datetime.now(timezone.utc)
