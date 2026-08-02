@@ -26,9 +26,21 @@ logger = logging.getLogger(__name__)
 # grow one lock per task for the process lifetime.
 _send_locks: dict[str, tuple[asyncio.Lock, int]] = {}
 
+# Cap on how many notifications may queue behind one task's lock. Serialized
+# sends cost up to one CLI timeout each, so an unbounded queue makes the worst
+# case unbounded too — and shutdown()'s drain window (which must stay under
+# run.sh's force-kill grace) could never cover it. Bounding the queue instead
+# keeps that budget a fixed, honest number; the dropped card is the *stale*
+# one, since the next notification for the same task carries the newer
+# last-message anyway.
+MAX_QUEUE_DEPTH = 3
 
-def _acquire_send_lock(task_id: str) -> asyncio.Lock:
+
+def _acquire_send_lock(task_id: str) -> asyncio.Lock | None:
+    """Reserve a slot in the task's send queue, or None if it's already full."""
     lock, refs = _send_locks.get(task_id, (asyncio.Lock(), 0))
+    if refs >= MAX_QUEUE_DEPTH:
+        return None
     _send_locks[task_id] = (lock, refs + 1)
     return lock
 
@@ -46,7 +58,8 @@ def max_queue_depth() -> int:
 
     ``shutdown()`` sizes its drain window from this: serialized notifications
     run one CLI call after another, so N queued sends for one task can take up
-    to N × the CLI's own timeout, not one timeout total.
+    to N × the CLI's own timeout, not one timeout total. Bounded by
+    ``MAX_QUEUE_DEPTH``, so that window has a fixed ceiling.
     """
     return max((refs for _, refs in _send_locks.values()), default=0)
 
@@ -119,6 +132,12 @@ async def notify_task_finished(agent_name: str, task: Task, start_index: int = 0
         # notification for the same task sees the root this one established
         # and replies into it, instead of opening a second topic.
         lock = _acquire_send_lock(task.id)
+        if lock is None:
+            logger.warning(
+                "Dropping feishu notification for task %s: %d already queued",
+                task.id, MAX_QUEUE_DEPTH,
+            )
+            return
         try:
             async with lock:
                 # Pass chat_id so a root recorded for a previously-configured

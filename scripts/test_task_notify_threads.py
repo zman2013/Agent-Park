@@ -125,16 +125,47 @@ def main() -> None:
         assert tn.max_queue_depth() == 0, "depth must drop back to 0 when drained"
         print("✓ max_queue_depth reflects the serialized backlog")
 
+        # ── 3c) the queue is BOUNDED. An unbounded queue makes the worst-case
+        #       drain unbounded too, which no shutdown budget under run.sh's
+        #       force-kill grace could cover. Sends past the cap are dropped
+        #       (the stale card — the next notification carries newer output).
+        calls.clear()
+        task4 = make_task("task-bound")
+        observed: list[int] = []
+
+        async def overflow():
+            nonlocal gate
+            gate = asyncio.Event()
+            waiters = [
+                asyncio.create_task(tn.notify_task_finished("tester", task4, 0))
+                for _ in range(tn.MAX_QUEUE_DEPTH + 3)
+            ]
+            await asyncio.sleep(0)
+            observed.append(tn.max_queue_depth())
+            gate.set()
+            await asyncio.gather(*waiters)
+            gate = None
+
+        asyncio.run(overflow())
+        assert observed[0] == tn.MAX_QUEUE_DEPTH, observed
+        assert len(calls) == tn.MAX_QUEUE_DEPTH, \
+            f"sends past the cap must be dropped, got {len(calls)}"
+        assert tn._send_locks == {}, tn._send_locks
+        print("✓ queue depth is capped and overflow is dropped, not queued")
+
         from server.agent_runner import (
-            NOTIFY_DRAIN_BASE_SECONDS, NOTIFY_DRAIN_MAX_SECONDS,
+            NOTIFY_DRAIN_BASE_SECONDS, _notify_drain_max_seconds,
         )
         # The CLI's own timeout is 30s (wiki_notify); the per-call budget must
-        # exceed it so its kill-the-child handler gets to run, and the ceiling
-        # must stay under run.sh's 115s force-kill grace.
+        # exceed it so its kill-the-child handler gets to run. The ceiling must
+        # cover the FULL capped queue (no truncation) and still fit inside
+        # run.sh's 135s force-kill grace.
         assert NOTIFY_DRAIN_BASE_SECONDS > 30, NOTIFY_DRAIN_BASE_SECONDS
-        assert NOTIFY_DRAIN_MAX_SECONDS >= NOTIFY_DRAIN_BASE_SECONDS * 2
-        assert NOTIFY_DRAIN_MAX_SECONDS < 115, NOTIFY_DRAIN_MAX_SECONDS
-        print("✓ shutdown drain budget covers a serialized queue")
+        worst_case = NOTIFY_DRAIN_BASE_SECONDS * tn.MAX_QUEUE_DEPTH
+        assert _notify_drain_max_seconds() == worst_case, \
+            "the drain ceiling must equal the worst case, not truncate it"
+        assert worst_case < 135, worst_case
+        print("✓ shutdown drain budget covers the full capped queue")
 
         # ── 4) disabled config sends nothing ─────────────────────────────
         calls.clear()

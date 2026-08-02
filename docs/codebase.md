@@ -228,7 +228,7 @@ agent_runner._finish_task(task_id, status)
 | 快照防污染 | 在首个 `await` 前 `model_copy(deep=True)`；并发 `send_input()` 会改写 status 与 `_run_start_index` |
 | 通知不被 kill | `_schedule_notify` 用独立 task + `_notify_tasks` 强引用，resume 的 `cancel_existing=True` 不会中断发送 |
 | 不超 ARG_MAX | 消息截断 4000 字符、名称 200 字符（CLI 的 `--max-len` 在 argv 解析后才生效，救不了 exec 本身） |
-| 关服不丢通知 | `shutdown()` 用 `asyncio.wait(_notify_tasks, timeout=...)` 兜底等待。单次预算 `NOTIFY_DRAIN_BASE_SECONDS=40` 必须大于 CLI 自身的 30s 超时，否则 CLI 子进程来不及被回收；同一 task 的通知是串行的，故预算按 `task_notify.max_queue_depth()` 放大，上限 `NOTIFY_DRAIN_MAX_SECONDS=100`，需小于 `run.sh` 的 115s 强杀宽限 |
+| 关服不丢通知 | `shutdown()` 用 `asyncio.wait(_notify_tasks, timeout=...)` 兜底等待。单次预算 `NOTIFY_DRAIN_BASE_SECONDS=40` 必须大于 CLI 自身的 30s 超时，否则 CLI 子进程来不及被回收；同一 task 的通知串行，故预算按 `task_notify.max_queue_depth()` 放大。队列由 `task_notify.MAX_QUEUE_DEPTH=3` 限界（超出的通知直接丢弃并记日志），最坏预算即 40×3=120s，需小于 `run.sh` 的 135s 强杀宽限 —— 限界队列而非无界放大预算，才能让这个数字有确定上限 |
 
 **配置缓存**：`server/config.py` 的 `_CONFIG` 是模块级单次加载，改 `config.json` 后必须重启服务才生效。
 
