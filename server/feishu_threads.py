@@ -114,13 +114,30 @@ def _save(data: dict) -> None:
 
 
 def _prune(data: dict) -> dict:
-    """Drop entries older than the TTL, then cap each section at the max size."""
-    for section in ("by_message", "by_task"):
+    """Drop entries older than the TTL, then cap each section at the max size.
+
+    ``by_task`` is capped first, and every root still referenced by a surviving
+    task is then pinned in ``by_message``. Capping the two sections
+    independently would let a busy task's root be evicted by 500 newer cards
+    from other tasks while its ``by_task`` record lived on — get_root_id would
+    keep replying into a root that resolve() can no longer map, so inbound
+    events pointing at it would stop matching the task.
+    """
+    for section in ("by_task", "by_message"):
         entries = data.get(section, {})
         kept = {k: v for k, v in entries.items() if not _is_expired(v)}
         if len(kept) > _MAX_ENTRIES:
+            pinned: dict = {}
+            if section == "by_message":
+                roots = {
+                    entry.get("root_id")
+                    for entry in data["by_task"].values()
+                    if entry.get("root_id")
+                }
+                pinned = {k: v for k, v in kept.items() if k in roots}
             newest = sorted(kept.items(), key=lambda kv: kv[1].get("at", ""), reverse=True)
-            kept = dict(newest[:_MAX_ENTRIES])
+            kept = dict(newest[: max(0, _MAX_ENTRIES - len(pinned))])
+            kept.update(pinned)
         data[section] = kept
     return data
 

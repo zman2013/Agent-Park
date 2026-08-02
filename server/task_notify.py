@@ -40,6 +40,16 @@ def _release_send_lock(task_id: str) -> None:
     else:
         _send_locks[task_id] = (lock, refs - 1)
 
+
+def max_queue_depth() -> int:
+    """Deepest per-task send queue right now (0 when nothing is in flight).
+
+    ``shutdown()`` sizes its drain window from this: serialized notifications
+    run one CLI call after another, so N queued sends for one task can take up
+    to N × the CLI's own timeout, not one timeout total.
+    """
+    return max((refs for _, refs in _send_locks.values()), default=0)
+
 _STATUS_LABELS = {"success": "✅ 成功", "failed": "❌ 失败"}
 _NO_OUTPUT_FALLBACK = {"success": "(任务已完成，无输出)", "failed": "(任务失败，无输出)"}
 # feishu-bot CLI applies --max-len only after argv is parsed inside the

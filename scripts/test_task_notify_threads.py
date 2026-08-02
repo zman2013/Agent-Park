@@ -97,7 +97,44 @@ def main() -> None:
 
         # ── 3) the per-task lock dict doesn't leak entries ────────────────
         assert tn._send_locks == {}, tn._send_locks
+        assert tn.max_queue_depth() == 0
         print("✓ send-lock table is empty once notifications finish")
+
+        # ── 3b) queue depth is visible while sends are serialized, so
+        #       shutdown() can size its drain window to N CLI timeouts rather
+        #       than assuming a single call.
+        calls.clear()
+        task3 = make_task("task-depth")
+        depths: list[int] = []
+
+        async def observe_depth():
+            nonlocal gate
+            gate = asyncio.Event()
+            waiters = [
+                asyncio.create_task(tn.notify_task_finished("tester", task3, 0))
+                for _ in range(3)
+            ]
+            await asyncio.sleep(0)
+            depths.append(tn.max_queue_depth())
+            gate.set()
+            await asyncio.gather(*waiters)
+            gate = None
+
+        asyncio.run(observe_depth())
+        assert depths[0] == 3, depths
+        assert tn.max_queue_depth() == 0, "depth must drop back to 0 when drained"
+        print("✓ max_queue_depth reflects the serialized backlog")
+
+        from server.agent_runner import (
+            NOTIFY_DRAIN_BASE_SECONDS, NOTIFY_DRAIN_MAX_SECONDS,
+        )
+        # The CLI's own timeout is 30s (wiki_notify); the per-call budget must
+        # exceed it so its kill-the-child handler gets to run, and the ceiling
+        # must stay under run.sh's 115s force-kill grace.
+        assert NOTIFY_DRAIN_BASE_SECONDS > 30, NOTIFY_DRAIN_BASE_SECONDS
+        assert NOTIFY_DRAIN_MAX_SECONDS >= NOTIFY_DRAIN_BASE_SECONDS * 2
+        assert NOTIFY_DRAIN_MAX_SECONDS < 115, NOTIFY_DRAIN_MAX_SECONDS
+        print("✓ shutdown drain budget covers a serialized queue")
 
         # ── 4) disabled config sends nothing ─────────────────────────────
         calls.clear()

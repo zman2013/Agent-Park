@@ -193,6 +193,34 @@ def main() -> None:
         assert "om_bulk0" not in data["by_message"], "oldest entry must be pruned first"
         print("✓ max-size pruning keeps most recent 500")
 
+        # ── 8b) the cap must not evict a root that a surviving task still
+        #       points at. by_message is capped at 500 while by_task here holds
+        #       only 2 entries, so a busy task's card stream can push another
+        #       task's still-referenced root out — leaving get_root_id replying
+        #       into a root resolve() can no longer map.
+        ft.THREADS_FILE.unlink()
+        old_at = (base - timedelta(days=20)).isoformat()
+        by_message = {"om_oldroot": {"task_id": "task-active", "root_id": "om_oldroot",
+                                     "chat_id": "oc_x", "at": old_at}}
+        by_task = {"task-active": {"root_id": "om_oldroot", "chat_id": "oc_x", "at": old_at}}
+        # One busy task with 505 newer cards, all under the same root.
+        for i in range(505):
+            at = (base - timedelta(seconds=505 - i)).isoformat()
+            by_message[f"om_busy{i}"] = {"task_id": "task-busy", "root_id": "om_busy0",
+                                         "chat_id": "oc_x", "at": at}
+        by_task["task-busy"] = {"root_id": "om_busy0", "chat_id": "oc_x", "at": base.isoformat()}
+        ft._save({"by_message": by_message, "by_task": by_task})
+        # Any write triggers _prune; the old root is now the oldest by_message entry.
+        ft.record("task-busy", ["om_busy_new"], root_id="om_busy0", chat_id="oc_x")
+        data = json.loads(ft.THREADS_FILE.read_text())
+        assert len(data["by_message"]) <= 500, len(data["by_message"])
+        assert "om_oldroot" in data["by_message"], \
+            "a root still referenced by by_task must not be evicted by the cap"
+        assert ft.get_root_id("task-active", "oc_x") == "om_oldroot"
+        assert ft.resolve("om_oldroot", "om_oldroot", "om_evt") == "task-active", \
+            "a surviving root must stay resolvable for inbound events"
+        print("✓ cap preserves roots that surviving tasks still reference")
+
         # ── 9) atomic write leaves no .tmp file behind ───────────────────
         assert not ft.THREADS_FILE.with_suffix(".tmp").exists()
         print("✓ no leftover .tmp file after writes")

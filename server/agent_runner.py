@@ -33,6 +33,12 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 
+# shutdown()'s drain window for pending Feishu notifications. BASE exceeds the
+# CLI's own 30s timeout with margin (so its kill-the-child handler gets to
+# run); MAX caps the total so the wait stays inside run.sh's force-kill grace.
+NOTIFY_DRAIN_BASE_SECONDS = 40
+NOTIFY_DRAIN_MAX_SECONDS = 100
+
 
 class _RunContext:
     """Implements ChunkContext — callback interface for adapters.
@@ -1573,8 +1579,20 @@ class AgentRunner:
         # task, so if both timers were equal and this one fired first,
         # shutdown would return with the notification's own timeout handler
         # (which kills its CLI child) never having run.
+        #
+        # Notifications for the SAME task are serialized (task_notify holds a
+        # per-task lock across send+record), so a queue of depth N can need up
+        # to N CLI timeouts, not one. Scale the window with the actual depth
+        # instead of assuming a single call, and keep it under run.sh's
+        # force-kill grace so the budget stays honest.
         if self._notify_tasks:
-            await asyncio.wait(list(self._notify_tasks), timeout=40)
+            from server.task_notify import max_queue_depth
+
+            budget = min(
+                NOTIFY_DRAIN_MAX_SECONDS,
+                NOTIFY_DRAIN_BASE_SECONDS * max(1, max_queue_depth()),
+            )
+            await asyncio.wait(list(self._notify_tasks), timeout=budget)
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
