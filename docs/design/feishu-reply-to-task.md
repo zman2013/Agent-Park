@@ -105,7 +105,11 @@ bot 退化成一个**薄的双向传输层**：飞书事件 → HTTP → agent-p
 // 命中但拒绝
 200 {"matched": true, "action": "rejected", "reason": "task_running",
      "hint": "agent 正在处理中，请等当前回合结束后再回复"}
+// 应用自身消息（含 bot 自己发的 hint / 卡片）—— 最先判断，不查映射
+200 {"matched": false, "action": "ignored", "reason": "app_message"}
 ```
+
+**无 `hint` 字段时 bot 必须闭嘴。** 这不是可选优化：bot 回的 hint 本身是 app 消息，会被再次转发进来，若也回 hint 就成了自己答自己的死循环。因此 `app_message` 分支排在反查之前，且响应里不带 `hint`。
 
 `data/feishu_threads.json`：
 

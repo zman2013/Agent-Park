@@ -851,6 +851,14 @@ async def feishu_inbound(body: FeishuInboundBody):
     if not cfg.get("enabled"):
         raise HTTPException(404, "feishu inbound is disabled")
 
+    # Ignore app-authored messages FIRST, before any lookup. The transport
+    # replies to the group with whatever `hint` we return, and that reply is
+    # itself an app message that resolves to nothing — so hinting at an app
+    # message would make the bot answer its own answer, forever. No `hint`
+    # key here means the bot has nothing to say back.
+    if body.sender_type == "app":
+        return {"matched": False, "action": "ignored", "reason": "app_message"}
+
     from server import feishu_threads
 
     task_id = feishu_threads.resolve(body.parent_id, body.root_id, body.message_id)
@@ -864,18 +872,20 @@ async def feishu_inbound(body: FeishuInboundBody):
             "hint": "该群未被允许驱动此 task",
         }
 
-    if body.sender_type == "app":
-        return {
-            "matched": True, "action": "rejected", "reason": "app_message",
-            "hint": "忽略应用自身消息",
-        }
-
     from server.models import TaskStatus
     if task.status == TaskStatus.running:
         return {
             "matched": True, "action": "rejected", "reason": "task_running",
             "hint": "agent 正在处理中，请等当前回合结束后再回复",
         }
+
+    # Claim the task in the same synchronous step as the check above. Without
+    # this, two replies arriving back-to-back both see a terminal status while
+    # the first is parked on `await broadcast()` — status only flips inside
+    # send_input(), too late to reject the second. The loser's send_input()
+    # would then kill the subprocess the winner just started, silently
+    # dropping the winner's input.
+    task.status = TaskStatus.running
 
     from server.models import Message
     from server.routes_ws import broadcast
