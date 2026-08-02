@@ -66,8 +66,20 @@ def _load() -> dict:
         return _empty()
     if not isinstance(data, dict):
         return _empty()
-    data.setdefault("by_message", {})
-    data.setdefault("by_task", {})
+    # Normalize the shape, don't just fill in missing keys: a file that is
+    # valid JSON but damaged (e.g. `{"by_message": []}`, or an entry that is a
+    # string) would otherwise survive setdefault and blow up later inside
+    # resolve()/record(), turning "recover from a corrupt file" into "every
+    # reply and notification fails from now on".
+    for section in ("by_message", "by_task"):
+        entries = data.get(section)
+        if not isinstance(entries, dict):
+            data[section] = {}
+            continue
+        data[section] = {
+            k: v for k, v in entries.items()
+            if isinstance(k, str) and isinstance(v, dict)
+        }
     return data
 
 
@@ -133,7 +145,7 @@ def get_root_id(task_id: str, chat_id: str = "") -> str | None:
         return None
     if chat_id and entry.get("chat_id") and entry["chat_id"] != chat_id:
         return None
-    return entry["root_id"]
+    return entry.get("root_id") or None
 
 
 def resolve(parent_id: str | None, root_id: str | None, message_id: str | None) -> str | None:
@@ -149,6 +161,6 @@ def resolve(parent_id: str | None, root_id: str | None, message_id: str | None) 
         if not mid:
             continue
         entry = data["by_message"].get(mid)
-        if entry:
+        if entry and entry.get("task_id"):
             return entry["task_id"]
     return None

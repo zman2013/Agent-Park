@@ -356,32 +356,36 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         from server.models import Message, TaskStatus
         from server.agent_runner import runner
 
-        # Reject /compact while the agent is running. Without this guard a
-        # stale tab, a duplicated click before the status update lands, or a
-        # crafted WS message could send /compact while the agent is still
-        # running, killing the in-flight turn and replacing it with /compact.
-        # Idle statuses (waiting/success/failed) are all acceptable since the
-        # frontend button only disables on `running`.
-        if task.status == TaskStatus.running:
-            return
+        # Same per-task input lock as user_message / feishu inbound: the guard
+        # below and send_input() must be one atomic step, else a concurrent
+        # input passes its own guard and kills whichever run started first.
+        async with runner.input_lock(task_id):
+            # Reject /compact while the agent is running. Without this guard a
+            # stale tab, a duplicated click before the status update lands, or a
+            # crafted WS message could send /compact while the agent is still
+            # running, killing the in-flight turn and replacing it with /compact.
+            # Idle statuses (waiting/success/failed) are all acceptable since the
+            # frontend button only disables on `running`.
+            if task.status == TaskStatus.running:
+                return
 
-        # Notify the user via a system bubble; '/compact' itself is not stored
-        # as a user message so the chat stays clean.
-        notice = Message(
-            role="agent",
-            type="system",
-            streaming=False,
-            content="🤖 已发送 /compact 指令，正在压缩上下文…",
-        )
-        task.messages.append(notice)
-        app_state.save_agent_tasks(task.agent_id)
-        await broadcast({
-            "type": "message",
-            "task_id": task_id,
-            "message": notice.model_dump(),
-        })
-        runner._compact_pending.discard(task_id)
-        await runner.send_input(task_id, "/compact")
+            # Notify the user via a system bubble; '/compact' itself is not
+            # stored as a user message so the chat stays clean.
+            notice = Message(
+                role="agent",
+                type="system",
+                streaming=False,
+                content="🤖 已发送 /compact 指令，正在压缩上下文…",
+            )
+            task.messages.append(notice)
+            app_state.save_agent_tasks(task.agent_id)
+            await broadcast({
+                "type": "message",
+                "task_id": task_id,
+                "message": notice.model_dump(),
+            })
+            runner._compact_pending.discard(task_id)
+            await runner.send_input(task_id, "/compact")
 
     elif msg_type == "toggle_auto_compact":
         task_id = data.get("task_id", "")
@@ -406,26 +410,28 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         from server.agent_runner import runner
         from server.handoff_prompts import step_1_and_2
 
-        # Reject while running (mirrors /compact). Allow idle/waiting/success/failed.
-        if task.status == TaskStatus.running:
-            return
+        # Same per-task input lock as the other input paths (see trigger_compact).
+        async with runner.input_lock(task_id):
+            # Reject while running (mirrors /compact). Allow idle/waiting/success/failed.
+            if task.status == TaskStatus.running:
+                return
 
-        notice = Message(
-            role="agent",
-            type="system",
-            streaming=False,
-            content="📤 已发起 Handoff 流程：整理 docs/handoff/ 并同步 sync-principles…",
-        )
-        task.messages.append(notice)
-        app_state.save_agent_tasks(task.agent_id)
-        await broadcast({
-            "type": "message",
-            "task_id": task_id,
-            "message": notice.model_dump(),
-        })
+            notice = Message(
+                role="agent",
+                type="system",
+                streaming=False,
+                content="📤 已发起 Handoff 流程：整理 docs/handoff/ 并同步 sync-principles…",
+            )
+            task.messages.append(notice)
+            app_state.save_agent_tasks(task.agent_id)
+            await broadcast({
+                "type": "message",
+                "task_id": task_id,
+                "message": notice.model_dump(),
+            })
 
-        runner._handoff_pending.add(task_id)
-        await runner.send_input(task_id, step_1_and_2())
+            runner._handoff_pending.add(task_id)
+            await runner.send_input(task_id, step_1_and_2())
 
     elif msg_type == "stop_task":
         task_id = data.get("task_id", "")

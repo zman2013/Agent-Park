@@ -190,6 +190,31 @@ def main() -> None:
         assert sent == [(tid, "from feishu"), (tid, "from browser")], sent
         print("✓ feishu-first: WS interrupt is serialized after, not interleaved")
 
+        # ── 8) trigger_compact / trigger_handoff take the same lock. Both are
+        #      "reject while running" like a feishu reply, so racing one
+        #      against a reply must leave exactly one run started.
+        for cmd in ("trigger_compact", "trigger_handoff"):
+            sent.clear()
+            tid = f"task-{cmd}"
+            make_task(tid, TaskStatus.success)
+            mid = f"om_{tid}"
+            ft.record(tid, [mid], root_id=mid, chat_id=CHAT)
+
+            async def run(cmd=cmd, tid=tid, mid=mid):
+                reply = rr.feishu_inbound(rr.FeishuInboundBody(
+                    parent_id=mid, chat_id=CHAT, sender_open_id="ou_human",
+                    sender_type="user", text="from feishu",
+                ))
+                ws_cmd = rws._handle_client_message({"type": cmd, "task_id": tid}, None)
+                res, _ = await asyncio.gather(reply, ws_cmd)
+                return res
+
+            res = asyncio.run(run())
+            assert res.get("action") == "resumed", (cmd, res)
+            assert sent == [(tid, "from feishu")], \
+                f"{cmd} must back off, not start a second run: {sent}"
+            print(f"✓ {cmd} serializes on the shared lock and backs off")
+
         print("\nAll feishu inbound smoke checks passed.")
     finally:
         shutil.rmtree(sandbox, ignore_errors=True)

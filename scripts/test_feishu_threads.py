@@ -81,6 +81,22 @@ def main() -> None:
         assert ft.resolve("om_f", None, None) == "task-6"
         print("✓ corrupted file recovers instead of crashing")
 
+        # ── 6b) valid JSON but damaged shape also recovers. setdefault alone
+        #       would keep a non-dict section, and then every resolve/record
+        #       raises — i.e. recovery silently stops working.
+        for broken in (
+            '{"by_message": [], "by_task": []}',
+            '{"by_message": "nope"}',
+            '{"by_message": {"om_g": "not-a-dict"}, "by_task": {"t": 7}}',
+            '[]',
+        ):
+            ft.THREADS_FILE.write_text(broken, encoding="utf-8")
+            assert ft.resolve("om_g", None, None) is None, broken
+            assert ft.get_root_id("t") is None, broken
+            ft.record("task-6b", ["om_h"], root_id="om_h", chat_id="oc_x")
+            assert ft.resolve("om_h", None, None) == "task-6b", broken
+        print("✓ damaged-but-valid-JSON shape is normalized, not propagated")
+
         # ── 7) TTL pruning drops entries older than 30 days ──────────────
         stale_at = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
         fresh_at = datetime.now(timezone.utc).isoformat()
