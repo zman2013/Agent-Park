@@ -35,16 +35,17 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 
 # shutdown()'s drain window for pending Feishu notifications. BASE exceeds the
 # CLI's own 30s timeout with margin (so its kill-the-child handler gets to
-# run). Same-task notifications are serialized, so the worst case is BASE times
-# task_notify's queue cap — MAX is derived from that cap, not guessed, and must
-# stay under run.sh's force-kill grace for the backend.
+# run). Same-task notifications coalesce instead of queueing, so the worst case
+# is a fixed BASE × task_notify.MAX_SERIAL_SENDS — a constant, not a sampled
+# depth (which could miss a coroutine scheduled but not yet started). Must stay
+# under run.sh's force-kill grace for the backend.
 NOTIFY_DRAIN_BASE_SECONDS = 40
 
 
 def _notify_drain_max_seconds() -> int:
-    from server.task_notify import MAX_QUEUE_DEPTH
+    from server.task_notify import MAX_SERIAL_SENDS
 
-    return NOTIFY_DRAIN_BASE_SECONDS * MAX_QUEUE_DEPTH
+    return NOTIFY_DRAIN_BASE_SECONDS * MAX_SERIAL_SENDS
 
 
 class _RunContext:
@@ -1587,17 +1588,15 @@ class AgentRunner:
         # shutdown would return with the notification's own timeout handler
         # (which kills its CLI child) never having run.
         #
-        # Notifications for the SAME task are serialized (task_notify holds a
-        # per-task lock across send+record), so a queue of depth N can need up
-        # to N CLI timeouts, not one. Scale the window with the actual depth.
-        # task_notify caps that depth at MAX_QUEUE_DEPTH, so this can't be
-        # truncated by a ceiling: the worst case is a fixed BASE × cap (see
-        # _notify_drain_max_seconds), which stays under run.sh's grace.
+        # Notifications for the SAME task coalesce rather than queue
+        # (task_notify keeps at most one in flight plus one pending slot), so
+        # the worst case is a FIXED MAX_SERIAL_SENDS CLI calls back to back.
+        # The budget is that constant — not a sampled depth, which could miss a
+        # coroutine scheduled but not yet started.
         if self._notify_tasks:
-            from server.task_notify import max_queue_depth
-
-            budget = NOTIFY_DRAIN_BASE_SECONDS * max(1, max_queue_depth())
-            await asyncio.wait(list(self._notify_tasks), timeout=budget)
+            await asyncio.wait(
+                list(self._notify_tasks), timeout=_notify_drain_max_seconds()
+            )
 
 
 # ── helpers ─────────────────────────────────────────────────────────────

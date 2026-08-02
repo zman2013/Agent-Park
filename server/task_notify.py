@@ -22,46 +22,21 @@ logger = logging.getLogger(__name__)
 # finishes again while the first detached CLI call is still in flight); both
 # would then read an empty root_id, send independent top-level cards, and the
 # later record() would pick one arbitrarily — splitting the thread the
-# reply-to-task flow depends on. Entries are ref-counted so the dict doesn't
-# grow one lock per task for the process lifetime.
-_send_locks: dict[str, tuple[asyncio.Lock, int]] = {}
+# reply-to-task flow depends on.
+#
+# Rather than queue the overlap, it COALESCES: a task has at most one send in
+# flight plus one pending slot holding the newest card. A newer notification
+# overwrites that slot instead of lining up behind it, so
+#   - the latest result is always what gets sent (dropping the newest arrival
+#     would leave Feishu permanently showing a stale round), and
+#   - the backlog per task is 1 by construction, so shutdown()'s drain window
+#     is a fixed 2 CLI calls — no queue depth to sample, nothing to truncate.
+_inflight: set[str] = set()
+_pending: dict[str, str] = {}
 
-# Cap on how many notifications may queue behind one task's lock. Serialized
-# sends cost up to one CLI timeout each, so an unbounded queue makes the worst
-# case unbounded too — and shutdown()'s drain window (which must stay under
-# run.sh's force-kill grace) could never cover it. Bounding the queue instead
-# keeps that budget a fixed, honest number; the dropped card is the *stale*
-# one, since the next notification for the same task carries the newer
-# last-message anyway.
-MAX_QUEUE_DEPTH = 3
-
-
-def _acquire_send_lock(task_id: str) -> asyncio.Lock | None:
-    """Reserve a slot in the task's send queue, or None if it's already full."""
-    lock, refs = _send_locks.get(task_id, (asyncio.Lock(), 0))
-    if refs >= MAX_QUEUE_DEPTH:
-        return None
-    _send_locks[task_id] = (lock, refs + 1)
-    return lock
-
-
-def _release_send_lock(task_id: str) -> None:
-    lock, refs = _send_locks[task_id]
-    if refs <= 1:
-        del _send_locks[task_id]
-    else:
-        _send_locks[task_id] = (lock, refs - 1)
-
-
-def max_queue_depth() -> int:
-    """Deepest per-task send queue right now (0 when nothing is in flight).
-
-    ``shutdown()`` sizes its drain window from this: serialized notifications
-    run one CLI call after another, so N queued sends for one task can take up
-    to N × the CLI's own timeout, not one timeout total. Bounded by
-    ``MAX_QUEUE_DEPTH``, so that window has a fixed ceiling.
-    """
-    return max((refs for _, refs in _send_locks.values()), default=0)
+# Worst-case serialized CLI calls per task once a drain starts: the one in
+# flight plus the single pending slot. shutdown() sizes its window from this.
+MAX_SERIAL_SENDS = 2
 
 _STATUS_LABELS = {"success": "✅ 成功", "failed": "❌ 失败"}
 _NO_OUTPUT_FALLBACK = {"success": "(任务已完成，无输出)", "failed": "(任务失败，无输出)"}
@@ -126,22 +101,22 @@ async def notify_task_finished(agent_name: str, task: Task, start_index: int = 0
         status=task.status.value,
         last_message=_last_agent_text(task, start_index),
     )
+    chat_id = cfg.get("chat_id", "")
+
+    # If a send for this task is already in flight, park the card in the
+    # pending slot (overwriting any older one) and let that send deliver it.
+    if task.id in _inflight:
+        _pending[task.id] = message
+        return
+
+    _inflight.add(task.id)
     try:
-        chat_id = cfg.get("chat_id", "")
-        # Hold the per-task lock across read-send-record so an overlapping
-        # notification for the same task sees the root this one established
-        # and replies into it, instead of opening a second topic.
-        lock = _acquire_send_lock(task.id)
-        if lock is None:
-            logger.warning(
-                "Dropping feishu notification for task %s: %d already queued",
-                task.id, MAX_QUEUE_DEPTH,
-            )
-            return
-        try:
-            async with lock:
+        while True:
+            try:
                 # Pass chat_id so a root recorded for a previously-configured
-                # group is ignored rather than replied into.
+                # group is ignored rather than replied into. Reading the root
+                # here (not before the loop) picks up the root the previous
+                # iteration established, so rounds collapse into one topic.
                 root_id = feishu_threads.get_root_id(task.id, chat_id) or ""
                 message_ids = await send_feishu_card(
                     cfg, message, capture_ids=True, reply_to=root_id
@@ -150,7 +125,13 @@ async def notify_task_finished(agent_name: str, task: Task, start_index: int = 0
                     feishu_threads.record(
                         task.id, message_ids, root_id or message_ids[0], chat_id
                     )
-        finally:
-            _release_send_lock(task.id)
-    except Exception:
-        logger.exception("task-finish feishu notification failed for task %s", task.id)
+            except Exception:
+                logger.exception(
+                    "task-finish feishu notification failed for task %s", task.id
+                )
+            message = _pending.pop(task.id, "")
+            if not message:
+                return
+    finally:
+        _inflight.discard(task.id)
+        _pending.pop(task.id, None)

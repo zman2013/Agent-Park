@@ -40,10 +40,12 @@ def main() -> None:
         # Record every send's reply_to so we can assert on threading, and hand
         # back a fresh message_id each time like the real CLI would.
         calls: list[str] = []
+        bodies: list[str] = []
         gate: asyncio.Event | None = None
 
         async def fake_send(cfg, message, *, capture_ids=False, reply_to=""):
             calls.append(reply_to)
+            bodies.append(message)
             if gate is not None:
                 # Simulate the CLI being slow: yields control so a second
                 # notification can interleave if nothing serializes them.
@@ -52,10 +54,10 @@ def main() -> None:
 
         tn.send_feishu_card = fake_send
 
-        def make_task(task_id: str) -> Task:
+        def make_task(task_id: str, last: str = "done") -> Task:
             task = Task(id=task_id, agent_id="ag-1", name=f"t-{task_id}",
                         status=TaskStatus.success)
-            task.messages.append(Message(role="agent", content="done"))
+            task.messages.append(Message(role="agent", content=last))
             return task
 
         # ── 1) first card opens a topic; the second replies into it ───────
@@ -95,77 +97,55 @@ def main() -> None:
         assert ft.get_root_id("task-overlap", CHAT) == "om_sent1"
         print("✓ overlapping notifications collapse into one topic")
 
-        # ── 3) the per-task lock dict doesn't leak entries ────────────────
-        assert tn._send_locks == {}, tn._send_locks
-        assert tn.max_queue_depth() == 0
-        print("✓ send-lock table is empty once notifications finish")
+        # ── 3) no per-task bookkeeping leaks after notifications finish ────
+        assert tn._inflight == set(), tn._inflight
+        assert tn._pending == {}, tn._pending
+        print("✓ coalescing state is empty once notifications finish")
 
-        # ── 3b) queue depth is visible while sends are serialized, so
-        #       shutdown() can size its drain window to N CLI timeouts rather
-        #       than assuming a single call.
+        # ── 3b) N overlapping notifications COALESCE into 2 sends, and the
+        #       LAST one to arrive is what actually gets delivered. Dropping the
+        #       newest arrival instead would leave Feishu showing a stale round
+        #       forever when that arrival is the task's final one.
         calls.clear()
-        task3 = make_task("task-depth")
-        depths: list[int] = []
+        bodies.clear()
 
-        async def observe_depth():
+        async def coalesce():
             nonlocal gate
             gate = asyncio.Event()
             waiters = [
-                asyncio.create_task(tn.notify_task_finished("tester", task3, 0))
-                for _ in range(3)
+                asyncio.create_task(tn.notify_task_finished(
+                    "tester", make_task("task-coalesce", f"round{i}"), 0))
+                for i in range(5)
             ]
             await asyncio.sleep(0)
-            depths.append(tn.max_queue_depth())
             gate.set()
             await asyncio.gather(*waiters)
             gate = None
 
-        asyncio.run(observe_depth())
-        assert depths[0] == 3, depths
-        assert tn.max_queue_depth() == 0, "depth must drop back to 0 when drained"
-        print("✓ max_queue_depth reflects the serialized backlog")
-
-        # ── 3c) the queue is BOUNDED. An unbounded queue makes the worst-case
-        #       drain unbounded too, which no shutdown budget under run.sh's
-        #       force-kill grace could cover. Sends past the cap are dropped
-        #       (the stale card — the next notification carries newer output).
-        calls.clear()
-        task4 = make_task("task-bound")
-        observed: list[int] = []
-
-        async def overflow():
-            nonlocal gate
-            gate = asyncio.Event()
-            waiters = [
-                asyncio.create_task(tn.notify_task_finished("tester", task4, 0))
-                for _ in range(tn.MAX_QUEUE_DEPTH + 3)
-            ]
-            await asyncio.sleep(0)
-            observed.append(tn.max_queue_depth())
-            gate.set()
-            await asyncio.gather(*waiters)
-            gate = None
-
-        asyncio.run(overflow())
-        assert observed[0] == tn.MAX_QUEUE_DEPTH, observed
-        assert len(calls) == tn.MAX_QUEUE_DEPTH, \
-            f"sends past the cap must be dropped, got {len(calls)}"
-        assert tn._send_locks == {}, tn._send_locks
-        print("✓ queue depth is capped and overflow is dropped, not queued")
+        asyncio.run(coalesce())
+        assert len(calls) == 2, f"5 overlapping sends must coalesce to 2: {calls}"
+        assert calls == ["", "om_sent1"], calls
+        assert "round0" in bodies[0], bodies[0]
+        assert "round4" in bodies[1], \
+            f"the newest card must be the one delivered, got {bodies[1]!r}"
+        assert tn._inflight == set() and tn._pending == {}
+        print("✓ overlapping notifications coalesce, newest wins")
 
         from server.agent_runner import (
             NOTIFY_DRAIN_BASE_SECONDS, _notify_drain_max_seconds,
         )
         # The CLI's own timeout is 30s (wiki_notify); the per-call budget must
-        # exceed it so its kill-the-child handler gets to run. The ceiling must
-        # cover the FULL capped queue (no truncation) and still fit inside
-        # run.sh's 135s force-kill grace.
+        # exceed it so its kill-the-child handler gets to run. Coalescing makes
+        # the worst case a FIXED 2 serialized calls — no depth to sample, so a
+        # notification scheduled but not yet started can't be under-budgeted.
+        # Must still fit inside run.sh's 95s force-kill grace.
         assert NOTIFY_DRAIN_BASE_SECONDS > 30, NOTIFY_DRAIN_BASE_SECONDS
-        worst_case = NOTIFY_DRAIN_BASE_SECONDS * tn.MAX_QUEUE_DEPTH
+        assert tn.MAX_SERIAL_SENDS == 2, tn.MAX_SERIAL_SENDS
+        worst_case = NOTIFY_DRAIN_BASE_SECONDS * tn.MAX_SERIAL_SENDS
         assert _notify_drain_max_seconds() == worst_case, \
-            "the drain ceiling must equal the worst case, not truncate it"
-        assert worst_case < 135, worst_case
-        print("✓ shutdown drain budget covers the full capped queue")
+            "the drain budget must equal the worst case, not truncate it"
+        assert worst_case < 95, worst_case
+        print("✓ shutdown drain budget is a fixed worst case, not a sampled depth")
 
         # ── 4) disabled config sends nothing ─────────────────────────────
         calls.clear()
