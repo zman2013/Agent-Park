@@ -76,13 +76,46 @@ python -m agentloop resume design.md --more-cycles 20
 ```
 python -m agentloop run design.md                       # 跑或续跑
 python -m agentloop run design.md --fresh               # 清 state/runs/todolist（保留 config.toml）
-python -m agentloop run design.md --review-plan         # planner 后暂停等回车
+python -m agentloop run design.md --review-plan         # 强制开启计划确认闸门
 python -m agentloop run design.md --max-cycles 50       # 覆盖 cycle 上限
 python -m agentloop run design.md --max-cost 2000       # 覆盖成本上限（CNY）
 python -m agentloop run design.md -v                    # 详细日志
 
 python -m agentloop resume design.md --more-cycles 20   # 已 exhausted，追加预算
 python -m agentloop status design.md                    # 进度表
+
+python -m agentloop approve --workspace <slug>          # 批准计划，之后 run 即开始执行
+python -m agentloop reject  --workspace <slug> --note "T-001 太大"
+```
+
+---
+
+## 计划确认闸门（默认开启）
+
+planner 产出 `todolist.md` 后，loop **不会**直接开跑，而是写下 `plan-review.json`
+并以 `AWAITING_REVIEW` 退出，等人确认。这不是阻塞等待——进程干净退出，状态全在
+workspace 里，几小时后再批准也没问题。
+
+```
+planner → todolist.md → [人工确认] → phase 1 (dev/qa 循环)
+```
+
+三种批准入口：agent-park UI 的批准按钮、飞书卡片、CLI `agentloop approve`。
+
+**审阅时该看什么**：不是 item 标题（它们看起来永远合理），而是**机器检查覆盖率**
+——哪些 dev item 没有任何检查能验证它。UI 与飞书卡片都会把这一项标红。
+
+**改计划比重新规划便宜**：直接编辑 `todolist.md` 再批准即可，批准时绑定的是编辑后
+的内容（`todolist_digest`）。批准之后文件再被改动 → 闸门自动退回 `awaiting`，
+需要重新批准，避免执行一份没人看过的计划。
+
+策略配置：
+
+```toml
+[review]
+plan = "always"          # 默认；每次规划后都要人工确认
+# plan = "never"          # 关闭闸门（等同旧行为）
+# plan = "when_unverified"  # 仅当存在"无机器检查覆盖"的 item 时才拦
 ```
 
 ---

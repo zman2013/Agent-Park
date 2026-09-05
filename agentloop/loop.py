@@ -26,6 +26,7 @@ from .agents import summarizer as summary_agent
 from .agents.base import RunResult
 from .config import AgentConfig
 from . import notify
+from . import plan_review
 from . import scheduler_writes as sw
 from .state import Decision, LoopState
 from .todolist import Attempt, Item, Todolist, TODOLIST_FILE, parse as parse_todolist, write as write_todolist
@@ -40,6 +41,10 @@ class ExitCode(Enum):
     EXHAUSTED = 1
     ERROR = 2
     PARTIAL_SUCCESS = 3
+    # Planner produced a plan; a human must approve it before phase 1 runs.
+    # Distinct from EXHAUSTED so the UI/manager can offer an approve action
+    # instead of presenting the run as a failure.
+    AWAITING_REVIEW = 4
 
 
 @dataclass
@@ -87,6 +92,7 @@ def run(
 
     # --- phase 0: planner ------------------------------------------------
     todolist_path = ws.todolist
+    planner_just_ran = False
     if not todolist_path.exists():
         logger.info("no todolist — running planner")
         planner_result = _run_planner_with_retry(
@@ -94,12 +100,29 @@ def run(
         )
         if planner_result is not None:
             return _finalize(ws, config, state, planner_result)
+        planner_just_ran = True
 
-        if config.review_plan:
-            try:
-                input("[agentloop] planner finished — press Enter to start the loop... ")
-            except EOFError:
-                pass
+    # --- plan-review gate -------------------------------------------------
+    # Opens right after a fresh plan lands, and is re-consulted on every
+    # resume. The loop *exits* while awaiting a human rather than blocking on
+    # stdin: the manager spawns us with stdin=DEVNULL, and a review may not
+    # happen for hours.
+    gate_enabled = _gate_enabled(config, parse_todolist(ws))
+    if planner_just_ran and gate_enabled:
+        review = plan_review.open_gate(ws, parse_todolist(ws))
+        logger.info(
+            "plan review gate opened: %d item(s), %d unverified",
+            review.stats.get("items", 0),
+            review.stats.get("unverified", 0),
+        )
+    if gate_enabled:
+        gate = plan_review.check_gate(ws, enabled=True)
+        if not gate.proceed:
+            state.save(ws)
+            return _finalize(
+                ws, config, state,
+                LoopResult(ExitCode.AWAITING_REVIEW, gate.reason),
+            )
 
     # --- phase 1: scheduling loop ---------------------------------------
     _startup_health(ws, state)
@@ -286,6 +309,25 @@ def run(
 
 
 # ----- helpers ------------------------------------------------------------
+
+
+def _gate_enabled(config: AgentConfig, todolist: Todolist) -> bool:
+    """Resolve the ``[review] plan`` policy against the current plan.
+
+    ``config.review_plan`` (the legacy ``--review-plan`` flag) forces the gate
+    on regardless of policy, so the flag keeps working — and now actually does
+    something in the manager path, where its ``input()`` implementation was
+    silently dead.
+    """
+    if config.review_plan:
+        return True
+    policy = config.review.plan
+    if policy == plan_review.POLICY_NEVER:
+        return False
+    if policy == plan_review.POLICY_ALWAYS:
+        return True
+    # when_unverified — gate only if some dev item lacks machine checks.
+    return bool(plan_review.summarize(todolist).get("unverified"))
 
 
 def _startup_health(ws: WorkspacePaths, state: LoopState) -> None:
@@ -834,7 +876,50 @@ _EXIT_TAGS = {
     ExitCode.PARTIAL_SUCCESS: "PARTIAL_SUCCESS",
     ExitCode.EXHAUSTED: "EXHAUSTED",
     ExitCode.ERROR: "ERROR",
+    ExitCode.AWAITING_REVIEW: "AWAITING_REVIEW",
 }
+
+
+def _notify_awaiting_review(
+    ws: WorkspacePaths,
+    config: AgentConfig,
+    state: LoopState,
+    result: LoopResult,
+) -> None:
+    """Push a Feishu card asking a human to review the plan.
+
+    Best-effort: a notification failure must not change the exit code. The
+    reviewer can always find the loop in the UI.
+    """
+    sc = config.summary_config
+    if not (sc.enabled and sc.feishu_enabled):
+        return
+    try:
+        todolist = parse_todolist(ws)
+        review = plan_review.PlanReview.load(ws)
+        if review is None or review.state != plan_review.AWAITING:
+            # Rejected / drifted gates aren't actionable review requests.
+            return
+        if review.notified_at:
+            # Already asked for this episode — a relaunch of a still-awaiting
+            # loop must not re-spam the reviewer.
+            return
+        try:
+            project_name = ws.workspace_dir.parent.parent.parent.name
+        except (AttributeError, IndexError):
+            project_name = ws.slug
+        message = notify.format_plan_review_card(
+            loop_slug=ws.slug,
+            project_name=project_name,
+            design_name=ws.design.name if ws.design.exists() else "(missing)",
+            items=todolist.items,
+            stats=review.stats,
+            reason=result.reason,
+        )
+        notify.send_feishu_card(sc.feishu, message)
+        plan_review.mark_notified(ws)
+    except Exception:  # noqa: BLE001 — terminal path, must not crash
+        logger.exception("plan review notification failed")
 
 
 def _finalize(
@@ -850,6 +935,13 @@ def _finalize(
     back to the caller — by the time we get here the scheduling decision is
     already final.
     """
+    if result.code == ExitCode.AWAITING_REVIEW:
+        # No work happened yet — running the summarizer LLM over an unexecuted
+        # plan would cost money to describe nothing. Send a review request
+        # instead, rendered straight from the todolist.
+        _notify_awaiting_review(ws, config, state, result)
+        return result
+
     sc = config.summary_config
     if not sc.enabled:
         return result

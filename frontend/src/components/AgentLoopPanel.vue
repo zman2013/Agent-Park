@@ -43,6 +43,66 @@
       >×</button>
     </div>
 
+    <!-- Plan review gate: the loop is paused until a human approves -->
+    <div
+      v-if="planReviewState === 'awaiting' || planReviewState === 'rejected'"
+      class="px-6 py-3 border-b shrink-0 text-xs"
+      :class="planReviewState === 'awaiting'
+        ? 'bg-amber-900/20 border-amber-800/40'
+        : 'bg-red-900/20 border-red-800/40'"
+    >
+      <div class="flex items-start gap-3">
+        <div class="flex-1 min-w-0">
+          <div class="font-semibold" :class="planReviewState === 'awaiting' ? 'text-amber-300' : 'text-red-300'">
+            {{ planReviewState === 'awaiting' ? '⏸ 待确认计划' : '🚫 计划已驳回' }}
+          </div>
+          <div class="mt-1 text-gray-400">
+            {{ planStats.items || 0 }} 项任务（dev {{ planStats.dev || 0 }} / qa {{ planStats.qa || 0 }}）
+          </div>
+          <!-- Coverage is the thing a human can actually judge; titles always
+               look plausible. Keep it visually loud. -->
+          <div v-if="planStats.unverified" class="mt-1 text-amber-300">
+            ⚠ {{ planStats.unverified }} 个 dev item 无机器检查覆盖：
+            <span class="font-mono">{{ (planStats.unverified_ids || []).join(', ') }}</span>
+          </div>
+          <div v-else-if="planStats.dev" class="mt-1 text-green-400">
+            ✓ 全部 dev item 均有机器检查覆盖
+          </div>
+          <div v-if="planReviewNote" class="mt-1 text-gray-500">备注：{{ planReviewNote }}</div>
+          <div v-if="planReviewState === 'rejected'" class="mt-1 text-gray-500">
+            可编辑 todolist 后批准，或用 <span class="font-mono">--fresh</span> 重新规划
+          </div>
+        </div>
+        <div class="flex flex-col gap-1 shrink-0">
+          <button
+            class="px-3 py-1 bg-green-700/70 hover:bg-green-700 text-green-50 rounded transition-colors disabled:opacity-50"
+            :disabled="reviewing"
+            @click="handleReview(true)"
+          >{{ reviewing ? '处理中...' : '批准并执行' }}</button>
+          <button
+            v-if="planReviewState === 'awaiting'"
+            class="px-3 py-1 bg-gray-700/70 hover:bg-gray-700 text-gray-200 rounded transition-colors disabled:opacity-50"
+            :disabled="reviewing"
+            @click="handleReview(false)"
+          >驳回</button>
+          <button
+            class="px-3 py-1 text-gray-500 hover:text-gray-300 transition-colors"
+            :title="editing ? '取消编辑' : '直接编辑 todolist.md，批准时绑定编辑后的版本'"
+            @click="toggleEdit"
+          >{{ editing ? '取消编辑' : '编辑计划' }}</button>
+        </div>
+      </div>
+      <textarea
+        v-if="editing"
+        v-model="editedTodolist"
+        spellcheck="false"
+        class="mt-2 w-full h-64 bg-[#0d0d0d] border border-gray-700 rounded p-2 font-mono text-[11px] text-gray-300 focus:outline-none focus:border-gray-500"
+      ></textarea>
+      <div v-if="editing" class="mt-1 text-gray-600">
+        批准时会保存并绑定以上内容；解析失败或没有 item 会被拒绝，原计划不受影响。
+      </div>
+    </div>
+
     <!-- Exhausted reason -->
     <div v-if="snap?.exhausted_reason" class="px-6 py-2 text-xs text-orange-300 bg-orange-900/20 border-b border-orange-800/40 shrink-0">
       ⚠ {{ snap.exhausted_reason }}
@@ -140,6 +200,9 @@ const selectedCycle = ref(null)
 const stopping = ref(false)
 const starting = ref(false)
 const browserOpen = ref(false)
+const reviewing = ref(false)
+const editing = ref(false)
+const editedTodolist = ref('')
 
 const snap = computed(() => store.agentloopSnapshot)
 const runLog = computed(() => store.agentloopRunLog)
@@ -155,6 +218,46 @@ const selectedRunActor = computed(() => selectedRun.value?.actor || '')
 const selectedRunItemId = computed(() => selectedRun.value?.item_id || '')
 
 const statusClass = computed(() => agentloopStatusColor(snap.value?.status))
+
+const planReview = computed(() => snap.value?.plan_review || null)
+// `consumed` / `approved` gates are not actionable — the banner only shows for
+// states that need a human.
+const planReviewState = computed(() => planReview.value?.state || null)
+const planStats = computed(() => planReview.value?.stats || {})
+const planReviewNote = computed(() => planReview.value?.note || '')
+
+function toggleEdit() {
+  if (editing.value) {
+    editing.value = false
+    return
+  }
+  editedTodolist.value = snap.value?.todolist?.raw || ''
+  editing.value = true
+}
+
+async function handleReview(approve) {
+  if (reviewing.value) return
+  // Rejecting without a reason regenerates the same flawed plan, so require one.
+  let note = null
+  if (!approve) {
+    note = window.prompt('驳回原因（会记录给下次 planner 参考）：')
+    if (note === null) return
+    if (!note.trim()) {
+      note = null
+    }
+  }
+  reviewing.value = true
+  try {
+    const ok = await store.reviewAgentLoopPlan(props.loopId, {
+      approve,
+      note,
+      todolist: editing.value ? editedTodolist.value : null,
+    })
+    if (ok) editing.value = false
+  } finally {
+    reviewing.value = false
+  }
+}
 
 function itemStatusClass(item) {
   switch (item.status) {

@@ -192,8 +192,16 @@ def run(design_path: Path) -> ExitCode:
 
     if not (cwd / "todolist.md").exists():
         run_agent("planner", cwd, None, config.planner)
-        if config.review_plan:
-            input("Press Enter to start loop...")
+        if gate_enabled(config):
+            plan_review.open_gate(ws, todolist)
+
+    # v4: plan-review gate — consulted on every run(), including resumes.
+    # Exits instead of blocking: the manager spawns us with stdin=DEVNULL and a
+    # human review may not happen for hours. See §6.1.
+    if gate_enabled(config):
+        gate = plan_review.check_gate(ws, enabled=True)
+        if not gate.proceed:
+            return AWAITING_REVIEW(gate.reason)
 
     while True:
         items = todolist.parse(cwd)
@@ -239,6 +247,72 @@ def run(design_path: Path) -> ExitCode:
 ```
 agentloop run design.md --max-cycles 50 --max-cost 2000
 ```
+
+---
+
+## 6.1 计划确认闸门（v4）
+
+planner 与 phase 1 之间插入一道人工确认。默认开启。
+
+### 为什么是文件闸门，而不是 `input()`
+
+原 `--review-plan` 调 `input()`，在**唯一真正重要的路径上是死的**：
+`agentloop_manager.start` 以 `stdin=subprocess.DEVNULL` 启动子进程，`input()`
+立刻抛 `EOFError` 并被 `except EOFError: pass` 吞掉。且阻塞会把进程钉在前台，
+而审阅可能发生在第二天早上。
+
+文件闸门两个问题都没有：loop 干净退出（`ExitCode.AWAITING_REVIEW`），恢复所需
+状态全在 workspace 里，批准可以来自 UI / 飞书 / CLI。
+
+### 状态机
+
+```
+(无文件) ──写入计划──▶ awaiting ──approve──▶ approved ──resume──▶ consumed
+                          ▲                                          │
+                          └────────── digest 不匹配 ──────────────────┘
+                          │
+                          └──reject──▶ rejected ──(--fresh)──▶ (无文件)
+```
+
+`plan-review.json` 字段：
+
+| 字段 | 含义 |
+|---|---|
+| `state` | `awaiting` / `approved` / `rejected` / `consumed` |
+| `todolist_digest` | 被批准的 todolist 原始字节 SHA-256 |
+| `stats` | items / dev / qa / unverified / unverified_ids |
+| `notified_at` | 本轮 awaiting 是否已通知（防重复推送） |
+
+### digest 绑定（关键）
+
+批准时**重新计算** digest，而不是沿用开闸时写下的值——这样"在 UI 里编辑计划再
+批准"就能正确绑定编辑后的内容。这是主要的"驳回"路径，比重跑 planner 便宜得多。
+
+恢复时重新校验：不匹配 → 退回 `awaiting`，而不是执行一份没人审过的计划。
+
+`consumed` 状态是必需的：进入 phase 1 后 loop 自己会改 todolist（status 推进、
+attempt_log 增长），digest 必然不再匹配。没有 `consumed`，每次 resume 都会误判
+成漂移并要求重新批准。
+
+### 审阅什么
+
+人在这道闸门上唯一的比较优势是**判断 oracle 够不够**——item 标题看起来永远合理，
+提供不了信号。所以 UI 与飞书卡片都突出显示"无机器检查覆盖的 dev item"。
+
+`stats.unverified` 目前等于全部 dev item（`checks` 字段尚不存在，evidence gate
+落地后才有）——这是诚实的答案：今天没有任何东西是机器可验证的。
+
+### 策略
+
+```toml
+[review]
+plan = "always"           # 默认
+# plan = "never"            # 关闭（等同 v3 行为）
+# plan = "when_unverified"  # 仅当存在无检查覆盖的 item 时才拦
+```
+
+`when_unverified` 让人工确认的频率随验证体系成熟度自动下降。
+`--review-plan` 标志强制开启，覆盖策略。
 
 ---
 
@@ -306,10 +380,12 @@ planner / dev: `cco`；qa: `ccs`；pm: 代码版。
 ```
 agentloop run design.md                    # 首次运行或续跑
 agentloop run design.md --fresh            # 删除 .agentloop/ 从零开始
-agentloop run design.md --review-plan      # planner 后暂停等回车
+agentloop run design.md --review-plan      # 强制开启计划确认闸门（见 §6.1）
 agentloop run design.md --max-cycles 50    # 覆盖 cycle 上限
 agentloop run design.md --max-cost 2000    # 覆盖成本上限
 
+agentloop approve --workspace <slug>       # 批准计划
+agentloop reject  --workspace <slug> --note "原因"
 agentloop resume --more-cycles 20          # 已 exhausted 后追加预算继续
 agentloop status                           # 显示当前 project 进度
 ```
