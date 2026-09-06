@@ -84,8 +84,10 @@ python -m agentloop run design.md -v                    # 详细日志
 python -m agentloop resume design.md --more-cycles 20   # 已 exhausted，追加预算
 python -m agentloop status design.md                    # 进度表
 
-python -m agentloop approve --workspace <slug>          # 批准计划，之后 run 即开始执行
+python -m agentloop approve --workspace <slug>          # 批准计划
 python -m agentloop reject  --workspace <slug> --note "T-001 太大"
+# 批准/驳回后按提示里打印的完整命令续跑——必须带 --workspace-dir，
+# 裸 `run <design>` 会生成新的时间戳 workspace，跑不到刚批准的计划。
 ```
 
 ---

@@ -117,6 +117,17 @@ def test_gate_with_unknown_state_derives_awaiting_review(workspace):
     assert plan_review.PlanReview.load(workspace) is None
 
 
+def test_gate_with_non_list_unverified_ids_derives_awaiting_review(workspace):
+    """The panel and the notification renderers both `join()` unverified_ids."""
+    plan_review.review_path(workspace).write_text(
+        '{"state": "awaiting", "stats": {"unverified": 1, "unverified_ids": 1}}',
+        encoding="utf-8",
+    )
+    state = {"cycle": 0, "last_decision": None}
+    assert m._derive_status_from_state(state, workspace) == "awaiting_review"
+    assert m._read_plan_review(workspace) == {"state": "unreadable"}
+
+
 def test_gate_with_non_mapping_stats_derives_awaiting_review(workspace):
     plan_review.review_path(workspace).write_text(
         '{"state": "approved", "stats": 1}', encoding="utf-8"

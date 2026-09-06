@@ -479,6 +479,50 @@ def test_unreadable_gate_recovery_advice_is_repair_not_delete(tmp_path: Path):
     assert "delete" not in reason
 
 
+def test_gate_with_non_list_unverified_ids_reads_as_unreadable(tmp_path: Path):
+    """The renderers all `join()` unverified_ids; a non-list must fail closed
+    rather than crash the notifier and the Vue panel mid-render."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    plan_review.review_path(ws).write_text(
+        '{"state": "awaiting", "stats": {"unverified": 1, "unverified_ids": 1}}',
+        encoding="utf-8",
+    )
+
+    assert plan_review.PlanReview.load(ws) is None
+    assert plan_review.check_gate(ws, enabled=True).proceed is False
+
+
+def test_stats_ok_accepts_what_summarize_produces(tmp_path: Path):
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    from agentloop.todolist import parse
+
+    assert plan_review.stats_ok(plan_review.summarize(parse(ws))) is True
+
+
+def test_stats_ok_rejects_non_int_counts():
+    assert plan_review.stats_ok({"items": "two"}) is False
+    assert plan_review.stats_ok({"unverified_ids": ["T-001", 2]}) is False
+    assert plan_review.stats_ok(1) is False
+
+
+def test_resume_cmd_carries_the_workspace(tmp_path: Path):
+    """Bare `run <design>` generates a new timestamped slug, so the printed
+    follow-up must name the workspace or the approved plan is never executed."""
+    from agentloop.cli import _resume_cmd
+
+    ws = _ws(tmp_path)
+    design = tmp_path / "design.md"
+    design.write_text("# Design\n", encoding="utf-8")
+    ws.design.symlink_to(design)
+
+    cmd = _resume_cmd(ws)
+
+    assert f"--workspace-dir {ws.workspace_dir}" in cmd
+    assert str(ws.design) in cmd
+
+
 def test_approve_without_gate_raises(tmp_path: Path):
     with pytest.raises(plan_review.PlanReviewError):
         plan_review.approve(_ws(tmp_path))

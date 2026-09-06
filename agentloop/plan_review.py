@@ -123,11 +123,14 @@ class PlanReview:
         if state not in VALID_STATES:
             return None
         stats = data.get("stats") or {}
-        if not isinstance(stats, dict):
-            # A hand-edited or older-schema gate whose `stats` isn't a mapping
-            # must read as unreadable, not raise out of load() — every caller
-            # (check_gate, the CLI, the notifier) expects None on bad input and
-            # would otherwise crash instead of failing closed.
+        if not stats_ok(stats):
+            # A hand-edited or older-schema gate whose `stats` don't match the
+            # shape `summarize()` produces must read as unreadable, not raise
+            # out of load() — every caller (check_gate, the CLI, the notifier)
+            # expects None on bad input and would otherwise crash instead of
+            # failing closed. The renderers in particular `", ".join()` the
+            # unverified_ids, so a non-list there breaks notification and the
+            # Vue panel mid-render (hiding the approval controls).
             return None
         return cls(
             state=state,
@@ -160,6 +163,27 @@ class PlanReview:
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
         tmp.replace(path)
+
+
+def stats_ok(stats: Any) -> bool:
+    """Whether ``stats`` matches the shape :func:`summarize` produces.
+
+    Only the fields the renderers actually touch are checked — the counts must
+    be ints and ``unverified_ids`` must be a list of strings, because the Feishu
+    card, the source-task message, and the Vue panel all ``join()`` it.
+    """
+    if not isinstance(stats, dict):
+        return False
+    for key in ("items", "dev", "qa", "unverified"):
+        if key in stats and not isinstance(stats[key], int):
+            return False
+    ids = stats.get("unverified_ids")
+    if ids is not None:
+        if not isinstance(ids, list):
+            return False
+        if any(not isinstance(i, str) for i in ids):
+            return False
+    return True
 
 
 def gate_file_present(ws: WorkspacePaths) -> bool:

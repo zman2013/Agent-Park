@@ -252,10 +252,11 @@ def _read_plan_review(ws: WorkspacePaths) -> dict[str, Any] | None:
     recovery controls, while Start just repeats the same fail-closed exit.
     """
     try:
-        from agentloop.plan_review import PLAN_REVIEW_FILE, VALID_STATES
+        from agentloop.plan_review import PLAN_REVIEW_FILE, VALID_STATES, stats_ok
     except ImportError:
         PLAN_REVIEW_FILE = "plan-review.json"
         VALID_STATES = {"awaiting", "approved", "rejected", "consumed"}
+        stats_ok = lambda s: isinstance(s, dict)  # noqa: E731
     path = ws.workspace_dir / PLAN_REVIEW_FILE
     if not path.exists():
         return None
@@ -270,7 +271,7 @@ def _read_plan_review(ws: WorkspacePaths) -> dict[str, Any] | None:
     # recovery banner rather than falling through to `stopped`.
     if str(data.get("state") or "") not in VALID_STATES:
         return {"state": "unreadable"}
-    if not isinstance(data.get("stats") or {}, dict):
+    if not stats_ok(data.get("stats") or {}):
         return {"state": "unreadable"}
     return data
 

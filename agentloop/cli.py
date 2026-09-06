@@ -427,7 +427,7 @@ def _cmd_review(args: argparse.Namespace) -> int:
                 f"[agentloop] plan approved ({updated.stats.get('items', 0)} items, "
                 f"digest {updated.todolist_digest[:12]}…)"
             )
-            print("[agentloop] run `agentloop run <design>` to start the loop.")
+            print(f"[agentloop] run `{_resume_cmd(ws)}` to start the loop.")
         else:
             updated = plan_review.reject(ws, note=args.note)
             print("[agentloop] plan rejected.")
@@ -435,12 +435,24 @@ def _cmd_review(args: argparse.Namespace) -> int:
                 print(f"[agentloop] note saved to {plan_review.REJECTION_NOTE_FILE}")
             print(
                 "[agentloop] edit todolist.md and approve, or re-plan with "
-                "`agentloop run <design> --fresh`."
+                f"`{_resume_cmd(ws)} --fresh`."
             )
     except plan_review.PlanReviewError as e:
         print(f"[agentloop] {e}", file=sys.stderr)
         return 2
     return 0
+
+
+def _resume_cmd(ws: WorkspacePaths) -> str:
+    """The exact ``run`` invocation that resumes *this* workspace.
+
+    Must carry ``--workspace-dir``: bare ``agentloop run <design>`` calls
+    ``generate_slug`` and lands in a brand-new timestamped workspace, so the
+    approved plan (and the preserved ``plan-rejection.md``) would never be seen
+    — a fresh planner and a fresh gate would run instead.
+    """
+    design = ws.design if ws.design.exists() else Path("<design>")
+    return f"agentloop run {design} --workspace-dir {ws.workspace_dir}"
 
 
 def _report_result(result: scheduler.LoopResult) -> int:
