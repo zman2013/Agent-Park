@@ -100,7 +100,8 @@ workspace 里，几小时后再批准也没问题。
 planner → todolist.md → [人工确认] → phase 1 (dev/qa 循环)
 ```
 
-三种批准入口：agent-park UI 的批准按钮、飞书卡片、CLI `agentloop approve`。
+两种批准入口：agent-park UI 的批准按钮、CLI `agentloop approve`。飞书卡片只做
+通知——它把待审的计划推给评审人并引导其到 UI 操作，卡片本身没有批准动作。
 
 **审阅时该看什么**：不是 item 标题（它们看起来永远合理），而是**机器检查覆盖率**
 ——哪些 dev item 没有任何检查能验证它。UI 与飞书卡片都会把这一项标红。

@@ -89,6 +89,30 @@ def test_no_gate_file_preserves_legacy_derivation(workspace):
     assert m._derive_status_from_state(state) == "exhausted"
 
 
+def test_unreadable_gate_derives_awaiting_review(workspace):
+    """The scheduler fails closed on a corrupt gate; the manager must surface
+    that as a paused state, not `stopped` — otherwise the panel hides the
+    recovery UI and Start just repeats the same exit."""
+    plan_review.review_path(workspace).write_text('{"state": "appro', encoding="utf-8")
+    state = {"cycle": 0, "last_decision": None}
+    assert m._derive_status_from_state(state, workspace) == "awaiting_review"
+    assert m._read_plan_review(workspace) == {"state": "unreadable"}
+
+
+def test_gate_with_invalid_utf8_derives_awaiting_review(workspace):
+    plan_review.review_path(workspace).write_bytes(b'{"state": "approved", "n": "\xff"}')
+    state = {"cycle": 0, "last_decision": None}
+    assert m._derive_status_from_state(state, workspace) == "awaiting_review"
+
+
+def test_gate_with_non_mapping_stats_derives_awaiting_review(workspace):
+    plan_review.review_path(workspace).write_text(
+        '{"state": "approved", "stats": 1}', encoding="utf-8"
+    )
+    state = {"cycle": 0, "last_decision": None}
+    assert m._derive_status_from_state(state, workspace) == "awaiting_review"
+
+
 def test_awaiting_review_is_notifiable():
     """The gate is the one status that *requires* human action — must notify."""
     assert "awaiting_review" in m._NOTIFIABLE_STATUSES

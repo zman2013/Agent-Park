@@ -244,7 +244,13 @@ def _read_state(ws: WorkspacePaths) -> dict[str, Any] | None:
 
 
 def _read_plan_review(ws: WorkspacePaths) -> dict[str, Any] | None:
-    """Read the workspace's plan-review gate file, or None when absent."""
+    """Read the workspace's plan-review gate file.
+
+    Returns ``None`` when no gate exists, and a synthetic ``unreadable`` entry
+    when the file is there but corrupt. Collapsing the two would report the
+    loop as ``stopped`` — the panel would hide the review banner and its
+    recovery controls, while Start just repeats the same fail-closed exit.
+    """
     try:
         from agentloop.plan_review import PLAN_REVIEW_FILE
     except ImportError:
@@ -254,9 +260,13 @@ def _read_plan_review(ws: WorkspacePaths) -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    return data if isinstance(data, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"state": "unreadable"}
+    if not isinstance(data, dict):
+        return {"state": "unreadable"}
+    if not isinstance(data.get("stats") or {}, dict):
+        return {"state": "unreadable"}
+    return data
 
 
 def _derive_status_from_state(state: dict[str, Any] | None, ws: WorkspacePaths | None = None) -> str:
@@ -271,7 +281,9 @@ def _derive_status_from_state(state: dict[str, Any] | None, ws: WorkspacePaths |
         review = _read_plan_review(ws)
         if review:
             gate_state = str(review.get("state") or "")
-            if gate_state == "awaiting":
+            if gate_state in ("awaiting", "unreadable"):
+                # `unreadable` is a paused state too: the loop refuses to run
+                # until a human fixes or deletes the gate file.
                 return "awaiting_review"
             if gate_state == "rejected":
                 return "plan_rejected"
@@ -1064,6 +1076,16 @@ def _render_completion_message(
     paused = status in _PAUSED_STATUSES
     if paused:
         review = _read_plan_review(ws) if isinstance(ws, WorkspacePaths) else None
+        if (review or {}).get("state") == "unreadable":
+            # Neither approve nor reject can act on a corrupt gate, so don't
+            # point the reviewer at buttons that will just error.
+            return (
+                "## ⛔ AgentLoop 计划闸门文件损坏\n\n"
+                f"- **workspace**: `{workspace_dir}`\n"
+                f"- **loop_id**: `{loop_id}`\n\n"
+                "`plan-review.json` 无法解析，loop 拒绝执行未经批准的计划。"
+                "请修复或删除该文件后重新启动；用 `--fresh` 可重新规划。\n"
+            )
         stats = (review or {}).get("stats") or {}
         lines = [
             f"## ⏸️ AgentLoop 等待人工确认（{emoji} {label}）",

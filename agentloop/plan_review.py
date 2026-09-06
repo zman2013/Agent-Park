@@ -13,8 +13,9 @@ was swallowed. Blocking also pins a process in the foreground for as long as
 the human takes to review — hours, if the review happens the next morning.
 
 A file gate has neither problem: the loop exits cleanly, the workspace holds
-all the state needed to resume, and approval can arrive from the UI, the CLI,
-or a Feishu reply.
+all the state needed to resume, and approval can arrive from the UI or the CLI.
+(The Feishu card is notification-only — it pushes the review request and points
+the reviewer at the UI; there is no inbound card action.)
 
 Digest binding
 --------------
@@ -114,7 +115,7 @@ class PlanReview:
             return None
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             return None
         if not isinstance(data, dict):
             return None

@@ -43,6 +43,21 @@
       >×</button>
     </div>
 
+    <!-- Corrupt gate file: neither approve nor reject can act on it. The loop
+         fails closed on every start, so the only way out is a human fixing or
+         deleting the file — say so instead of showing dead buttons. -->
+    <div
+      v-if="planReviewState === 'unreadable'"
+      class="px-6 py-3 border-b shrink-0 text-xs bg-red-900/20 border-red-800/40"
+    >
+      <div class="font-semibold text-red-300">⛔ 计划闸门文件损坏</div>
+      <div class="mt-1 text-gray-400">
+        <span class="font-mono">plan-review.json</span> 无法解析，loop 拒绝执行未经批准的计划。
+        请修复或删除该文件后重新启动；用
+        <span class="font-mono">--fresh</span> 可重新规划。
+      </div>
+    </div>
+
     <!-- Plan review gate: the loop is paused until a human approves -->
     <div
       v-if="planReviewState === 'awaiting' || planReviewState === 'rejected'"

@@ -442,6 +442,18 @@ def test_gate_with_non_mapping_stats_reads_as_unreadable(tmp_path: Path):
     assert "unreadable" in gate.reason
 
 
+def test_gate_with_invalid_utf8_reads_as_unreadable(tmp_path: Path):
+    """Byte-level corruption must fail closed, not raise UnicodeDecodeError."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    plan_review.review_path(ws).write_bytes(b'{"state": "approved", "note": "\xff\xfe"}')
+
+    assert plan_review.PlanReview.load(ws) is None
+    gate = plan_review.check_gate(ws, enabled=True)
+    assert gate.proceed is False
+    assert "unreadable" in gate.reason
+
+
 def test_approve_without_gate_raises(tmp_path: Path):
     with pytest.raises(plan_review.PlanReviewError):
         plan_review.approve(_ws(tmp_path))
