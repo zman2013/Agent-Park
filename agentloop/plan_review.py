@@ -202,19 +202,43 @@ def approve(ws: WorkspacePaths, *, note: str | None = None) -> PlanReview:
     Re-digesting at approval time (rather than trusting the digest written when
     the gate opened) is what makes "edit the plan in the UI, then approve" work
     — the reviewer's edits become the approved plan.
+
+    The plan is validated first. Approving an empty or structurally invalid
+    todolist is worse than an error: the file exists, so the next run skips the
+    planner, consumes the approval, PM immediately returns ``done``, and the
+    loop reports SUCCESS having executed nothing. Same invariant the planner's
+    output must satisfy — at least one parseable item.
     """
     review = PlanReview.load(ws)
     if review is None:
+        if gate_file_present(ws):
+            raise PlanReviewError(f"{PLAN_REVIEW_FILE} is unreadable")
         raise PlanReviewError("no plan-review.json in this workspace")
     if review.state == CONSUMED:
         raise PlanReviewError("plan already approved and consumed by a running loop")
+    parsed = _require_valid_plan(ws)
     review.state = APPROVED
     review.reviewed_at = _utcnow()
     review.note = note
     review.todolist_digest = todolist_digest(ws)
-    review.stats = review.stats or {}
+    review.stats = summarize(parsed)
     review.save(ws)
     return review
+
+
+def _require_valid_plan(ws: WorkspacePaths) -> Todolist:
+    """Parse ``todolist.md`` or raise :class:`PlanReviewError`."""
+    if not ws.todolist.exists():
+        raise PlanReviewError("no todolist.md to approve")
+    from .todolist import parse as parse_todolist
+
+    try:
+        parsed = parse_todolist(ws)
+    except Exception as e:  # noqa: BLE001 — any parse failure is a bad plan
+        raise PlanReviewError(f"todolist.md does not parse: {e}") from e
+    if not parsed.items:
+        raise PlanReviewError("todolist.md contains no items")
+    return parsed
 
 
 def reject(ws: WorkspacePaths, *, note: str | None = None) -> PlanReview:
@@ -227,7 +251,14 @@ def reject(ws: WorkspacePaths, *, note: str | None = None) -> PlanReview:
     """
     review = PlanReview.load(ws)
     if review is None:
+        if gate_file_present(ws):
+            raise PlanReviewError(f"{PLAN_REVIEW_FILE} is unreadable")
         raise PlanReviewError("no plan-review.json in this workspace")
+    if review.state == CONSUMED:
+        # A stale reject arriving after the loop already ran must not flip a
+        # finished workspace back to `rejected` — status derivation prioritizes
+        # the gate, so a completed run would be presented as plan_rejected.
+        raise PlanReviewError("plan already approved and consumed by a running loop")
     review.state = REJECTED
     review.reviewed_at = _utcnow()
     review.note = note

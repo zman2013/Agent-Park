@@ -271,6 +271,51 @@ def test_when_unverified_gates_because_no_checks_exist_yet(gated, monkeypatch):
     assert calls == ["planner"]
 
 
+def test_open_gate_is_consulted_even_when_policy_would_not_reopen_it(
+    gated, monkeypatch
+):
+    """The policy decides whether to *open* a gate, never whether to honor one.
+
+    Under ``when_unverified``, an edit that leaves no unverified dev items would
+    otherwise flip the policy off and skip the awaiting check entirely — running
+    the unapproved edit.
+    """
+    ws, design, calls = gated
+    monkeypatch.setattr(
+        AgentConfig,
+        "load",
+        classmethod(lambda cls, d: _quiet_config("when_unverified")),
+    )
+
+    assert scheduler.run(design, ws=ws).code is ExitCode.AWAITING_REVIEW
+
+    # Strip the dev item so summarize() reports 0 unverified → policy says
+    # "don't gate". The awaiting gate on disk must still stop us.
+    ws.todolist.write_text(
+        """---
+project: demo
+design_doc: design.md
+created_at: 2026-09-05T00:00:00Z
+cycle: 0
+---
+
+# Todolist
+
+## Items
+
+### T-002 · type:qa · status:pending
+Verify something
+- dependencies: []
+""",
+        encoding="utf-8",
+    )
+
+    result = scheduler.run(design, ws=ws)
+
+    assert result.code is ExitCode.AWAITING_REVIEW
+    assert calls == ["planner"], "phase 1 must not run on an unapproved edit"
+
+
 # ---------- config parsing ------------------------------------------------
 
 
@@ -353,6 +398,97 @@ def test_save_leaves_no_partial_file_behind(tmp_path: Path):
 def test_approve_without_gate_raises(tmp_path: Path):
     with pytest.raises(plan_review.PlanReviewError):
         plan_review.approve(_ws(tmp_path))
+
+
+def test_approve_refuses_an_empty_plan(tmp_path: Path):
+    """Approving an empty todolist would report SUCCESS having done nothing:
+    the file exists so the planner is skipped, PM immediately says done."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    plan_review.PlanReview(state=plan_review.AWAITING).save(ws)
+    ws.todolist.write_text("", encoding="utf-8")
+
+    with pytest.raises(plan_review.PlanReviewError, match="no items"):
+        plan_review.approve(ws)
+
+    assert plan_review.PlanReview.load(ws).state == plan_review.AWAITING
+
+
+def test_approve_refuses_a_missing_plan(tmp_path: Path):
+    ws = _ws(tmp_path)
+    plan_review.PlanReview(state=plan_review.AWAITING).save(ws)
+
+    with pytest.raises(plan_review.PlanReviewError, match="no todolist"):
+        plan_review.approve(ws)
+
+
+def test_approve_refreshes_stats_from_the_approved_plan(tmp_path: Path):
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    plan_review.PlanReview(state=plan_review.AWAITING, stats={"items": 99}).save(ws)
+
+    review = plan_review.approve(ws)
+
+    assert review.stats["items"] == 2
+
+
+def test_reject_on_a_consumed_gate_raises(tmp_path: Path):
+    """A stale reject must not flip a finished loop's gate back to rejected —
+    status derivation prioritizes the gate over the terminal state."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    plan_review.PlanReview(state=plan_review.CONSUMED).save(ws)
+
+    with pytest.raises(plan_review.PlanReviewError, match="consumed"):
+        plan_review.reject(ws, note="too late")
+
+    assert plan_review.PlanReview.load(ws).state == plan_review.CONSUMED
+    assert not plan_review.rejection_note_path(ws).exists()
+
+
+# ---------- notification retry --------------------------------------------
+
+
+def test_failed_card_send_does_not_suppress_the_retry(gated, monkeypatch):
+    ws, design, calls = gated
+    cfg = _quiet_config()
+    cfg.summary_config = SummaryConfig(
+        enabled=True, feishu_enabled=True, feishu=FeishuConfig()
+    )
+    cfg.review.plan = "always"
+    monkeypatch.setattr(AgentConfig, "load", classmethod(lambda cls, d: cfg))
+
+    sends: list[int] = []
+    monkeypatch.setattr(
+        scheduler.notify, "send_feishu_card", lambda c, m: sends.append(1) or False
+    )
+
+    scheduler.run(design, ws=ws)
+    assert plan_review.PlanReview.load(ws).notified_at is None
+
+    scheduler.run(design, ws=ws)
+    assert len(sends) == 2, "a failed send must be retried on relaunch"
+
+
+def test_successful_card_send_suppresses_the_retry(gated, monkeypatch):
+    ws, design, calls = gated
+    cfg = _quiet_config()
+    cfg.summary_config = SummaryConfig(
+        enabled=True, feishu_enabled=True, feishu=FeishuConfig()
+    )
+    cfg.review.plan = "always"
+    monkeypatch.setattr(AgentConfig, "load", classmethod(lambda cls, d: cfg))
+
+    sends: list[int] = []
+    monkeypatch.setattr(
+        scheduler.notify, "send_feishu_card", lambda c, m: sends.append(1) or True
+    )
+
+    scheduler.run(design, ws=ws)
+    assert plan_review.PlanReview.load(ws).notified_at
+
+    scheduler.run(design, ws=ws)
+    assert len(sends) == 1, "a delivered card must not be re-sent"
 
 
 # ---------- rejection feedback survives --fresh ---------------------------

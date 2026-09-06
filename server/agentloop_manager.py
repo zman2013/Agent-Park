@@ -540,13 +540,15 @@ def review_plan(
     # consumed review request must fail without having replaced the persisted
     # plan, and rejection must never overwrite it at all — the UI sends the
     # editor contents whenever edit mode is open, but we promise edits are
-    # saved on approval only.
+    # saved on approval only. The consumed check covers rejection too: flipping
+    # a finished loop's gate to `rejected` would make status derivation present
+    # a completed run as plan_rejected.
     gate = pr.PlanReview.load(ws)
     if gate is None:
         if pr.gate_file_present(ws):
             raise ValueError(f"{pr.PLAN_REVIEW_FILE} is unreadable in this workspace")
         raise ValueError("no plan-review.json in this workspace")
-    if approve and gate.state == pr.CONSUMED:
+    if gate.state == pr.CONSUMED:
         raise ValueError("plan already approved and consumed by a running loop")
 
     if approve and todolist is not None:

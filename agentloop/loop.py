@@ -107,15 +107,21 @@ def run(
     # resume. The loop *exits* while awaiting a human rather than blocking on
     # stdin: the manager spawns us with stdin=DEVNULL, and a review may not
     # happen for hours.
-    gate_enabled = _gate_enabled(config, parse_todolist(ws))
-    if planner_just_ran and gate_enabled:
+    # The policy decides whether to *open* a gate; an already-open gate is
+    # consulted unconditionally. Recomputing the policy against the current
+    # plan would let an edit that removes every unverified dev item flip
+    # `when_unverified` to false and skip the awaiting/digest checks entirely,
+    # executing the unapproved edit.
+    gate_exists = plan_review.gate_file_present(ws)
+    if planner_just_ran and not gate_exists and _gate_enabled(config, parse_todolist(ws)):
         review = plan_review.open_gate(ws, parse_todolist(ws))
+        gate_exists = True
         logger.info(
             "plan review gate opened: %d item(s), %d unverified",
             review.stats.get("items", 0),
             review.stats.get("unverified", 0),
         )
-    if gate_enabled:
+    if gate_exists:
         gate = plan_review.check_gate(ws, enabled=True)
         if not gate.proceed:
             state.save(ws)
@@ -931,8 +937,14 @@ def _notify_awaiting_review(
             stats=review.stats,
             reason=result.reason,
         )
-        notify.send_feishu_card(sc.feishu, message)
-        plan_review.mark_notified(ws)
+        # Only suppress the retry when the card actually went out. Marking on a
+        # failed send (nonzero feishu-bot exit / timeout) permanently silences
+        # the request for this episode, and a CLI-created loop with no source
+        # task has no other channel — it would sit paused unnoticed.
+        if notify.send_feishu_card(sc.feishu, message):
+            plan_review.mark_notified(ws)
+        else:
+            logger.warning("plan review card send failed; will retry on relaunch")
     except Exception:  # noqa: BLE001 — terminal path, must not crash
         logger.exception("plan review notification failed")
 

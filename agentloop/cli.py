@@ -409,9 +409,13 @@ def _cmd_review(args: argparse.Namespace) -> int:
 
     review = plan_review.PlanReview.load(ws)
     if review is None:
+        detail = (
+            f"{plan_review.PLAN_REVIEW_FILE} is unreadable"
+            if plan_review.gate_file_present(ws)
+            else f"no {plan_review.PLAN_REVIEW_FILE}"
+        )
         print(
-            f"[agentloop] no {plan_review.PLAN_REVIEW_FILE} in {ws.workspace_dir} "
-            "— nothing to review",
+            f"[agentloop] {detail} in {ws.workspace_dir} — nothing to review",
             file=sys.stderr,
         )
         return 2

@@ -248,6 +248,27 @@ def test_consumed_gate_rejects_edit_before_writing(
     assert "Implement the thing" in workspace.todolist.read_text(encoding="utf-8")
 
 
+def test_stale_reject_against_consumed_gate_is_refused(
+    workspace, registry, tmp_path, monkeypatch
+):
+    """A reject arriving after the loop finished must not present a completed
+    run as plan_rejected (status derivation prioritizes the gate)."""
+    from agentloop.todolist import parse
+
+    plan_review.open_gate(workspace, parse(workspace))
+    plan_review.approve(workspace)
+    plan_review.consume(workspace)
+    m._upsert(_entry(workspace, tmp_path))
+
+    with pytest.raises(ValueError, match="consumed"):
+        m.review_plan("loop-1", approve=False, note="too late")
+
+    assert plan_review.PlanReview.load(workspace).state == plan_review.CONSUMED
+    assert not plan_review.rejection_note_path(workspace).exists()
+    state = {"cycle": 12, "last_decision": {"next": "done"}}
+    assert m._derive_status_from_state(state, workspace) == "done"
+
+
 def test_corrupt_gate_rejects_edit_before_writing(
     workspace, registry, tmp_path, monkeypatch
 ):
