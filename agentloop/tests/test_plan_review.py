@@ -334,6 +334,18 @@ def test_config_rejects_unknown_policy_and_keeps_default(tmp_path: Path):
     assert AgentConfig.load(tmp_path).review.plan == "always"
 
 
+def test_unknown_policy_resets_rather_than_inheriting_never(tmp_path: Path):
+    """A workspace typo layered over an inherited `never` must reset to the
+    safe default, not keep the disabled gate."""
+    cfg = AgentConfig()
+    cfg.review.plan = "never"  # as if inherited from a global config
+    (tmp_path / "config.toml").write_text(
+        '[review]\nplan = "nevr"\n', encoding="utf-8"
+    )
+    cfg._merge_from(tmp_path / "config.toml")
+    assert cfg.review.plan == "always"
+
+
 def test_review_plan_flag_forces_gate_on(tmp_path: Path):
     cfg = _quiet_config("never")
     cfg.review_plan = True

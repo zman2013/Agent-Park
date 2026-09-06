@@ -230,6 +230,25 @@ def test_reject_records_status_and_does_not_relaunch(
     assert plan_review.PlanReview.load(workspace).state == plan_review.REJECTED
 
 
+def test_reject_clears_notified_at_so_the_source_task_hears_about_it(
+    workspace, registry, tmp_path, monkeypatch
+):
+    """The awaiting_review notification already stamped notified_at; keeping it
+    would make notify_source_task skip plan_rejected, leaving the original
+    conversation stuck showing the plan as awaiting approval."""
+    from agentloop.todolist import parse
+
+    plan_review.open_gate(workspace, parse(workspace))
+    entry = _entry(workspace, tmp_path)
+    assert entry["notified_at"], "fixture models an already-notified loop"
+    m._upsert(entry)
+    monkeypatch.setattr(m, "start", lambda **kw: {"status": "running"})
+
+    m.review_plan("loop-1", approve=False, note="T-001 太大")
+
+    assert m._find("loop-1")["notified_at"] is None
+
+
 def test_review_refuses_while_process_alive(
     workspace, registry, tmp_path, monkeypatch
 ):

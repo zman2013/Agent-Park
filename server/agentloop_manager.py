@@ -602,7 +602,17 @@ def review_plan(
         raise ValueError(str(e)) from e
 
     if not approve:
-        updated = _update_fields(loop_id, status="plan_rejected", reviewed_at=_utcnow())
+        # Clear ``notified_at``: the source task was very likely already told
+        # about the `awaiting_review` episode, and keeping the stamp makes
+        # ``notify_source_task`` skip the newly-notifiable `plan_rejected`
+        # status — the original conversation would sit forever showing the plan
+        # as awaiting approval, never learning a re-plan is needed.
+        updated = _update_fields(
+            loop_id,
+            status="plan_rejected",
+            reviewed_at=_utcnow(),
+            notified_at=None,
+        )
         return _summary(updated or entry)
 
     # Relaunch against the same workspace slug. ``start`` is idempotent on a

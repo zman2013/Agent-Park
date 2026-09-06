@@ -22,6 +22,7 @@ from .workspace import CONFIG_FILE, AGENTLOOP_DIR
 # Kept local to avoid a circular import: plan_review imports todolist which
 # imports workspace; config is imported by plan_review's caller (loop).
 _VALID_REVIEW_POLICIES = {"always", "never", "when_unverified"}
+_DEFAULT_REVIEW_POLICY = "always"
 
 
 @dataclass
@@ -79,7 +80,7 @@ class ReviewConfig:
     burning 60 cycles, and one click is cheaper than one runaway.
     """
 
-    plan: str = "always"
+    plan: str = _DEFAULT_REVIEW_POLICY
 
 
 @dataclass
@@ -139,11 +140,15 @@ class AgentConfig:
         review = data.get("review", {})
         if "plan" in review:
             policy = str(review["plan"] or "").strip().lower()
-            # Unknown policy strings fall back to the default rather than
+            # An unknown policy string resets to the default rather than
             # silently disabling the gate — a typo'd `plan = "nevr"` must not
-            # turn 60 unattended cycles loose.
-            if policy in _VALID_REVIEW_POLICIES:
-                self.review.plan = policy
+            # turn 60 unattended cycles loose. Reset rather than *keep* the
+            # inherited value: a workspace typo layered over a global
+            # `plan = "never"` would otherwise inherit the disabled gate,
+            # which is exactly the outcome the fallback exists to prevent.
+            self.review.plan = (
+                policy if policy in _VALID_REVIEW_POLICIES else _DEFAULT_REVIEW_POLICY
+            )
 
         agents = data.get("agents", {})
         for role in ("planner", "dev", "qa", "summary", "pm"):
