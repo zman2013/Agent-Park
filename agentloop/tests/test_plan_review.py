@@ -317,8 +317,114 @@ def test_corrupt_gate_file_reads_as_absent(tmp_path: Path):
     ws = _ws(tmp_path)
     plan_review.review_path(ws).write_text("{not json", encoding="utf-8")
     assert plan_review.PlanReview.load(ws) is None
+    # ...but the file's *presence* is still observable, which is what lets
+    # check_gate fail closed instead of reading it as "no gate".
+    assert plan_review.gate_file_present(ws) is True
+
+
+def test_corrupt_gate_file_fails_closed(tmp_path: Path):
+    """A truncated gate must never let an unapproved plan execute."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    plan_review.review_path(ws).write_text('{"state": "appro', encoding="utf-8")
+
+    gate = plan_review.check_gate(ws, enabled=True)
+
+    assert gate.proceed is False
+    assert "unreadable" in gate.reason
+
+
+def test_missing_gate_file_still_proceeds(tmp_path: Path):
+    """Legacy workspaces (planner ran before the gate existed) are unaffected."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    assert plan_review.check_gate(ws, enabled=True).proceed is True
+
+
+def test_save_leaves_no_partial_file_behind(tmp_path: Path):
+    """save() is atomic: the temp file is renamed, not left as a sibling."""
+    ws = _ws(tmp_path)
+    plan_review.PlanReview(state=plan_review.AWAITING).save(ws)
+    leftovers = [p.name for p in ws.workspace_dir.iterdir() if p.suffix == ".tmp"]
+    assert leftovers == []
+    assert plan_review.PlanReview.load(ws).state == plan_review.AWAITING
 
 
 def test_approve_without_gate_raises(tmp_path: Path):
     with pytest.raises(plan_review.PlanReviewError):
         plan_review.approve(_ws(tmp_path))
+
+
+# ---------- rejection feedback survives --fresh ---------------------------
+
+
+def test_fresh_preserves_rejection_note(gated, monkeypatch):
+    """--fresh must not delete the reviewer's reason for the last rejection."""
+    ws, design, calls = gated
+    monkeypatch.setattr(AgentConfig, "load", classmethod(lambda cls, d: _quiet_config()))
+
+    scheduler.run(design, ws=ws)
+    plan_review.reject(ws, note="T-001 太大，拆成三个")
+
+    scheduler.run(design, fresh=True, ws=ws)
+
+    # The planner re-ran (todolist was wiped), and got the note in its prompt.
+    assert calls == ["planner", "planner"]
+    # Consumed after the successful re-plan so it isn't re-injected forever.
+    assert not plan_review.rejection_note_path(ws).exists()
+
+
+def test_planner_prompt_carries_the_rejection_note(tmp_path: Path, monkeypatch):
+    ws = _ws(tmp_path)
+    design = tmp_path / "design.md"
+    design.write_text("# Design\n", encoding="utf-8")
+    plan_review.rejection_note_path(ws).write_text(
+        "# Plan rejected\n\nT-001 太大，拆成三个\n", encoding="utf-8"
+    )
+
+    seen: dict[str, str] = {}
+
+    def fake_run_agent(role, ws_, item, backend, prompt):
+        seen["prompt"] = prompt
+        from agentloop.agents.base import RunResult
+
+        return RunResult(
+            stream_json_path=Path("/dev/null"),
+            duration_sec=0.0,
+            cost_cny=0.0,
+            success=True,
+        )
+
+    from agentloop.agents import planner as planner_agent
+
+    monkeypatch.setattr(planner_agent, "run_agent", fake_run_agent)
+    planner_agent.run(ws, _quiet_config().planner, design)
+
+    assert "拆成三个" in seen["prompt"]
+    assert "驳回" in seen["prompt"]
+
+
+def test_planner_prompt_omits_section_without_a_note(tmp_path: Path, monkeypatch):
+    ws = _ws(tmp_path)
+    design = tmp_path / "design.md"
+    design.write_text("# Design\n", encoding="utf-8")
+
+    seen: dict[str, str] = {}
+
+    def fake_run_agent(role, ws_, item, backend, prompt):
+        seen["prompt"] = prompt
+        from agentloop.agents.base import RunResult
+
+        return RunResult(
+            stream_json_path=Path("/dev/null"),
+            duration_sec=0.0,
+            cost_cny=0.0,
+            success=True,
+        )
+
+    from agentloop.agents import planner as planner_agent
+
+    monkeypatch.setattr(planner_agent, "run_agent", fake_run_agent)
+    planner_agent.run(ws, _quiet_config().planner, design)
+
+    assert "驳回" not in seen["prompt"]

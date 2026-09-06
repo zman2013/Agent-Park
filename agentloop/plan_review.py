@@ -105,8 +105,9 @@ class PlanReview:
     def load(cls, ws: WorkspacePaths) -> "PlanReview | None":
         """Read the gate file. Returns ``None`` when absent or unreadable.
 
-        A corrupt file is treated as absent so a truncated write (crash
-        mid-``write_text``) re-plans rather than wedging the workspace.
+        Callers that make a *safety* decision must not conflate the two:
+        ``check_gate`` pairs this with :func:`gate_file_present` so a corrupt
+        file keeps the loop waiting instead of being read as "no gate".
         """
         path = review_path(ws)
         if not path.exists():
@@ -142,9 +143,25 @@ class PlanReview:
             "stats": self.stats,
             "notified_at": self.notified_at,
         }
-        path.write_text(
+        # Atomic: write a sibling temp file then rename. A crash mid-write must
+        # never leave a truncated gate file behind — a half-written file reads
+        # as unparseable, and `check_gate` then has to keep the loop waiting
+        # (fail closed) even though the plan may already be approved.
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(
             json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        tmp.replace(path)
+
+
+def gate_file_present(ws: WorkspacePaths) -> bool:
+    """Whether a gate file exists on disk, regardless of whether it parses.
+
+    ``PlanReview.load`` returns ``None`` both for "no gate was ever opened"
+    and "the gate is there but corrupt". Only the first may proceed into
+    phase 1; this separates them.
+    """
+    return review_path(ws).exists()
 
 
 def summarize(todolist: Todolist) -> dict[str, Any]:
@@ -274,10 +291,23 @@ def check_gate(ws: WorkspacePaths, *, enabled: bool) -> GateCheck:
 
     review = PlanReview.load(ws)
     if review is None:
-        # No gate file: either the policy was just turned on for a workspace
-        # mid-flight, or the planner ran before this feature existed. Opening
-        # a gate here would demand approval for a plan already in progress, so
-        # only gate when nothing has happened yet.
+        if gate_file_present(ws):
+            # The file is there but unreadable (truncated / hand-edited /
+            # invalid state). Fail closed: treating it as "no gate" would let
+            # an unapproved plan execute, which is the one outcome this module
+            # exists to prevent. A human can delete the file or re-plan with
+            # --fresh to get out.
+            return GateCheck(
+                proceed=False,
+                reason=(
+                    f"{PLAN_REVIEW_FILE} is unreadable — refusing to execute an "
+                    "unapproved plan; delete it or re-plan with --fresh"
+                ),
+            )
+        # No gate file at all: either the policy was just turned on for a
+        # workspace mid-flight, or the planner ran before this feature existed.
+        # Opening a gate here would demand approval for a plan already in
+        # progress, so only gate when nothing has happened yet.
         return GateCheck(proceed=True, reason="no gate file")
 
     if review.state == CONSUMED:

@@ -505,7 +505,8 @@ def review_plan(
     ``todolist`` optionally replaces ``todolist.md`` before the gate is bound,
     so a reviewer can correct the plan and approve in one atomic call. The
     approval digest covers the written content, which is what the loop verifies
-    on startup.
+    on startup. It is honored on approval only — a rejection leaves the
+    persisted plan untouched.
 
     On approval the loop process is relaunched against the same workspace: the
     todolist and state.json are still on disk, so the planner is skipped and
@@ -535,7 +536,20 @@ def review_plan(
     if not isinstance(ws, WorkspacePaths):
         raise ValueError("legacy workspace layout does not support plan review")
 
-    if todolist is not None:
+    # Validate the gate *before* touching todolist.md. A stale or already
+    # consumed review request must fail without having replaced the persisted
+    # plan, and rejection must never overwrite it at all — the UI sends the
+    # editor contents whenever edit mode is open, but we promise edits are
+    # saved on approval only.
+    gate = pr.PlanReview.load(ws)
+    if gate is None:
+        if pr.gate_file_present(ws):
+            raise ValueError(f"{pr.PLAN_REVIEW_FILE} is unreadable in this workspace")
+        raise ValueError("no plan-review.json in this workspace")
+    if approve and gate.state == pr.CONSUMED:
+        raise ValueError("plan already approved and consumed by a running loop")
+
+    if approve and todolist is not None:
         # Validate before overwriting: an unparseable todolist would wedge the
         # loop on its next start, and the reviewer would have lost the plan.
         try:

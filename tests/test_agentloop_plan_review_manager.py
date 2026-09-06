@@ -211,6 +211,56 @@ def test_review_unknown_loop_returns_none(registry):
     assert m.review_plan("nope", approve=True) is None
 
 
+def test_reject_never_overwrites_the_plan(
+    workspace, registry, tmp_path, monkeypatch
+):
+    """The UI sends editor contents whenever edit mode is open; rejection must
+    leave the persisted plan alone (we only promise edits are saved on approval).
+    """
+    from agentloop.todolist import parse
+
+    plan_review.open_gate(workspace, parse(workspace))
+    m._upsert(_entry(workspace, tmp_path))
+    monkeypatch.setattr(m, "start", lambda **kw: {"status": "running"})
+
+    edited = TODOLIST.replace("Implement the thing", "half-typed edit")
+    m.review_plan("loop-1", approve=False, note="拆细", todolist=edited)
+
+    assert "Implement the thing" in workspace.todolist.read_text(encoding="utf-8")
+
+
+def test_consumed_gate_rejects_edit_before_writing(
+    workspace, registry, tmp_path, monkeypatch
+):
+    """A stale approve against a consumed gate must fail *before* clobbering."""
+    from agentloop.todolist import parse
+
+    plan_review.open_gate(workspace, parse(workspace))
+    plan_review.approve(workspace)
+    plan_review.consume(workspace)
+    m._upsert(_entry(workspace, tmp_path))
+    monkeypatch.setattr(m, "start", lambda **kw: {"status": "running"})
+
+    edited = TODOLIST.replace("Implement the thing", "stale editor contents")
+    with pytest.raises(ValueError, match="consumed"):
+        m.review_plan("loop-1", approve=True, todolist=edited)
+
+    assert "Implement the thing" in workspace.todolist.read_text(encoding="utf-8")
+
+
+def test_corrupt_gate_rejects_edit_before_writing(
+    workspace, registry, tmp_path, monkeypatch
+):
+    plan_review.review_path(workspace).write_text('{"state": "appro', encoding="utf-8")
+    m._upsert(_entry(workspace, tmp_path))
+    monkeypatch.setattr(m, "start", lambda **kw: {"status": "running"})
+
+    with pytest.raises(ValueError, match="unreadable"):
+        m.review_plan("loop-1", approve=True, todolist="corrupt-driven overwrite\n")
+
+    assert "Implement the thing" in workspace.todolist.read_text(encoding="utf-8")
+
+
 def test_summary_exposes_plan_review(workspace, registry, tmp_path):
     from agentloop.todolist import parse
 

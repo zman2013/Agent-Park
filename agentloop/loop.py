@@ -424,6 +424,13 @@ def _run_planner_with_retry(
         try:
             validate_transition(before, after, "planner", None)
             if result.success:
+                # The rejection note has now been folded into a plan; drop it so
+                # a later --fresh doesn't re-inject feedback about a plan two
+                # generations old.
+                try:
+                    plan_review.rejection_note_path(ws).unlink()
+                except FileNotFoundError:
+                    pass
                 state.save(ws)
                 return None
             last_error = "planner failed (non-zero exit or stream error)"
@@ -847,18 +854,26 @@ def _wipe_agentloop_state(ws: WorkspacePaths) -> None:
     ``--fresh`` resets this workspace's todolist, state.json, and runs logs
     without erasing its per-workspace ``config.toml`` (seeded by the CLI /
     manager before the run), its ``design.md`` link (pointing at the real
-    spec the user passed in), nor any sibling workspace under
-    ``<cwd>/.agentloop/workspaces/``.
+    spec the user passed in), the ``plan-rejection.md`` note (the reviewer's
+    reason for sending the last plan back — the whole point of ``--fresh``
+    after a rejection is to re-plan *with* that feedback), nor any sibling
+    workspace under ``<cwd>/.agentloop/workspaces/``.
     """
     ws_dir = ws.workspace_dir
     if not ws_dir.exists():
         ws_dir.mkdir(parents=True, exist_ok=True)
         return
-    # Preserve config.toml and design.md across the wipe — both are put in
-    # place by the caller just before the run starts, and naively rmtree-ing
-    # the whole workspace would drop them (breaking per-workspace config
-    # overrides and making the spec unreachable from the subprocess cwd).
-    preserve = {ws.config_file.name, ws.design.name}
+    # Preserve config.toml, design.md and plan-rejection.md across the wipe.
+    # config.toml/design.md are put in place by the caller just before the run
+    # starts, and naively rmtree-ing the whole workspace would drop them
+    # (breaking per-workspace config overrides and making the spec unreachable
+    # from the subprocess cwd). plan-rejection.md must survive because the
+    # planner reads it on the next run.
+    preserve = {
+        ws.config_file.name,
+        ws.design.name,
+        plan_review.REJECTION_NOTE_FILE,
+    }
     for child in ws_dir.iterdir():
         if child.name in preserve:
             continue
