@@ -33,9 +33,14 @@ print(c.get('frontend',{}).get('port',3000))
 # 僵尸进程 kill -0 仍返回成功，但实际已死，必须视为「未运行」
 is_zombie() {
     local pid="$1"
-    local state
-    # /proc/<pid>/stat 第 3 个字段是进程状态，Z 表示僵尸
-    state=$(awk '{print $3}' "/proc/$pid/stat" 2>/dev/null) || return 1
+    local stat_text state
+    # /proc/<pid>/stat 第 2 个字段 comm 是带括号的进程名，且可能含空格
+    # （frontend 实际为 "(npm exec vite -)"），所以 awk '{print $3}' 会取到
+    # comm 内部的词而不是状态。必须从最后一个 ") " 之后切，剩余部分的第 1
+    # 个字段才是进程状态，Z 表示僵尸。
+    stat_text=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    state=${stat_text##*') '}
+    state=${state%% *}
     [ "$state" = "Z" ]
 }
 
@@ -199,7 +204,10 @@ stop_one() {
     kill "$pid"
 
     local count=0
-    while kill -0 "$pid" 2>/dev/null; do
+    # 僵尸进程 kill -0 永远返回成功，只判 kill -0 会白等满整个 grace
+    # （backend 的 grace 是 95s）再无意义地 kill -9 一个已死的进程。
+    # 进程已退出但未被 reap 时同样视为已停止。
+    while kill -0 "$pid" 2>/dev/null && ! is_zombie "$pid"; do
         sleep 1
         count=$((count + 1))
         if [ "$count" -ge "$grace" ]; then

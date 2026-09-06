@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shlex
 import shutil
 import sys
 from pathlib import Path
 
 from . import loop as scheduler
+from . import plan_review
 from .config import AgentConfig, seed_workspace_config
 from .state import LoopState
 from .todolist import parse as parse_todolist
@@ -79,6 +81,31 @@ def main(argv: list[str] | None = None) -> int:
     p_resume.add_argument("--more-cycles", type=int, default=20)
     p_resume.add_argument("--more-cost", type=float, default=None)
 
+    # approve / reject take no design argument — the workspace already holds a
+    # design.md link, and the reviewer identifies the loop by workspace.
+    for name, help_text in (
+        ("approve", "Approve the planned todolist so the loop may run."),
+        ("reject", "Reject the plan; record a note for the next planner run."),
+    ):
+        p = sub.add_parser(name, help=help_text)
+        p.add_argument(
+            "--workspace-dir",
+            type=Path,
+            default=None,
+            dest="workspace_dir",
+            help="Absolute path to the workspace directory.",
+        )
+        p.add_argument(
+            "--project-root",
+            type=Path,
+            default=None,
+            dest="project_root",
+            help="Project root under which .agentloop/workspaces/<slug>/ lives.",
+        )
+        p.add_argument("--workspace", default=None, help="Workspace slug.")
+        p.add_argument("--note", default=None, help="Reviewer note.")
+        p.add_argument("-v", "--verbose", action="store_true")
+
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -92,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_resume(args)
     if args.command == "status":
         return _cmd_status(args)
+    if args.command in ("approve", "reject"):
+        return _cmd_review(args)
 
     parser.print_help()
     return 2
@@ -298,7 +327,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         max_cost_cny=args.max_cost_cny,
         ws=ws,
     )
-    return _report_result(result)
+    return _report_result(result, ws)
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
@@ -323,7 +352,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         max_cost_cny=new_cost,
         ws=ws,
     )
-    return _report_result(result)
+    return _report_result(result, ws)
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -339,6 +368,18 @@ def _cmd_status(args: argparse.Namespace) -> int:
     print(f"rollbacks: {len(state.rollbacks)}")
     if state.exhausted_reason:
         print(f"exhausted: {state.exhausted_reason}")
+    review = plan_review.PlanReview.load(ws)
+    if review is not None:
+        line = f"plan review: {review.state}"
+        if review.state == plan_review.AWAITING:
+            unverified = review.stats.get("unverified") or 0
+            line += f" — {review.stats.get('items', 0)} items"
+            if unverified:
+                line += f", {unverified} without machine checks"
+            line += "  (run `agentloop approve` to start)"
+        elif review.note:
+            line += f" — {review.note}"
+        print(line)
     if state.last_decision:
         d = state.last_decision
         print(f"last decision: {d.next} {d.item_id or ''} — {d.reason}")
@@ -355,14 +396,102 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def _report_result(result: scheduler.LoopResult) -> int:
+def _cmd_review(args: argparse.Namespace) -> int:
+    """Approve or reject a pending plan.
+
+    Approving only flips the gate file; it deliberately does *not* relaunch the
+    loop. In CLI mode the human runs ``agentloop run`` again (or the manager
+    relaunches on the API path), which keeps the "who spawns processes"
+    responsibility in one place.
+    """
+    ws = _resolve_workspace_for_existing(args)
+    if ws is None:
+        return 2
+
+    review = plan_review.PlanReview.load(ws)
+    if review is None:
+        detail = (
+            f"{plan_review.PLAN_REVIEW_FILE} is unreadable"
+            if plan_review.gate_file_present(ws)
+            else f"no {plan_review.PLAN_REVIEW_FILE}"
+        )
+        print(
+            f"[agentloop] {detail} in {ws.workspace_dir} — nothing to review",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        if args.command == "approve":
+            updated = plan_review.approve(ws, note=args.note)
+            print(
+                f"[agentloop] plan approved ({updated.stats.get('items', 0)} items, "
+                f"digest {updated.todolist_digest[:12]}…)"
+            )
+            print(f"[agentloop] run `{_resume_cmd(ws)}` to start the loop.")
+        else:
+            updated = plan_review.reject(ws, note=args.note)
+            print("[agentloop] plan rejected.")
+            if updated.note:
+                print(f"[agentloop] note saved to {plan_review.REJECTION_NOTE_FILE}")
+            print(
+                "[agentloop] edit todolist.md and approve, or re-plan with "
+                f"`{_resume_cmd(ws)} --fresh`."
+            )
+    except plan_review.PlanReviewError as e:
+        print(f"[agentloop] {e}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def _agentloop_cmd(*argv: str) -> str:
+    """A copy-pasteable ``python -m agentloop ...`` invocation.
+
+    There is no console-script entry point in ``pyproject.toml`` — the supported
+    invocation everywhere is ``python -m agentloop`` — so a bare ``agentloop``
+    would just be ``command not found``. Uses the running interpreter so a venv
+    is respected, and ``shlex.join`` so paths with spaces survive the copy.
+    """
+    return shlex.join([sys.executable, "-m", "agentloop", *argv])
+
+
+def _resume_cmd(ws: WorkspacePaths) -> str:
+    """The exact ``run`` invocation that resumes *this* workspace.
+
+    Must carry ``--workspace-dir``: bare ``run <design>`` calls
+    ``generate_slug`` and lands in a brand-new timestamped workspace, so the
+    approved plan (and the preserved ``plan-rejection.md``) would never be seen
+    — a fresh planner and a fresh gate would run instead.
+    """
+    design = str(ws.design) if ws.design.exists() else "<design>"
+    return _agentloop_cmd("run", design, "--workspace-dir", str(ws.workspace_dir))
+
+
+def _report_result(
+    result: scheduler.LoopResult, ws: WorkspacePaths | None = None
+) -> int:
     tag = {
         scheduler.ExitCode.SUCCESS: "SUCCESS",
         scheduler.ExitCode.PARTIAL_SUCCESS: "PARTIAL_SUCCESS",
         scheduler.ExitCode.EXHAUSTED: "EXHAUSTED",
         scheduler.ExitCode.ERROR: "ERROR",
-    }[result.code]
+        scheduler.ExitCode.AWAITING_REVIEW: "AWAITING_REVIEW",
+    }.get(result.code, result.code.name)
     print(f"[agentloop] {tag}: {result.reason}")
+    if result.code is scheduler.ExitCode.AWAITING_REVIEW:
+        # `run` may have auto-generated a timestamped slug that we never printed,
+        # so a literal `--workspace <slug>` placeholder is unusable — `approve`
+        # would resolve against cwd and, with several workspaces present, refuse
+        # to guess. Print the resolved path.
+        target = (
+            f"`{_agentloop_cmd('approve', '--workspace-dir', str(ws.workspace_dir))}`"
+            if ws is not None
+            else "`approve --workspace <slug>`"
+        )
+        print(
+            f"[agentloop] review the plan in todolist.md, then run {target} "
+            "(or approve in the UI)."
+        )
     return result.code.value
 
 

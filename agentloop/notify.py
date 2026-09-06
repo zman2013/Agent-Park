@@ -52,6 +52,54 @@ def format_summary_card(
     return "\n".join(header) + "\n\n---\n" + summary_md.strip() + "\n"
 
 
+def format_plan_review_card(
+    *,
+    loop_slug: str,
+    project_name: str,
+    design_name: str,
+    items: list,
+    stats: dict,
+    reason: str = "",
+) -> str:
+    """Render the plan-review request card.
+
+    The reviewer's job is to judge whether the oracle coverage is good enough,
+    so ``checks`` (or its conspicuous absence) is the emphasized column — not
+    the item titles, which always look plausible and carry little signal.
+    """
+    header = [
+        f"⏸️ agentloop 待确认计划 — {loop_slug}\n",
+        f"**项目**: {project_name}",
+        f"**Design**: {design_name}",
+        f"**任务**: {stats.get('items', 0)} 项"
+        f"（dev {stats.get('dev', 0)} / qa {stats.get('qa', 0)}）",
+    ]
+    unverified = int(stats.get("unverified") or 0)
+    if unverified:
+        ids = ", ".join(stats.get("unverified_ids") or [])
+        header.append(f"**⚠️ 无机器检查覆盖**: {unverified} 个 dev item（{ids}）")
+    else:
+        header.append("**检查覆盖**: 全部 dev item 均有机器检查 ✅")
+
+    lines = []
+    for it in items:
+        checks = getattr(it, "checks", None)
+        mark = ", ".join(checks) if checks else "⚠️ 无"
+        lines.append(f"- `{it.id}` {it.type} — {it.title}")
+        if it.type == "dev":
+            lines.append(f"    checks: {mark}")
+
+    footer = [
+        "",
+        "---",
+        "在 agent-park UI 中**批准**后 loop 才会开始执行；",
+        "也可以先在 UI 里直接编辑 todolist.md，批准时会绑定编辑后的版本。",
+    ]
+    if reason:
+        footer.insert(0, f"_{reason}_")
+    return "\n".join(header) + "\n\n---\n" + "\n".join(lines) + "\n" + "\n".join(footer) + "\n"
+
+
 def send_feishu_card(cfg: FeishuConfig, message: str) -> bool:
     """Send ``message`` via the feishu-bot CLI.
 

@@ -103,6 +103,39 @@ async def stop_loop(loop_id: str):
     return entry
 
 
+class ReviewBody(BaseModel):
+    approve: bool
+    note: str | None = None
+    # Optional edited todolist.md content. Written before the gate is bound so
+    # the approval digest covers the reviewer's edits — this is the "fix the
+    # plan myself" path, and doing it in one call means the loop can't be
+    # relaunched between the write and the approval.
+    todolist: str | None = None
+
+
+@router.post("/{loop_id}/review")
+async def review_plan(loop_id: str, body: ReviewBody):
+    """Approve or reject a loop's pending plan.
+
+    On approval the loop is relaunched against the same workspace and resumes
+    at phase 1 (the planner is not re-run).
+    """
+    try:
+        entry = agentloop_manager.review_plan(
+            loop_id,
+            approve=body.approve,
+            note=body.note,
+            todolist=body.todolist,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"failed to review plan: {e}")
+    if entry is None:
+        raise HTTPException(404, "agentloop not found")
+    return entry
+
+
 @router.post("/{loop_id}/dismiss")
 async def dismiss_loop(loop_id: str):
     entry = agentloop_manager.dismiss(loop_id)

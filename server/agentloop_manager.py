@@ -243,8 +243,57 @@ def _read_state(ws: WorkspacePaths) -> dict[str, Any] | None:
         return None
 
 
-def _derive_status_from_state(state: dict[str, Any] | None) -> str:
-    """Infer a finished loop's status from its state.json."""
+def _read_plan_review(ws: WorkspacePaths) -> dict[str, Any] | None:
+    """Read the workspace's plan-review gate file.
+
+    Returns ``None`` when no gate exists, and a synthetic ``unreadable`` entry
+    when the file is there but corrupt. Collapsing the two would report the
+    loop as ``stopped`` — the panel would hide the review banner and its
+    recovery controls, while Start just repeats the same fail-closed exit.
+    """
+    try:
+        from agentloop.plan_review import PLAN_REVIEW_FILE, VALID_STATES, stats_ok
+    except ImportError:
+        PLAN_REVIEW_FILE = "plan-review.json"
+        VALID_STATES = {"awaiting", "approved", "rejected", "consumed"}
+        stats_ok = lambda s: isinstance(s, dict)  # noqa: E731
+    path = ws.workspace_dir / PLAN_REVIEW_FILE
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {"state": "unreadable"}
+    if not isinstance(data, dict):
+        return {"state": "unreadable"}
+    # Mirror PlanReview.load's acceptance criteria exactly: anything it rejects
+    # makes the scheduler fail closed, so the manager must show the paused
+    # recovery banner rather than falling through to `stopped`.
+    if str(data.get("state") or "") not in VALID_STATES:
+        return {"state": "unreadable"}
+    if not stats_ok(data.get("stats") or {}):
+        return {"state": "unreadable"}
+    return data
+
+
+def _derive_status_from_state(state: dict[str, Any] | None, ws: WorkspacePaths | None = None) -> str:
+    """Infer a finished loop's status from its state.json (+ gate file).
+
+    The plan-review gate is checked *first*: a loop that exited awaiting human
+    approval has no ``exhausted_reason`` and no ``done`` decision, so without
+    this branch it would be reported as ``stopped`` — indistinguishable from a
+    user-initiated kill, and the UI would offer no approve action.
+    """
+    if ws is not None:
+        review = _read_plan_review(ws)
+        if review:
+            gate_state = str(review.get("state") or "")
+            if gate_state in ("awaiting", "unreadable"):
+                # `unreadable` is a paused state too: the loop refuses to run
+                # until a human fixes or deletes the gate file.
+                return "awaiting_review"
+            if gate_state == "rejected":
+                return "plan_rejected"
     if not state:
         return "unknown"
     if state.get("exhausted_reason"):
@@ -463,6 +512,121 @@ def dismiss(loop_id: str) -> dict[str, Any] | None:
     return _update_fields(loop_id, dismissed=True)
 
 
+def review_plan(
+    loop_id: str,
+    *,
+    approve: bool,
+    note: str | None = None,
+    todolist: str | None = None,
+) -> dict[str, Any] | None:
+    """Approve or reject a loop's pending plan.
+
+    ``todolist`` optionally replaces ``todolist.md`` before the gate is bound,
+    so a reviewer can correct the plan and approve in one atomic call. The
+    approval digest covers the written content, which is what the loop verifies
+    on startup. It is honored on approval only — a rejection leaves the
+    persisted plan untouched.
+
+    On approval the loop process is relaunched against the same workspace: the
+    todolist and state.json are still on disk, so the planner is skipped and
+    execution resumes at phase 1.
+
+    Returns the refreshed entry, or ``None`` when ``loop_id`` is unknown.
+    Raises ``ValueError`` when there is no gate to act on, or when the loop is
+    still running (approving mid-flight would spawn a second process against
+    one workspace).
+    """
+    entry = _find(loop_id)
+    if not entry:
+        return None
+
+    pid = int(entry.get("pid") or 0)
+    if _pid_matches(pid, entry.get("pid_start_time")):
+        raise ValueError(
+            "loop process is still running — stop it before reviewing the plan"
+        )
+
+    ws = _entry_workspace(entry)
+    try:
+        from agentloop import plan_review as pr
+    except ImportError as e:  # pragma: no cover - packaging error
+        raise ValueError(f"agentloop package unavailable: {e}") from e
+
+    if not isinstance(ws, WorkspacePaths):
+        raise ValueError("legacy workspace layout does not support plan review")
+
+    # Validate the gate *before* touching todolist.md. A stale or already
+    # consumed review request must fail without having replaced the persisted
+    # plan, and rejection must never overwrite it at all — the UI sends the
+    # editor contents whenever edit mode is open, but we promise edits are
+    # saved on approval only. The consumed check covers rejection too: flipping
+    # a finished loop's gate to `rejected` would make status derivation present
+    # a completed run as plan_rejected.
+    gate = pr.PlanReview.load(ws)
+    if gate is None:
+        if pr.gate_file_present(ws):
+            raise ValueError(f"{pr.PLAN_REVIEW_FILE} is unreadable in this workspace")
+        raise ValueError("no plan-review.json in this workspace")
+    if gate.state == pr.CONSUMED:
+        raise ValueError("plan already approved and consumed by a running loop")
+
+    if approve and todolist is not None:
+        # Validate before overwriting: an invalid todolist would wedge the loop
+        # on its next start, and the reviewer would have lost the plan. Same
+        # invariant `pr.approve` enforces (planner shape: unique ids, known
+        # types/statuses, nothing already done) — applied here so a bad edit
+        # never reaches disk.
+        try:
+            from agentloop.todolist import Todolist, parse_text
+            from agentloop.validator import validate_transition
+        except ImportError:
+            parse_text = None
+        if parse_text is not None:
+            try:
+                parsed = parse_text(todolist)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"edited todolist does not parse: {e}") from e
+            if not parsed.items:
+                raise ValueError("edited todolist contains no items")
+            try:
+                validate_transition(Todolist(), parsed, "planner", None)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"edited todolist is not a valid plan: {e}") from e
+        ws.todolist.write_text(todolist, encoding="utf-8")
+
+    try:
+        if approve:
+            pr.approve(ws, note=note)
+        else:
+            pr.reject(ws, note=note)
+    except pr.PlanReviewError as e:
+        raise ValueError(str(e)) from e
+
+    if not approve:
+        # Clear ``notified_at``: the source task was very likely already told
+        # about the `awaiting_review` episode, and keeping the stamp makes
+        # ``notify_source_task`` skip the newly-notifiable `plan_rejected`
+        # status — the original conversation would sit forever showing the plan
+        # as awaiting approval, never learning a re-plan is needed.
+        updated = _update_fields(
+            loop_id,
+            status="plan_rejected",
+            reviewed_at=_utcnow(),
+            notified_at=None,
+        )
+        return _summary(updated or entry)
+
+    # Relaunch against the same workspace slug. ``start`` is idempotent on a
+    # running loop and reuses an existing workspace dir, so this resumes rather
+    # than creating a sibling.
+    return start(
+        cwd=entry["cwd"],
+        design_path=entry.get("design_path"),
+        source_task_id=entry.get("source_task_id"),
+        workspace=entry.get("workspace"),
+    )
+
+
 def _refresh_status(entry: dict[str, Any]) -> dict[str, Any]:
     """Reconcile an entry's ``status`` field with actual process/state on disk."""
     pid = int(entry.get("pid") or 0)
@@ -472,7 +636,7 @@ def _refresh_status(entry: dict[str, Any]) -> dict[str, Any]:
 
     if entry.get("status") == "running":
         if not _pid_matches(pid, expected_st):
-            derived = _derive_status_from_state(state)
+            derived = _derive_status_from_state(state, ws)
             _update_fields(entry["loop_id"], status=derived, stopped_at=_utcnow())
             entry["status"] = derived
 
@@ -576,7 +740,7 @@ def restore_orphan_loops() -> list[str]:
             continue
         ws = _entry_workspace(entry)
         state = _read_state(ws)
-        derived = _derive_status_from_state(state)
+        derived = _derive_status_from_state(state, ws)
         _update_fields(loop_id, status=derived, stopped_at=_utcnow())
         results.append(loop_id)
     return results
@@ -759,6 +923,7 @@ def _summary(entry: dict[str, Any]) -> dict[str, Any]:
         out["total_cost_cny"] = 0.0
         out["exhausted_reason"] = None
     out["cwd_basename"] = Path(entry["cwd"]).name
+    out["plan_review"] = _read_plan_review(ws)
     return out
 
 
@@ -767,12 +932,12 @@ def _read_todolist(ws: WorkspacePaths) -> dict[str, Any]:
     try:
         from agentloop.todolist import parse as parse_todolist
     except ImportError:
-        return {"metadata": {}, "items": []}
+        return {"metadata": {}, "items": [], "raw": ""}
     try:
         tl = parse_todolist(ws)
     except Exception:
         logger.exception("Failed to parse todolist for %s", ws.todolist)
-        return {"metadata": {}, "items": []}
+        return {"metadata": {}, "items": [], "raw": ""}
     items = []
     for it in tl.items:
         items.append(
@@ -791,7 +956,14 @@ def _read_todolist(ws: WorkspacePaths) -> dict[str, Any]:
                 ],
             }
         )
-    return {"metadata": dict(tl.metadata), "items": items}
+    # ``raw`` backs the plan-review editor: the reviewer edits the actual file
+    # content (which is what the approval digest binds to), not a re-serialized
+    # projection of the parsed model.
+    try:
+        raw = ws.todolist.read_text(encoding="utf-8")
+    except OSError:
+        raw = ""
+    return {"metadata": dict(tl.metadata), "items": items, "raw": raw}
 
 
 def _list_runs(ws: WorkspacePaths) -> list[dict[str, Any]]:
@@ -856,7 +1028,16 @@ _STATUS_DISPLAY: dict[str, tuple[str, str]] = {
     "exhausted": ("⏱️", "资源耗尽"),
     "error": ("❌", "失败"),
     "unknown": ("❓", "未知"),
+    # The gate states are notifiable on purpose: they are the only statuses
+    # that *require* a human action before anything else can happen, so the
+    # source task must be told rather than left waiting on a silent loop.
+    "awaiting_review": ("⏸️", "待确认计划"),
+    "plan_rejected": ("🚫", "计划被驳回"),
 }
+
+# Statuses where the loop is paused pending human input rather than finished.
+# ``_render_completion_message`` swaps its header for these.
+_PAUSED_STATUSES = frozenset({"awaiting_review", "plan_rejected"})
 
 # Statuses that warrant notification. ``stopped`` is excluded on purpose:
 # the user explicitly asked the loop to stop, so they don't need a poke.
@@ -908,6 +1089,44 @@ def _render_completion_message(
     workspace_dir = entry.get("workspace_dir") or str(ws.workspace_dir)
     design_path = entry.get("design_path") or str(ws.design)
     loop_id = entry.get("loop_id", "")
+
+    paused = status in _PAUSED_STATUSES
+    if paused:
+        review = _read_plan_review(ws) if isinstance(ws, WorkspacePaths) else None
+        if (review or {}).get("state") == "unreadable":
+            # Neither approve nor reject can act on a corrupt gate, so don't
+            # point the reviewer at buttons that will just error.
+            return (
+                "## ⛔ AgentLoop 计划闸门文件损坏\n\n"
+                f"- **workspace**: `{workspace_dir}`\n"
+                f"- **loop_id**: `{loop_id}`\n\n"
+                "`plan-review.json` 无法解析，loop 拒绝执行未经批准的计划。"
+                "请修复该文件后重新启动，或用 `--fresh` 重新规划。"
+                "**不要只删除该文件**——todolist 还在，删掉闸门会让下次启动"
+                "直接跑一份没人批准的计划。\n"
+            )
+        stats = (review or {}).get("stats") or {}
+        lines = [
+            f"## ⏸️ AgentLoop 等待人工确认（{emoji} {label}）",
+            "",
+            f"- **计划**: {stats.get('items', 0)} 项"
+            f"（dev {stats.get('dev', 0)} / qa {stats.get('qa', 0)}）",
+        ]
+        unverified = int(stats.get("unverified") or 0)
+        if unverified:
+            ids = ", ".join(stats.get("unverified_ids") or [])
+            lines.append(f"- **⚠️ 无机器检查覆盖**: {unverified} 个 dev item（{ids}）")
+        if (review or {}).get("note"):
+            lines.append(f"- **备注**: {review['note']}")
+        lines += [
+            f"- **workspace**: `{workspace_dir}`",
+            f"- **design**: `{design_path}`",
+            f"- **loop_id**: `{loop_id}`",
+            "",
+            "在左侧 AgentLoop 面板审阅 `todolist.md` 后点击**批准**即可开始执行；"
+            "也可以先直接编辑 todolist，批准时会绑定编辑后的版本。",
+        ]
+        return "\n".join(lines) + "\n"
 
     lines = [
         f"## 🎯 AgentLoop 已结束（{emoji} {label}）",

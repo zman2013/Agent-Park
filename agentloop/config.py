@@ -19,6 +19,11 @@ except ModuleNotFoundError:  # pragma: no cover - 3.10 fallback
 from .state import Limits
 from .workspace import CONFIG_FILE, AGENTLOOP_DIR
 
+# Kept local to avoid a circular import: plan_review imports todolist which
+# imports workspace; config is imported by plan_review's caller (loop).
+_VALID_REVIEW_POLICIES = {"always", "never", "when_unverified"}
+_DEFAULT_REVIEW_POLICY = "always"
+
 
 @dataclass
 class AgentBackend:
@@ -61,6 +66,24 @@ class SummaryConfig:
 
 
 @dataclass
+class ReviewConfig:
+    """Human plan-review gate settings.
+
+    ``plan`` policy:
+      * ``always``          — always stop after the planner for approval
+      * ``never``           — never stop (pre-gate behavior)
+      * ``when_unverified`` — stop only when some dev item has no machine
+        checks declared. Lets the approval frequency fall automatically as the
+        verification suite matures.
+
+    Default is ``always``: agentloop's expensive failure mode is a bad plan
+    burning 60 cycles, and one click is cheaper than one runaway.
+    """
+
+    plan: str = _DEFAULT_REVIEW_POLICY
+
+
+@dataclass
 class AgentConfig:
     limits: Limits = field(default_factory=Limits)
     planner: AgentBackend = field(default_factory=lambda: AgentBackend(cmd="cco"))
@@ -70,6 +93,7 @@ class AgentConfig:
     pm: AgentBackend = field(default_factory=lambda: AgentBackend(cmd=None, is_code=True))
     review_plan: bool = False
     summary_config: SummaryConfig = field(default_factory=SummaryConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
 
     def backend_for(self, role: str) -> AgentBackend:
         try:
@@ -112,6 +136,19 @@ class AgentConfig:
 
         if "review_plan" in data:
             self.review_plan = bool(data["review_plan"])
+
+        review = data.get("review", {})
+        if "plan" in review:
+            policy = str(review["plan"] or "").strip().lower()
+            # An unknown policy string resets to the default rather than
+            # silently disabling the gate — a typo'd `plan = "nevr"` must not
+            # turn 60 unattended cycles loose. Reset rather than *keep* the
+            # inherited value: a workspace typo layered over a global
+            # `plan = "never"` would otherwise inherit the disabled gate,
+            # which is exactly the outcome the fallback exists to prevent.
+            self.review.plan = (
+                policy if policy in _VALID_REVIEW_POLICIES else _DEFAULT_REVIEW_POLICY
+            )
 
         agents = data.get("agents", {})
         for role in ("planner", "dev", "qa", "summary", "pm"):

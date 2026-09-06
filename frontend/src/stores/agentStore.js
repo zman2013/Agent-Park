@@ -746,6 +746,33 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
+  // Approve or reject a pending plan. On approval the backend relaunches the
+  // loop against the same workspace (planner is skipped). ``todolist`` lets the
+  // reviewer send an edited plan; approval binds to what's sent, so editing and
+  // approving is atomic — the loop can't start between the two.
+  async function reviewAgentLoopPlan(loopId, { approve, note = null, todolist = null } = {}) {
+    try {
+      const res = await fetch(`/api/agentloops/${loopId}/review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ approve, note, todolist }),
+      })
+      if (!res.ok) {
+        const detail = await res.text().catch(() => '')
+        throw new Error(`HTTP ${res.status}${detail ? `: ${detail}` : ''}`)
+      }
+      await fetchAgentLoops()
+      if (selectedAgentLoopId.value === loopId) {
+        await fetchAgentLoopSnapshot(loopId)
+      }
+      addToast(approve ? '计划已批准，loop 开始执行' : '计划已驳回', 'success')
+      return true
+    } catch (e) {
+      addToast(`${approve ? '批准' : '驳回'}失败: ${e.message}`, 'error')
+      return false
+    }
+  }
+
   return {
     agents,
     tasks,
@@ -813,11 +840,13 @@ export const useAgentStore = defineStore('agent', () => {
     dismissAgentLoopRecent,
     stopAgentLoop,
     startAgentLoop,
+    reviewAgentLoopPlan,
     findAgentLoopByCwd,
     findAgentLoopsByCwd,
     // auto-compact
     autoCompactDisabled,
     setAutoCompactDisabled,
     resetAutoCompactDisabled,
+    // plan mode
   }
 })
