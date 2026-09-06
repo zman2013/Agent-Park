@@ -8,6 +8,8 @@ Covers the four behaviors that make the gate trustworthy:
 """
 from __future__ import annotations
 
+import shlex
+import sys
 from pathlib import Path
 
 import pytest
@@ -519,8 +521,40 @@ def test_resume_cmd_carries_the_workspace(tmp_path: Path):
 
     cmd = _resume_cmd(ws)
 
-    assert f"--workspace-dir {ws.workspace_dir}" in cmd
-    assert str(ws.design) in cmd
+    assert "--workspace-dir" in cmd
+    assert str(ws.workspace_dir) in cmd
+    # There is no `agentloop` console script — a bare name would be
+    # "command not found" for the standalone CLI users this text is for.
+    assert "-m agentloop run" in cmd
+    assert sys.executable in cmd
+
+
+def test_resume_cmd_quotes_paths_with_spaces(tmp_path: Path):
+    """Copy-pasting must survive spaces; argparse would otherwise see extra args."""
+    from agentloop.cli import _resume_cmd
+
+    root = tmp_path / "my project"
+    ws = WorkspacePaths.for_workspace(root, "gate-ws")
+    ws.workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = _resume_cmd(ws)
+
+    assert f"'{ws.workspace_dir}'" in cmd
+    assert shlex.split(cmd)[-1] == str(ws.workspace_dir)
+
+
+def test_awaiting_review_report_names_the_resolved_workspace(tmp_path, capsys):
+    """`run` may have auto-generated the slug and printed it nowhere else, so a
+    literal `<slug>` placeholder leaves the reviewer unable to find the gate."""
+    from agentloop.cli import _report_result
+
+    ws = _ws(tmp_path)
+    _report_result(scheduler.LoopResult(ExitCode.AWAITING_REVIEW, "awaiting"), ws)
+
+    out = capsys.readouterr().out
+    assert "-m agentloop approve" in out
+    assert str(ws.workspace_dir) in out
+    assert "<slug>" not in out
 
 
 def test_approve_without_gate_raises(tmp_path: Path):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -326,7 +327,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         max_cost_cny=args.max_cost_cny,
         ws=ws,
     )
-    return _report_result(result)
+    return _report_result(result, ws)
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
@@ -351,7 +352,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         max_cost_cny=new_cost,
         ws=ws,
     )
-    return _report_result(result)
+    return _report_result(result, ws)
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -443,19 +444,32 @@ def _cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def _agentloop_cmd(*argv: str) -> str:
+    """A copy-pasteable ``python -m agentloop ...`` invocation.
+
+    There is no console-script entry point in ``pyproject.toml`` — the supported
+    invocation everywhere is ``python -m agentloop`` — so a bare ``agentloop``
+    would just be ``command not found``. Uses the running interpreter so a venv
+    is respected, and ``shlex.join`` so paths with spaces survive the copy.
+    """
+    return shlex.join([sys.executable, "-m", "agentloop", *argv])
+
+
 def _resume_cmd(ws: WorkspacePaths) -> str:
     """The exact ``run`` invocation that resumes *this* workspace.
 
-    Must carry ``--workspace-dir``: bare ``agentloop run <design>`` calls
+    Must carry ``--workspace-dir``: bare ``run <design>`` calls
     ``generate_slug`` and lands in a brand-new timestamped workspace, so the
     approved plan (and the preserved ``plan-rejection.md``) would never be seen
     — a fresh planner and a fresh gate would run instead.
     """
-    design = ws.design if ws.design.exists() else Path("<design>")
-    return f"agentloop run {design} --workspace-dir {ws.workspace_dir}"
+    design = str(ws.design) if ws.design.exists() else "<design>"
+    return _agentloop_cmd("run", design, "--workspace-dir", str(ws.workspace_dir))
 
 
-def _report_result(result: scheduler.LoopResult) -> int:
+def _report_result(
+    result: scheduler.LoopResult, ws: WorkspacePaths | None = None
+) -> int:
     tag = {
         scheduler.ExitCode.SUCCESS: "SUCCESS",
         scheduler.ExitCode.PARTIAL_SUCCESS: "PARTIAL_SUCCESS",
@@ -465,9 +479,18 @@ def _report_result(result: scheduler.LoopResult) -> int:
     }.get(result.code, result.code.name)
     print(f"[agentloop] {tag}: {result.reason}")
     if result.code is scheduler.ExitCode.AWAITING_REVIEW:
+        # `run` may have auto-generated a timestamped slug that we never printed,
+        # so a literal `--workspace <slug>` placeholder is unusable — `approve`
+        # would resolve against cwd and, with several workspaces present, refuse
+        # to guess. Print the resolved path.
+        target = (
+            f"`{_agentloop_cmd('approve', '--workspace-dir', str(ws.workspace_dir))}`"
+            if ws is not None
+            else "`approve --workspace <slug>`"
+        )
         print(
-            "[agentloop] review the plan in todolist.md, then run "
-            "`agentloop approve --workspace <slug>` (or approve in the UI)."
+            f"[agentloop] review the plan in todolist.md, then run {target} "
+            "(or approve in the UI)."
         )
     return result.code.value
 
