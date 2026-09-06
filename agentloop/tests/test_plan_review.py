@@ -395,6 +395,53 @@ def test_save_leaves_no_partial_file_behind(tmp_path: Path):
     assert plan_review.PlanReview.load(ws).state == plan_review.AWAITING
 
 
+def test_approve_refuses_an_all_done_plan(tmp_path: Path):
+    """An edited all-done plan would consume the gate and report SUCCESS
+    without executing anything — the planner invariant already forbids it."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(
+        TODOLIST.replace("status:pending", "status:done"), encoding="utf-8"
+    )
+    plan_review.PlanReview(state=plan_review.AWAITING).save(ws)
+
+    with pytest.raises(plan_review.PlanReviewError, match="not a valid initial plan"):
+        plan_review.approve(ws)
+
+    assert plan_review.PlanReview.load(ws).state == plan_review.AWAITING
+
+
+def test_approve_refuses_duplicate_item_ids(tmp_path: Path):
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST.replace("T-002", "T-001"), encoding="utf-8")
+    plan_review.PlanReview(state=plan_review.AWAITING).save(ws)
+
+    with pytest.raises(plan_review.PlanReviewError, match="duplicate"):
+        plan_review.approve(ws)
+
+
+def test_approve_refuses_unknown_item_type(tmp_path: Path):
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST.replace("type:qa", "type:wat"), encoding="utf-8")
+    plan_review.PlanReview(state=plan_review.AWAITING).save(ws)
+
+    with pytest.raises(plan_review.PlanReviewError, match="not a valid initial plan"):
+        plan_review.approve(ws)
+
+
+def test_gate_with_non_mapping_stats_reads_as_unreadable(tmp_path: Path):
+    """A hand-edited gate must fail closed, not raise TypeError out of load()."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    plan_review.review_path(ws).write_text(
+        '{"state": "approved", "stats": 1}', encoding="utf-8"
+    )
+
+    assert plan_review.PlanReview.load(ws) is None
+    gate = plan_review.check_gate(ws, enabled=True)
+    assert gate.proceed is False
+    assert "unreadable" in gate.reason
+
+
 def test_approve_without_gate_raises(tmp_path: Path):
     with pytest.raises(plan_review.PlanReviewError):
         plan_review.approve(_ws(tmp_path))

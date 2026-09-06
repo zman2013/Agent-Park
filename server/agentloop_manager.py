@@ -552,17 +552,27 @@ def review_plan(
         raise ValueError("plan already approved and consumed by a running loop")
 
     if approve and todolist is not None:
-        # Validate before overwriting: an unparseable todolist would wedge the
-        # loop on its next start, and the reviewer would have lost the plan.
+        # Validate before overwriting: an invalid todolist would wedge the loop
+        # on its next start, and the reviewer would have lost the plan. Same
+        # invariant `pr.approve` enforces (planner shape: unique ids, known
+        # types/statuses, nothing already done) — applied here so a bad edit
+        # never reaches disk.
         try:
-            from agentloop.todolist import parse_text
-            parsed = parse_text(todolist)
+            from agentloop.todolist import Todolist, parse_text
+            from agentloop.validator import validate_transition
         except ImportError:
-            parsed = None
-        except Exception as e:  # noqa: BLE001
-            raise ValueError(f"edited todolist does not parse: {e}") from e
-        if parsed is not None and not parsed.items:
-            raise ValueError("edited todolist contains no items")
+            parse_text = None
+        if parse_text is not None:
+            try:
+                parsed = parse_text(todolist)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"edited todolist does not parse: {e}") from e
+            if not parsed.items:
+                raise ValueError("edited todolist contains no items")
+            try:
+                validate_transition(Todolist(), parsed, "planner", None)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError(f"edited todolist is not a valid plan: {e}") from e
         ws.todolist.write_text(todolist, encoding="utf-8")
 
     try:

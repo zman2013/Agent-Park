@@ -248,6 +248,23 @@ def test_consumed_gate_rejects_edit_before_writing(
     assert "Implement the thing" in workspace.todolist.read_text(encoding="utf-8")
 
 
+def test_invalid_shape_edit_is_rejected_without_clobbering(
+    workspace, registry, tmp_path, monkeypatch
+):
+    """Parseable but not a valid initial plan (all done) — still must not land."""
+    from agentloop.todolist import parse
+
+    plan_review.open_gate(workspace, parse(workspace))
+    m._upsert(_entry(workspace, tmp_path))
+    monkeypatch.setattr(m, "start", lambda **kw: {"status": "running"})
+
+    all_done = TODOLIST.replace("status:pending", "status:done")
+    with pytest.raises(ValueError, match="not a valid plan"):
+        m.review_plan("loop-1", approve=True, todolist=all_done)
+
+    assert "status:pending" in workspace.todolist.read_text(encoding="utf-8")
+
+
 def test_stale_reject_against_consumed_gate_is_refused(
     workspace, registry, tmp_path, monkeypatch
 ):

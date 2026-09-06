@@ -121,13 +121,20 @@ class PlanReview:
         state = str(data.get("state") or "")
         if state not in VALID_STATES:
             return None
+        stats = data.get("stats") or {}
+        if not isinstance(stats, dict):
+            # A hand-edited or older-schema gate whose `stats` isn't a mapping
+            # must read as unreadable, not raise out of load() — every caller
+            # (check_gate, the CLI, the notifier) expects None on bad input and
+            # would otherwise crash instead of failing closed.
+            return None
         return cls(
             state=state,
             planned_at=str(data.get("planned_at") or ""),
             todolist_digest=str(data.get("todolist_digest") or ""),
             reviewed_at=data.get("reviewed_at"),
             note=data.get("note"),
-            stats=dict(data.get("stats") or {}),
+            stats=dict(stats),
             notified_at=data.get("notified_at"),
         )
 
@@ -227,10 +234,19 @@ def approve(ws: WorkspacePaths, *, note: str | None = None) -> PlanReview:
 
 
 def _require_valid_plan(ws: WorkspacePaths) -> Todolist:
-    """Parse ``todolist.md`` or raise :class:`PlanReviewError`."""
+    """Parse ``todolist.md`` and hold it to the planner's invariant.
+
+    An approved plan is about to be executed *as if the planner had written it*,
+    so it must satisfy the same rules: unique ids, known types and statuses, at
+    least one item, and nothing already ``done``. Only checking "parses and has
+    items" leaves real holes — an edited all-``done`` plan consumes the gate and
+    reports SUCCESS having executed nothing, and duplicate ids or unknown
+    statuses wedge scheduling later.
+    """
     if not ws.todolist.exists():
         raise PlanReviewError("no todolist.md to approve")
-    from .todolist import parse as parse_todolist
+    from .todolist import Todolist as _Todolist, parse as parse_todolist
+    from .validator import ValidationError, validate_transition
 
     try:
         parsed = parse_todolist(ws)
@@ -238,6 +254,10 @@ def _require_valid_plan(ws: WorkspacePaths) -> Todolist:
         raise PlanReviewError(f"todolist.md does not parse: {e}") from e
     if not parsed.items:
         raise PlanReviewError("todolist.md contains no items")
+    try:
+        validate_transition(_Todolist(), parsed, "planner", None)
+    except ValidationError as e:
+        raise PlanReviewError(f"todolist.md is not a valid initial plan: {e}") from e
     return parsed
 
 
