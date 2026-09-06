@@ -454,6 +454,19 @@ def test_gate_with_invalid_utf8_reads_as_unreadable(tmp_path: Path):
     assert "unreadable" in gate.reason
 
 
+def test_unreadable_gate_recovery_advice_is_repair_not_delete(tmp_path: Path):
+    """Deleting a corrupt gate while todolist.md survives *would* run the
+    unapproved plan (no gate to open, none to consult), so the guidance must
+    never suggest it."""
+    ws = _ws(tmp_path)
+    ws.todolist.write_text(TODOLIST, encoding="utf-8")
+    plan_review.review_path(ws).write_text("{trunc", encoding="utf-8")
+
+    reason = plan_review.check_gate(ws, enabled=True).reason
+    assert "repair" in reason
+    assert "delete" not in reason
+
+
 def test_approve_without_gate_raises(tmp_path: Path):
     with pytest.raises(plan_review.PlanReviewError):
         plan_review.approve(_ws(tmp_path))

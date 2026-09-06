@@ -252,9 +252,10 @@ def _read_plan_review(ws: WorkspacePaths) -> dict[str, Any] | None:
     recovery controls, while Start just repeats the same fail-closed exit.
     """
     try:
-        from agentloop.plan_review import PLAN_REVIEW_FILE
+        from agentloop.plan_review import PLAN_REVIEW_FILE, VALID_STATES
     except ImportError:
         PLAN_REVIEW_FILE = "plan-review.json"
+        VALID_STATES = {"awaiting", "approved", "rejected", "consumed"}
     path = ws.workspace_dir / PLAN_REVIEW_FILE
     if not path.exists():
         return None
@@ -263,6 +264,11 @@ def _read_plan_review(ws: WorkspacePaths) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return {"state": "unreadable"}
     if not isinstance(data, dict):
+        return {"state": "unreadable"}
+    # Mirror PlanReview.load's acceptance criteria exactly: anything it rejects
+    # makes the scheduler fail closed, so the manager must show the paused
+    # recovery banner rather than falling through to `stopped`.
+    if str(data.get("state") or "") not in VALID_STATES:
         return {"state": "unreadable"}
     if not isinstance(data.get("stats") or {}, dict):
         return {"state": "unreadable"}
@@ -1084,7 +1090,9 @@ def _render_completion_message(
                 f"- **workspace**: `{workspace_dir}`\n"
                 f"- **loop_id**: `{loop_id}`\n\n"
                 "`plan-review.json` 无法解析，loop 拒绝执行未经批准的计划。"
-                "请修复或删除该文件后重新启动；用 `--fresh` 可重新规划。\n"
+                "请修复该文件后重新启动，或用 `--fresh` 重新规划。"
+                "**不要只删除该文件**——todolist 还在，删掉闸门会让下次启动"
+                "直接跑一份没人批准的计划。\n"
             )
         stats = (review or {}).get("stats") or {}
         lines = [

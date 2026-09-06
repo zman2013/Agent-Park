@@ -105,6 +105,18 @@ def test_gate_with_invalid_utf8_derives_awaiting_review(workspace):
     assert m._derive_status_from_state(state, workspace) == "awaiting_review"
 
 
+def test_gate_with_unknown_state_derives_awaiting_review(workspace):
+    """A syntactically valid gate whose state PlanReview.load rejects still
+    makes the scheduler fail closed — the manager must agree."""
+    plan_review.review_path(workspace).write_text(
+        '{"state": "future", "stats": {}}', encoding="utf-8"
+    )
+    state = {"cycle": 0, "last_decision": None}
+    assert m._derive_status_from_state(state, workspace) == "awaiting_review"
+    assert m._read_plan_review(workspace) == {"state": "unreadable"}
+    assert plan_review.PlanReview.load(workspace) is None
+
+
 def test_gate_with_non_mapping_stats_derives_awaiting_review(workspace):
     plan_review.review_path(workspace).write_text(
         '{"state": "approved", "stats": 1}', encoding="utf-8"

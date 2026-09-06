@@ -262,7 +262,8 @@ planner 与 phase 1 之间插入一道人工确认。默认开启。
 而审阅可能发生在第二天早上。
 
 文件闸门两个问题都没有：loop 干净退出（`ExitCode.AWAITING_REVIEW`），恢复所需
-状态全在 workspace 里，批准可以来自 UI / 飞书 / CLI。
+状态全在 workspace 里，批准可以来自 UI 或 CLI。飞书卡片只做通知——它把待审的
+计划推给评审人并引导其到 UI 操作，卡片本身没有批准动作（无入站 handler）。
 
 ### 状态机
 

@@ -347,13 +347,18 @@ def check_gate(ws: WorkspacePaths, *, enabled: bool) -> GateCheck:
             # The file is there but unreadable (truncated / hand-edited /
             # invalid state). Fail closed: treating it as "no gate" would let
             # an unapproved plan execute, which is the one outcome this module
-            # exists to prevent. A human can delete the file or re-plan with
-            # --fresh to get out.
+            # exists to prevent.
+            #
+            # Recovery is repair-or-replan, *not* delete: deleting the gate
+            # while todolist.md survives lands in exactly the hole this branch
+            # guards — the next run sees a todolist, so `planner_just_ran` is
+            # false, no gate is opened or consulted, and phase 1 runs the
+            # unapproved plan.
             return GateCheck(
                 proceed=False,
                 reason=(
                     f"{PLAN_REVIEW_FILE} is unreadable — refusing to execute an "
-                    "unapproved plan; delete it or re-plan with --fresh"
+                    "unapproved plan; repair the file or re-plan with --fresh"
                 ),
             )
         # No gate file at all: either the policy was just turned on for a

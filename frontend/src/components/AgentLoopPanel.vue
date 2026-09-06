@@ -53,8 +53,9 @@
       <div class="font-semibold text-red-300">⛔ 计划闸门文件损坏</div>
       <div class="mt-1 text-gray-400">
         <span class="font-mono">plan-review.json</span> 无法解析，loop 拒绝执行未经批准的计划。
-        请修复或删除该文件后重新启动；用
-        <span class="font-mono">--fresh</span> 可重新规划。
+        请修复该文件后重新启动，或用 <span class="font-mono">--fresh</span> 重新规划。
+        <span class="text-amber-300">不要只删除该文件</span>——todolist 还在，
+        删掉闸门会让下次启动直接跑一份没人批准的计划。
       </div>
     </div>
 
