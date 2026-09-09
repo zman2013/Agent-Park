@@ -305,7 +305,7 @@ async def get_knowledge(agent_id: str):
     return {
         "lessons": read_layer(eid, "lessons"),
         "project": read_layer(eid, "project"),
-        "hotfiles": read_layer(eid, "hotfiles"),
+        "history": read_layer(eid, "history"),
         "profile": read_layer(eid, "profile"),
         # Read-only; nothing writes data/knowledge/ any more.
         "archive": read_knowledge_docs(agent_id),

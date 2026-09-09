@@ -41,6 +41,20 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 # under run.sh's force-kill grace for the backend.
 NOTIFY_DRAIN_BASE_SECONDS = 40
 
+# shutdown()'s drain window for history-triggered consolidations. Deliberately
+# small: the notify drain above can already consume 80s of run.sh's 95s
+# force-kill grace, so there is no room to wait out a consolidation's LLM calls
+# (600s timeout each) and it is not necessary to. An interrupted consolidation
+# loses nothing — write_layer is atomic via os.replace, and the history counter
+# is only reset after both layers clear the gates, so the window is retried
+# instead of dropped. This wait exists only to let a consolidation that is
+# already past its LLM calls finish writing.
+CONSOLIDATE_DRAIN_SECONDS = 5
+
+
+def _consolidate_drain_seconds() -> int:
+    return CONSOLIDATE_DRAIN_SECONDS
+
 
 def _notify_drain_max_seconds() -> int:
     from server.task_notify import MAX_SERIAL_SENDS
@@ -554,6 +568,8 @@ class AgentRunner:
         self._handoff_pending: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         self._notify_tasks: set[asyncio.Task] = set()  # detached feishu-notify tasks (survive runner cancellation)
+        self._consolidate_tasks: set[asyncio.Task] = set()  # detached history-triggered consolidations
+        self._consolidating: set[str] = set()  # eids with a consolidation in flight
         # PTY read transports currently awaiting EOF, so shutdown() can force
         # them closed instead of waiting out their internal 60s lingering-
         # grandchild safety net (see _run_pty_mode) within its own bounded
@@ -1264,11 +1280,94 @@ class AgentRunner:
         if task and not was_terminal and not compact_will_continue:
             notify_args = self._prepare_notify(task_id, task)
 
+        # Same three boundaries as the notification, for the same reasons: skip
+        # resume kills (handled above), skip idempotent re-entry (was_terminal),
+        # and skip a success that auto-compact is about to continue. Read before
+        # the await so the text belongs to this run.
+        history_args = None
+        if task and not was_terminal and not compact_will_continue:
+            history_args = self._prepare_history(task_id, task, status)
+
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
             app_state.save_agent_tasks(task.agent_id)
         if notify_args:
             self._schedule_notify(*notify_args)
+        if history_args:
+            self._record_history(*history_args)
+
+    def _prepare_history(self, task_id: str, task: Task,
+                         status: TaskStatus) -> tuple[str, str, str, str] | None:
+        """Build (eid, who, status, text) for the history append, or None.
+
+        Called before the first await in _finish_task, so ``_run_start_index``
+        still points at this run: a concurrent send_input() would advance it and
+        we would summarize the wrong run.
+        """
+        from server import auto_memory
+        from server.task_notify import _last_agent_text
+
+        text = _last_agent_text(task, self._run_start_index.get(task_id, 0))
+        if not text:
+            return None
+        agent = app_state.get_agent(task.agent_id)
+        who = f"{agent.name if agent else task.agent_id} / {task.name}"
+        return auto_memory.effective_id(task.agent_id), who, str(status.value), text
+
+    def _record_history(self, eid: str, who: str, status: str, text: str) -> None:
+        """Append to history.md and, every Nth append, consolidate.
+
+        The append itself is synchronous and LLM-free — one file rewrite of at
+        most 4KB. Consolidation is detached: it makes two LLM calls, and
+        _finish_task is on the path that reports task completion to the UI.
+        """
+        from server import auto_memory
+
+        try:
+            n = auto_memory.append_history(eid, who, status, text)
+        except Exception:
+            logger.exception("Failed to append history for eid %s", eid)
+            return
+        if n and n % auto_memory.consolidate_every() == 0:
+            self._schedule_consolidate(eid, n)
+
+    def _schedule_consolidate(self, eid: str, n: int) -> None:
+        """Run consolidation detached from the finishing task's coroutine.
+
+        Held in ``_consolidate_tasks`` for the same reason notifications are:
+        a resume calls kill_task(cancel_existing=True), and a consolidation
+        awaiting an LLM inside that coroutine would be cancelled mid-write.
+        Also guards against overlap — the per-eid lock inside consolidate()
+        would serialize them, but queueing N of them would keep firing LLM
+        calls long after the window that triggered them.
+        """
+        if eid in self._consolidating:
+            logger.info("eid %s already consolidating, skipping this trigger", eid)
+            return
+
+        async def run() -> None:
+            from server import auto_memory
+            from server.routes_ws import _eid_tasks
+
+            self._consolidating.add(eid)
+            try:
+                logger.info("history reached %d entries for eid %s, consolidating", n, eid)
+                result = await auto_memory.consolidate(eid, _eid_tasks(eid))
+                logger.info(
+                    "history-triggered consolidation done: eid=%s added=%d updated=%d "
+                    "deleted=%d refused=%d%s",
+                    eid, result["added"], result["updated"], result["deleted"],
+                    result["refused"],
+                    f" FAILED_LAYERS={result['failed_layers']}" if result["failed_layers"] else "",
+                )
+            except Exception:
+                logger.exception("History-triggered consolidation failed for eid %s", eid)
+            finally:
+                self._consolidating.discard(eid)
+
+        t = asyncio.create_task(run(), name=f"consolidate-{eid}")
+        self._consolidate_tasks.add(t)
+        t.add_done_callback(self._consolidate_tasks.discard)
 
     def _prepare_notify(self, task_id: str, task: Task) -> tuple[str, Task, int] | None:
         """Build the (agent_name, task_snapshot, start_index) args for
@@ -1647,6 +1746,17 @@ class AgentRunner:
         if self._notify_tasks:
             await asyncio.wait(
                 list(self._notify_tasks), timeout=_notify_drain_max_seconds()
+            )
+
+        # History-triggered consolidations write layer documents, so cancelling
+        # one mid-flight is worse than waiting: os.replace makes the write itself
+        # atomic, but the history counter is only reset after both layers pass
+        # the gates, so an interrupted run re-consolidates next time rather than
+        # losing the window. Bounded by one layer's LLM timeout — we are not
+        # obliged to finish, only to not corrupt.
+        if self._consolidate_tasks:
+            await asyncio.wait(
+                list(self._consolidate_tasks), timeout=_consolidate_drain_seconds()
             )
 
 

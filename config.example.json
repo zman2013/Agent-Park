@@ -7,7 +7,7 @@
     "port": 3000
   },
   "automemory": {
-    "_comment": "四层 auto-memory（profile/lessons/project/hotfiles），是唯一的记忆系统。daily_enabled 只管无人值守的 00:30 巩固循环；注入与手工 🧠 不受它限制。",
+    "_comment": "四层 auto-memory（profile/lessons/project/history），是唯一的记忆系统。history 每轮追加（零 LLM），每满 consolidate_every 条触发一次巩固。daily_enabled 只管无人值守的 00:30 循环；注入、手工 🧠 与 history 触发都不受它限制。",
     "daily_enabled": true,
     "command": "glm",
     "timeout": 600,
@@ -15,9 +15,8 @@
     "lessons_max_items": 30,
     "project_max_items": 40,
     "max_signal_chars": 12000,
-    "hotfiles_max_items": 20,
-    "hotfiles_recent_days": 7,
-    "default_task_count": 5
+    "default_task_count": 5,
+    "consolidate_every": 10
   },
   "compact": {
     "_comment": "压缩阈值（绝对 token 数，针对本轮 input_tokens + cache_read + cache_creation 求和）。超过 warn_tokens 发送预警通知；超过 auto_compact_tokens 且 auto_compact_enabled=true 时，当前 turn 结束后自动发送 /compact 指令。默认贴近 Sonnet/Opus 200k 窗口的 compact 触发点（≈78% / ≈85%）。1M 窗口模型请覆盖为例如 820000 / 880000。",

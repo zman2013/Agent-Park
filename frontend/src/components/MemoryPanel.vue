@@ -150,9 +150,9 @@ const knowledgeLoading = ref(false)
 const knowledgeDocs = [
   { key: 'lessons', label: '错误经验' },
   { key: 'project', label: '项目知识' },
-  { key: 'hotfiles', label: '热点文件' },
+  { key: 'history', label: '近期行动' },
 ]
-const knowledgeData = ref({ lessons: '', project: '', hotfiles: '' })
+const knowledgeData = ref({ lessons: '', project: '', history: '' })
 
 const currentKnowledgeDoc = computed(() => knowledgeData.value[activeKnowledgeDoc.value] || '')
 

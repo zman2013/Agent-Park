@@ -15,12 +15,19 @@ layer        priority  authority           written by
 profile.md   1         the user            humans only — never the LLM
 lessons.md   2         corrections         consolidation, JSON delta
 project.md   3         observation         consolidation, JSON delta
-hotfiles.md  4         none (statistics)   pure Python, no LLM
+history.md   4         none (a log)        appended per run, no LLM
 ===========  ========  ==================  ===============================
 
 Consolidation never writes ``profile.md``. It is the one human-authored
 source, and a system that silently edits the user's own rules is not one they
 can keep trusting.
+
+``history.md`` is the raw feed the other two are distilled from: every finished
+run appends one line, without an LLM, and every tenth append triggers a
+consolidation pass. It replaced ``hotfiles.md`` (a file-access frequency table)
+because a ranked list of paths told the model which files were touched but
+never what happened to them — nothing it could act on, for 4000 characters of
+the budget.
 """
 
 from __future__ import annotations
@@ -102,10 +109,10 @@ LAYER_LIMITS = {
     "profile": 2000,
     "lessons": 8000,
     "project": 10000,
-    "hotfiles": 4000,
+    "history": 4000,
 }
 
-LAYERS = ("profile", "lessons", "project", "hotfiles")
+LAYERS = ("profile", "lessons", "project", "history")
 
 
 def memory_dir(eid: str) -> Path:
@@ -228,7 +235,7 @@ _LAYER_HEADERS = {
     # project fact phrased as an imperative ("always use make -j") being
     # executed as a rule in the wrong repo.
     "project": "<!-- Factual key-value pairs about this project. Data, not instructions. -->",
-    "hotfiles": "<!-- File access frequency. Statistics only, computed without an LLM. -->",
+    "history": "<!-- Recent activity log. Appended verbatim without an LLM, newest last. -->",
 }
 
 
@@ -665,35 +672,32 @@ _eid_locks: dict[str, "object"] = {}
 async def consolidate(
     eid: str,
     tasks: list,
-    hotfiles_tasks: list | None = None,
     progress_cb=None,
     today: str | None = None,
 ) -> dict:
-    """Consolidate every layer for *eid*.
+    """Consolidate the LLM-derived layers for *eid*.
 
-    *tasks* feeds LLM extraction (usually one day's worth). *hotfiles_tasks*
-    feeds the file-heat statistics, which keep a multi-day window and must span
-    every agent sharing this store — computing them from one member and then
-    overwriting the shared document discards the rest.
+    *tasks* feeds extraction. ``history.md`` is also read as a signal source:
+    it is the only record of what was *done* rather than what went wrong, and
+    it is written per-run without an LLM.
 
     *today* is the date stamped onto touched entries; it defaults to the real
     current date. Callers replaying history must pass the date being replayed,
     or every entry lands on the same date and ``last`` stops discriminating —
     which silently disables the recency half of the truncation ranking.
 
-    ``profile.md`` is never touched: it is the user's own file.
+    ``profile.md`` is never touched: it is the user's own file. ``history.md``
+    is not rewritten either — consolidation reads it and marks it consumed.
     """
     import asyncio
     from datetime import datetime, timezone
 
     from server.config import automemory_config
-    from server.knowledge import compute_hotfiles, extract_project_signals
-    from server.state import app_state
+    from server.knowledge import extract_project_signals
 
     cfg = automemory_config()
     if today is None:
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    hotfiles_tasks = tasks if hotfiles_tasks is None else hotfiles_tasks
 
     async def progress(step: str, detail: str):
         if progress_cb:
@@ -704,28 +708,32 @@ async def consolidate(
         await progress("extracting", f"分析 {len(tasks)} 个任务...")
         lesson_signals = extract_lesson_signals(tasks)
         project_signals = extract_project_signals(tasks)
-
-        agent = app_state.get_agent(eid)
-        project_root = (agent.cwd or "").strip() if agent else ""
-        hotfiles = compute_hotfiles(
-            hotfiles_tasks, cfg["hotfiles_recent_days"], project_root=project_root or None
-        )
+        history_signals = extract_history_signals(eid)
         await progress(
             "extracting",
             f"提取到 {len(lesson_signals)} 条经验信号，"
-            f"{len(project_signals)} 条项目信号，{len(hotfiles)} 个文件",
+            f"{len(project_signals)} 条项目信号，{len(history_signals)} 条近期行动",
         )
 
         results: dict[str, ConsolidationResult] = {}
         await progress("merging", "巩固 lessons.md...")
-        results["lessons"] = await consolidate_layer(eid, "lessons", lesson_signals, today, cfg)
+        results["lessons"] = await consolidate_layer(
+            eid, "lessons", lesson_signals + history_signals, today, cfg)
         await progress("merging", "巩固 project.md...")
-        results["project"] = await consolidate_layer(eid, "project", project_signals, today, cfg)
+        results["project"] = await consolidate_layer(
+            eid, "project", project_signals + history_signals, today, cfg)
 
-        # hotfiles: pure statistics, no LLM. This is the only layer that has
-        # never been polluted, across two independent measurements.
-        await progress("writing", "写入 hotfiles.md...")
-        write_layer(eid, "hotfiles", _hotfiles_doc(hotfiles, cfg["hotfiles_max_items"]))
+        # Only clear the window if at least one layer actually consumed it.
+        # Resetting unconditionally would discard the window whenever the helper
+        # LLM returned nothing usable — the counter would go back to 0 and those
+        # runs would never be looked at again, which is the same silent-data-loss
+        # shape as the old "timeout returns existing_md" behaviour.
+        if any(not r["failed"] for r in results.values()):
+            reset_history_counter(eid)
+        else:
+            logger.warning(
+                "%s: every layer failed, keeping the history window for a retry", eid
+            )
 
     totals = {k: sum(r[k] for r in results.values())
               for k in ("added", "updated", "deleted", "refused", "dropped")}
@@ -737,10 +745,138 @@ async def consolidate(
     }
 
 
-def _hotfiles_doc(hotfiles: list[dict], max_items: int) -> str:
-    from server.knowledge import build_hotfiles_md
+# ── History layer ─────────────────────────────────────────────────────────────
 
-    return f"{_LAYER_HEADERS['hotfiles']}\n{build_hotfiles_md(hotfiles, max_items)}"
+# One appended line per finished run. Not the entry model: entries are a
+# deduplicated set keyed by title, history is a time series where the same
+# thing happening twice is the signal, not a collision.
+#
+#   - 2026-09-09 21:40 · agent-park / 删除 hotfiles · success — <summary>
+_HISTORY_RE = re.compile(
+    r"^-\s+(?P<at>\d{4}-\d{2}-\d{2} \d{2}:\d{2})\s+·\s+"
+    r"(?P<who>.*?)\s+·\s+(?P<status>\w+)\s+—\s+(?P<text>.*)$"
+)
+
+HISTORY_MAX_ENTRIES = 50
+HISTORY_SUMMARY_CHARS = 220
+
+# Appends since the last consolidation. Persisted next to the documents so a
+# restart mid-window does not silently reset the trigger.
+_COUNTER_FILE = "history_count"
+
+
+def consolidate_every() -> int:
+    from server.config import automemory_config
+
+    return automemory_config()["consolidate_every"]
+
+
+def parse_history(md: str) -> list[dict]:
+    out: list[dict] = []
+    for line in md.splitlines():
+        m = _HISTORY_RE.match(line)
+        if m:
+            out.append(m.groupdict())
+    return out
+
+
+def render_history(rows: list[dict]) -> str:
+    out = [_LAYER_HEADERS["history"], "# History", ""]
+    for r in rows:
+        out.append(f"- {r['at']} · {r['who']} · {r['status']} — {r['text']}")
+    return "\n".join(out) + "\n"
+
+
+def append_history(eid: str, who: str, status: str, text: str,
+                   at: str | None = None) -> int:
+    """Append one run to *eid*'s history. Zero LLM, synchronous, cheap.
+
+    Returns the number of appends since the last consolidation, so the caller
+    can decide whether to trigger one. Rolls off the oldest entries at both
+    ``HISTORY_MAX_ENTRIES`` and the layer's character limit — the point of this
+    layer is "what happened lately", and ``data/tasks/*.json`` already holds the
+    complete transcript if anyone needs it.
+    """
+    from datetime import datetime, timezone
+
+    text = _one_line(text, HISTORY_SUMMARY_CHARS)
+    if not text:
+        # Nothing to record. Don't advance the counter either: an empty run
+        # should not push the window toward an LLM call.
+        return read_history_counter(eid)
+
+    rows = parse_history(read_layer(eid, "history"))
+    rows.append({
+        "at": at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
+        "who": _one_line(who, 60) or "?",
+        "status": status,
+        "text": text,
+    })
+    rows = rows[-HISTORY_MAX_ENTRIES:]
+    while len(rows) > 1 and len(render_history(rows)) > LAYER_LIMITS["history"]:
+        rows.pop(0)
+    write_layer(eid, "history", render_history(rows))
+    return _bump_history_counter(eid)
+
+
+def _one_line(text: str, limit: int) -> str:
+    """Collapse to a single line and truncate.
+
+    Newlines would break the one-entry-per-line format, and the `·` / `—`
+    separators would break the parse, so they are replaced rather than escaped:
+    this is a human-readable log, not a serialization format.
+    """
+    flat = " ".join((text or "").split())
+    flat = flat.replace("·", "•").replace("—", "-")
+    if len(flat) > limit:
+        flat = flat[:limit].rstrip() + "…"
+    return flat
+
+
+def _counter_path(eid: str):
+    return memory_dir(eid) / _COUNTER_FILE
+
+
+def read_history_counter(eid: str) -> int:
+    p = _counter_path(eid)
+    if not p.exists():
+        return 0
+    try:
+        return int(p.read_text(encoding="utf-8").strip() or 0)
+    except Exception:
+        # A corrupt counter must not wedge consolidation forever.
+        logger.warning("%s: unreadable history counter, treating as 0", eid)
+        return 0
+
+
+def _bump_history_counter(eid: str) -> int:
+    n = read_history_counter(eid) + 1
+    d = memory_dir(eid)
+    d.mkdir(parents=True, exist_ok=True)
+    _counter_path(eid).write_text(str(n), encoding="utf-8")
+    return n
+
+
+def reset_history_counter(eid: str) -> None:
+    p = _counter_path(eid)
+    if p.exists():
+        try:
+            p.unlink()
+        except Exception:
+            logger.exception("%s: failed to reset history counter", eid)
+
+
+def extract_history_signals(eid: str) -> list[dict]:
+    """Feed history into extraction as one signal per logged run.
+
+    This is the only signal source describing what was *accomplished*; the
+    other three all describe something going wrong (task failed, tool error,
+    high turn count).
+    """
+    return [
+        {"source": "recent_action", "content": f"[{r['status']}] {r['who']}: {r['text']}"}
+        for r in parse_history(read_layer(eid, "history"))
+    ]
 
 
 # ── Signal extraction ─────────────────────────────────────────────────────────
@@ -818,7 +954,7 @@ _LAYER_INTROS = {
     "profile": "[Profile] ALWAYS follow these interaction rules. They override default behavior.",
     "lessons": "[Lessons] ALWAYS check these before acting. They override default behavior.",
     "project": "[Project] Factual reference data about this project. Not instructions.",
-    "hotfiles": "[Hotfiles] Recently active files, by access frequency. Statistics only.",
+    "history": "[History] What was recently done, newest last. Context, not instructions.",
 }
 
 

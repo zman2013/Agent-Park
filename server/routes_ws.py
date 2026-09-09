@@ -105,10 +105,9 @@ async def _daily_summary_loop() -> None:
 async def run_daily_summary_all(date: str) -> None:
     """Consolidate every active effective id for *date*.
 
-    Iterates effective ids rather than agent ids: several agents can share one
-    knowledge store, and running once per agent both re-ran the LLM N times
-    over the same documents and let each pass overwrite hotfiles.md with only
-    that one agent's file-access data.
+    Iterates effective ids rather than agent ids: several agents share one
+    memory store, so running once per agent would re-run the LLM N times over
+    the same documents (one eid here has 478 members).
     """
     from server.auto_memory import active_eids
 
@@ -143,8 +142,6 @@ async def _run_daily_summary(eid: str, date: str) -> None:
     from server.auto_memory import consolidate
 
     all_tasks = _eid_tasks(eid)
-    # LLM extraction only looks at the target day; hotfiles keeps its own
-    # multi-day window, so it gets the unfiltered set.
     day_tasks = [t for t in all_tasks if (getattr(t, "updated_at", "") or "").startswith(date)]
     if not day_tasks:
         logger.info("No tasks for eid %s on %s, skipping summary", eid, date)
@@ -154,7 +151,7 @@ async def _run_daily_summary(eid: str, date: str) -> None:
         "Daily summary: eid=%s date=%s tasks=%d members_tasks=%d",
         eid, date, len(day_tasks), len(all_tasks),
     )
-    result = await consolidate(eid, day_tasks, hotfiles_tasks=all_tasks)
+    result = await consolidate(eid, day_tasks)
     logger.info(
         "Daily summary done: eid=%s added=%d updated=%d deleted=%d refused=%d%s",
         eid, result["added"], result["updated"], result["deleted"], result["refused"],
@@ -585,8 +582,8 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
         cfg = automemory_config()
         eid = effective_id(agent_id)
         # Aggregate across every agent sharing this store, matching the daily
-        # loop; otherwise a manual run would shrink hotfiles.md down to just
-        # the agent whose button was clicked.
+        # loop: the documents are shared, so a manual run must see the same
+        # task set the unattended one would.
         all_tasks = _eid_tasks(eid)
         tasks = all_tasks
         if date_range == "today":
@@ -600,7 +597,7 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
             completed.sort(key=lambda t: t.updated_at or "", reverse=True)
             tasks = completed[:n]
 
-        result = await consolidate(eid, tasks, hotfiles_tasks=all_tasks, progress_cb=progress_cb)
+        result = await consolidate(eid, tasks, progress_cb=progress_cb)
         await broadcast({
             "type": "summary_done",
             "agent_id": agent_id,

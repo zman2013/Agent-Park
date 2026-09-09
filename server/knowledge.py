@@ -1,36 +1,35 @@
-"""Hotfile statistics and the read-only knowledge archive.
+"""Project-signal extraction and the read-only knowledge archive.
 
 What is left here after auto-memory took over consolidation:
 
-- ``compute_hotfiles`` / ``build_hotfiles_md`` — pure-Python file-heat stats.
-  Across two independent measurements this was the only layer never polluted by
-  meta-narration, and it is the only one that never called an LLM. That
-  correlation is why it is reused verbatim.
 - ``extract_project_signals`` — signal source for the project layer.
 - ``_llm_call`` — the read-only helper-LLM invocation, shared with auto-memory.
-- ``read_knowledge_docs`` / ``write_knowledge_docs`` — ``data/knowledge/{eid}/``
-  is kept in place as a read-only archive so the migration stays reversible.
+- ``read_knowledge_docs`` — ``data/knowledge/{eid}/`` is kept in place as a
+  read-only archive so the migration stays reversible.
 
-Removed with this change: ``merge_errors`` / ``merge_project`` (whole-document
-free-text rewrite, measured destroying real documents), ``extract_error_signals``
-(any 5-200 char user message counted as a "correction"),
-``build_memory_entries`` / ``update_memory_index`` (lossy one-line derivatives),
-and ``_AGENT_PARK_NOISE_KEYWORDS`` — that last guard filtered *inputs* that
+Removed earlier: ``merge_errors`` / ``merge_project`` (whole-document free-text
+rewrite, measured destroying real documents), ``extract_error_signals`` (any
+5-200 char user message counted as a "correction"), ``build_memory_entries`` /
+``update_memory_index`` (lossy one-line derivatives), and
+``_AGENT_PARK_NOISE_KEYWORDS`` — that last guard filtered *inputs* that
 mentioned agent-park symbols, which is self-destructive for agent-park's own
 agent, and its companion prompt clause ("if the conversation is about
 agent-park internals, return the existing document unchanged") caused the
 pollution it meant to prevent: the LLM complied by narrating that it was
 returning the document unchanged, and the narration became the document.
+
+Removed with this change: ``compute_hotfiles`` / ``build_hotfiles_md`` and
+their five path helpers. The hotfiles layer was the only one that never called
+an LLM and never got polluted — but a ranked table of file-access counts told
+the model *which* files were touched and never *what happened to them*, so it
+spent 4000 characters of the injection budget on something unactionable. The
+history layer replaced it: same zero-LLM property, but it records outcomes.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import re
-from collections import defaultdict
-from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -85,151 +84,10 @@ def extract_project_signals(tasks: list) -> list[dict]:
     return signals
 
 
-_HOTFILE_EXCLUDE_PREFIXES = (
-    "/tmp/",
-    "/var/",
-    "/proc/",
-    "/sys/",
-    "/dev/",
-    "/run/",
-)
-
-
-def _is_under_root(fp: str, root: str) -> bool:
-    """Return True if fp equals root or is nested under root (prefix-safe)."""
-    root_clean = root.rstrip("/")
-    return fp == root_clean or fp.startswith(f"{root_clean}/")
-
-
-def _is_project_file(fp: str, project_roots: tuple[str, ...] = ()) -> bool:
-    """Return True if the file path is a meaningful project file (not temp/system noise)."""
-    fp = fp.strip()
-    if not fp:
-        return False
-
-    for prefix in _HOTFILE_EXCLUDE_PREFIXES:
-        if fp.startswith(prefix):
-            # Keep files inside known project roots even if repo is under /tmp, /var, etc.
-            if project_roots and any(_is_under_root(fp, root) for root in project_roots):
-                return True
-            return False
-    return True
-
-
-def compute_hotfiles(tasks: list, recent_days: int = 7, project_root: str | None = None) -> list[dict]:
-    """Count file access frequency from tool_use messages (no LLM)."""
-    cutoff = datetime.now(timezone.utc) - timedelta(days=recent_days)
-    read_counts: dict[str, int] = defaultdict(int)
-    edit_counts: dict[str, int] = defaultdict(int)
-    last_access: dict[str, str] = {}
-    project_roots = tuple([project_root.rstrip("/")]) if project_root else ()
-
-    for task in tasks:
-        # check task updated_at for recency
-        updated_at = getattr(task, "updated_at", "")
-        try:
-            ts = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-            if ts < cutoff:
-                continue
-        except Exception:
-            pass
-
-        messages = task.messages if hasattr(task, "messages") else []
-        for msg in messages:
-            role = getattr(msg, "role", "")
-            msg_type = getattr(msg, "type", "")
-            tool_name = getattr(msg, "tool_name", "")
-            content = getattr(msg, "content", "")
-
-            if role != "agent" or msg_type != "tool_use":
-                continue
-
-            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-            if tool_name in ("Read",):
-                # content is JSON with file_path
-                fp = _extract_file_path(content, tool_name)
-                if fp and _is_project_file(fp, project_roots):
-                    read_counts[fp] += 1
-                    last_access[fp] = today
-
-            elif tool_name in ("Edit", "Write", "NotebookEdit"):
-                fp = _extract_file_path(content, tool_name)
-                if fp and _is_project_file(fp, project_roots):
-                    edit_counts[fp] += 1
-                    last_access[fp] = today
-
-            elif tool_name == "Bash":
-                fps = _extract_paths_from_bash(content)
-                for fp in fps:
-                    if _is_project_file(fp, project_roots):
-                        read_counts[fp] += 1
-                        last_access[fp] = today
-
-    # merge and sort
-    all_files = set(list(read_counts.keys()) + list(edit_counts.keys()))
-    result = []
-    for fp in all_files:
-        r = read_counts.get(fp, 0)
-        e = edit_counts.get(fp, 0)
-        weight = r + e * 2  # edits count more
-        result.append({
-            "file": fp,
-            "reads": r,
-            "edits": e,
-            "weight": weight,
-            "last_access": last_access.get(fp, ""),
-        })
-    result.sort(key=lambda x: -x["weight"])
-    return result
-
-
-def _extract_file_path(content: str, tool_name: str) -> str | None:
-    """Try to extract file_path from tool_use content (JSON or plain text)."""
-    try:
-        obj = json.loads(content)
-        if isinstance(obj, dict):
-            for key in ("file_path", "notebook_path", "path"):
-                if key in obj:
-                    return str(obj[key])
-    except Exception:
-        pass
-    # fallback: regex for absolute paths
-    m = re.search(r'["\']?(/[\w/.\-_]+\.\w+)["\']?', content)
-    if m:
-        return m.group(1)
-    return None
-
-
-def _extract_paths_from_bash(content: str) -> list[str]:
-    """Extract file paths from bash command content."""
-    paths = []
-    try:
-        obj = json.loads(content)
-        cmd = obj.get("command", "") if isinstance(obj, dict) else ""
-    except Exception:
-        cmd = content
-    for m in re.finditer(r'(/[\w/.\-_]+\.(?:py|cpp|h|mlir|json|yaml|yml|md|sh|txt))', cmd):
-        paths.append(m.group(1))
-    return paths
-
-
-# ── Markdown document builders ────────────────────────────────────────────────
-
 def _read_existing(path: Path) -> str:
     if path.exists():
         return path.read_text(encoding="utf-8")
     return ""
-
-
-def build_hotfiles_md(hotfiles: list[dict], max_items: int = 20) -> str:
-    top = hotfiles[:max_items]
-    if not top:
-        return "## 热点文件（最近 7 天）\n\n暂无数据\n"
-    lines = ["## 热点文件（最近 7 天）\n", "| 文件 | 读取 | 编辑 | 最近访问 |", "|------|------|------|----------|"]
-    for f in top:
-        lines.append(f"| {f['file']} | {f['reads']} | {f['edits']} | {f['last_access']} |")
-    return "\n".join(lines) + "\n"
 
 
 # ── LLM merge ─────────────────────────────────────────────────────────────────
