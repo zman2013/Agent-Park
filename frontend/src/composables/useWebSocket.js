@@ -150,6 +150,12 @@ export function useWebSocket() {
           data.data.auto_compact_disabled.forEach(tid => { newDisabled[tid] = true })
           store.resetAutoCompactDisabled(newDisabled)
         }
+        // Hydrate plan-mode state on reconnect
+        if (Array.isArray(data.data.plan_mode)) {
+          const newPlan = {}
+          data.data.plan_mode.forEach(tid => { newPlan[tid] = true })
+          store.resetPlanMode(newPlan)
+        }
         // If exactly one new task appeared, auto-select it
         const newTaskIds = Object.keys(store.tasks).filter(id => !prevTaskIds.has(id))
         if (newTaskIds.length === 1) {
@@ -239,6 +245,10 @@ export function useWebSocket() {
         store.setAutoCompactDisabled(data.task_id, data.disabled)
         break
 
+      case 'plan_mode_toggled':
+        store.setPlanMode(data.task_id, data.enabled)
+        break
+
       case 'ping':
         break
 
@@ -298,6 +308,10 @@ export function useWebSocket() {
     send({ type: 'toggle_auto_compact', task_id: taskId, disabled })
   }
 
+  function togglePlanMode(taskId, enabled) {
+    send({ type: 'toggle_plan_mode', task_id: taskId, enabled })
+  }
+
   function triggerHandoff(taskId) {
     send({ type: 'trigger_handoff', task_id: taskId })
   }
@@ -326,6 +340,10 @@ export function useWebSocket() {
     toggleAutoCompact(e.detail.taskId, e.detail.disabled)
   }
 
+  function onTogglePlanModeEvent(e) {
+    togglePlanMode(e.detail.taskId, e.detail.enabled)
+  }
+
   onMounted(() => {
     disposed = false
     connect()
@@ -334,6 +352,7 @@ export function useWebSocket() {
     window.addEventListener('trigger-stop-task', onTriggerStopTaskEvent)
     window.addEventListener('trigger-handoff', onTriggerHandoffEvent)
     window.addEventListener('toggle-auto-compact', onToggleAutoCompactEvent)
+    window.addEventListener('toggle-plan-mode', onTogglePlanModeEvent)
   })
 
   onUnmounted(() => {
@@ -347,6 +366,7 @@ export function useWebSocket() {
     window.removeEventListener('trigger-stop-task', onTriggerStopTaskEvent)
     window.removeEventListener('trigger-handoff', onTriggerHandoffEvent)
     window.removeEventListener('toggle-auto-compact', onToggleAutoCompactEvent)
+    window.removeEventListener('toggle-plan-mode', onTogglePlanModeEvent)
     if (ws) {
       const socket = ws
       ws = null
@@ -367,5 +387,6 @@ export function useWebSocket() {
     triggerHandoff,
     stopTask,
     toggleAutoCompact,
+    togglePlanMode,
   }
 }

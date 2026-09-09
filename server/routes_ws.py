@@ -288,6 +288,7 @@ async def websocket_endpoint(ws: WebSocket):
     from server.agent_runner import runner as _runner
     sync_data = app_state.snapshot(_runner._session_ids)
     sync_data["auto_compact_disabled"] = list(_runner._auto_compact_disabled)
+    sync_data["plan_mode"] = list(_runner._plan_mode)
     await ws.send_text(
         json.dumps({"type": "state_sync", "data": sync_data}, ensure_ascii=False)
     )
@@ -399,6 +400,20 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
             "type": "auto_compact_toggled",
             "task_id": task_id,
             "disabled": disabled,
+        })
+
+    elif msg_type == "toggle_plan_mode":
+        task_id = data.get("task_id", "")
+        enabled = bool(data.get("enabled", False))
+        task = app_state.get_task(task_id)
+        if not task:
+            return
+        from server.agent_runner import runner
+        runner.toggle_plan_mode(task_id, enabled)
+        await broadcast({
+            "type": "plan_mode_toggled",
+            "task_id": task_id,
+            "enabled": enabled,
         })
 
     elif msg_type == "trigger_handoff":

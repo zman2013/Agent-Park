@@ -96,6 +96,7 @@ class BaseAdapter(ABC):
         fork_sid: str | None,
         agent_cwd: str,
         resume_at: str | None = None,
+        plan_mode: bool = False,
     ) -> list[str]:
         """Build subprocess command-line arguments."""
         ...

@@ -28,6 +28,21 @@
       >
         同步远端代码
       </button>
+      <label
+        class="flex items-center gap-1 ml-auto cursor-pointer select-none"
+        title="Plan 模式：只调研并输出方案，不修改文件（下一次发送生效）"
+      >
+        <input
+          type="checkbox"
+          class="w-3 h-3 accent-purple-500 cursor-pointer"
+          :checked="isPlanMode"
+          @change="togglePlanMode"
+        />
+        <span
+          class="text-xs transition-colors"
+          :class="isPlanMode ? 'text-purple-400' : 'text-gray-500 hover:text-gray-400'"
+        >Plan</span>
+      </label>
     </div>
 
     <div
@@ -234,6 +249,7 @@ const agent = computed(() => store.agents.find(a => a.id === props.task.agent_id
 const canUpload = computed(() => !!agent.value?.cwd)
 const canSyncRemote = computed(() => !!agent.value?.cwd)
 const isAutoCompactDisabled = computed(() => !!store.autoCompactDisabled[props.task.id])
+const isPlanMode = computed(() => !!store.planMode[props.task.id])
 const uploadTitle = computed(() =>
   canUpload.value ? 'Upload files' : 'Configure agent cwd to enable uploads'
 )
@@ -533,6 +549,12 @@ function toggleAutoCompact() {
   const newDisabled = !isAutoCompactDisabled.value
   window.dispatchEvent(new CustomEvent('toggle-auto-compact', {
     detail: { taskId: props.task.id, disabled: newDisabled }
+  }))
+}
+
+function togglePlanMode() {
+  window.dispatchEvent(new CustomEvent('toggle-plan-mode', {
+    detail: { taskId: props.task.id, enabled: !isPlanMode.value }
   }))
 }
 
