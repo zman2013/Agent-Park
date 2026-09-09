@@ -239,14 +239,11 @@ def truncate_entries(layer: str, entries: list[dict]) -> tuple[list[dict], int]:
     final tiebreak. Deterministic and explainable on purpose: a relevance score
     would decide what the user loses using a number they cannot see or correct.
 
-    That last tiebreak is not cosmetic. A 12-day replay of real history showed
-    every entry sitting at ``n=1`` with the same ``last`` — a document acquires
-    genuinely distinct facts far more often than it re-sees one. With all keys
-    tied, a stable sort preserves document order, which is oldest-first, so
-    truncation kept the oldest entries and dropped every new one: once the
-    document filled up on day 5 it froze and no new knowledge could ever enter.
-    Breaking ties toward recent arrivals makes a full document behave as a
-    rolling window instead of a sealed one.
+    The arrival tiebreak matters for entries added on the same day, which all
+    carry an identical ``last``: without it a stable sort keeps whichever the
+    document happened to list first, so an over-budget day drops its newest
+    findings. It is a genuine but narrow improvement — it only reorders entries
+    that are already tied on both frequency and recency.
 
     Returns (kept, dropped_count).
     """
@@ -410,9 +407,9 @@ def apply_delta(
             # entries alongside the new conversation and chose to revise this
             # one, which means the new material spoke to it again. Without this,
             # n only grew when a title hashed identically — and a 12-day replay
-            # of real history produced n=1 for every single entry, leaving the
-            # frequency half of the truncation ranking dead and ordering by
-            # recency alone.
+            # of real history produced n=1 for every single entry across 31
+            # updates, leaving the frequency half of the truncation ranking a
+            # constant.
             target["n"] = target.get("n", 1) + 1
             # A rename must re-key the entry, or its id no longer matches its
             # title and the next `add` of that same title hashes to a different
@@ -670,6 +667,7 @@ async def consolidate(
     tasks: list,
     hotfiles_tasks: list | None = None,
     progress_cb=None,
+    today: str | None = None,
 ) -> dict:
     """Consolidate every layer for *eid*.
 
@@ -677,6 +675,11 @@ async def consolidate(
     feeds the file-heat statistics, which keep a multi-day window and must span
     every agent sharing this store — computing them from one member and then
     overwriting the shared document discards the rest.
+
+    *today* is the date stamped onto touched entries; it defaults to the real
+    current date. Callers replaying history must pass the date being replayed,
+    or every entry lands on the same date and ``last`` stops discriminating —
+    which silently disables the recency half of the truncation ranking.
 
     ``profile.md`` is never touched: it is the user's own file.
     """
@@ -688,7 +691,8 @@ async def consolidate(
     from server.state import app_state
 
     cfg = automemory_config()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today is None:
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     hotfiles_tasks = tasks if hotfiles_tasks is None else hotfiles_tasks
 
     async def progress(step: str, detail: str):
