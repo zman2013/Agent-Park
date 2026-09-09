@@ -36,14 +36,11 @@ READONLY_SETTINGS = json.dumps({
 def effective_memory_agent_id(agent_id: str) -> str:
     """Return the agent id whose memory file should be used.
 
-    If the agent has shared_memory_agent_id set, reads/writes go to that
-    agent's memory file instead of its own.
+    Thin alias kept for existing callers; the rule itself lives in
+    ``auto_memory.effective_id`` so memory and knowledge cannot diverge.
     """
-    from server.state import app_state
-    agent = app_state.get_agent(agent_id)
-    if agent and agent.shared_memory_agent_id:
-        return agent.shared_memory_agent_id
-    return agent_id
+    from server.auto_memory import effective_id
+    return effective_id(agent_id)
 
 
 def _memory_path(agent_id: str) -> Path:

@@ -43,7 +43,11 @@ class CodexAdapter(BaseAdapter):
         agent_cwd: str,
         resume_at: str | None = None,
         plan_mode: bool = False,
+        system_prompt: str = "",
     ) -> list[str]:
+        # system_prompt is ignored: `codex exec` has no --append-system-prompt
+        # equivalent. supports_system_prompt() returns False, so the caller
+        # keeps folding memory into the prompt text for this adapter.
         # command might be "ept codex", "ept codex -m k2", etc.
         parts = shlex.split(command)
 

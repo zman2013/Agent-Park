@@ -586,6 +586,13 @@ class AgentRunner:
         # two concurrent inputs each start a run and the second's kill_existing
         # tears down the first's subprocess, dropping its input.
         self._input_locks: dict[str, asyncio.Lock] = {}
+        # Persistent-memory block per task, built once on first run and reused
+        # for every resume so the system-prompt cache prefix stays byte-stable
+        # within one task's lifetime. Deliberately not persisted: 1782 tasks x
+        # ~4 KB would mean rewriting a 7 MB JSON on every new task, and the only
+        # consequence of losing it is that a task resumed after a restart picks
+        # up newer memory.
+        self._memory_snapshots: dict[str, str] = {}
 
     def input_lock(self, task_id: str) -> asyncio.Lock:
         """Return the per-task lock guarding check-status-then-send_input."""
@@ -717,17 +724,36 @@ class AgentRunner:
                 skip_wiki = True
                 prompt = prompt[len("!wiki"):].lstrip()
 
-            # Inject memory and wiki context only on new sessions (no existing session_id and not a fork)
-            if not session_id and not fork_sid:
-                from server.memory import load_memory
-                from server.config import memory_config
-                mem_cfg = memory_config()
-                memory_lines = load_memory(task.agent_id, mem_cfg["max_lines"])
+            # Select adapter first: whether memory can ride in the system prompt
+            # decides how it gets injected below.
+            adapter = get_adapter(command)
+            self._adapters[task_id] = adapter
 
+            # Persistent memory. One snapshot per task, reused for every run:
+            # the system prompt is a cacheable prefix, so identical bytes across
+            # resumes keep the cache warm while a changed value would break it
+            # mid-task.
+            memory_context = self._memory_snapshots.get(task_id)
+            if memory_context is None:
+                from server import auto_memory
+                memory_context = auto_memory.build_context(task.agent_id)
+                self._memory_snapshots[task_id] = memory_context
+
+            system_prompt = ""
+            if adapter.supports_system_prompt():
+                # Injected on every run, new session or resume alike, so memory
+                # survives /compact and session renewal.
+                system_prompt = memory_context
+
+            # Inject wiki context only on new sessions (no existing session_id
+            # and not a fork). It is a per-prompt search result, not persistent
+            # memory, so it does not belong in the cached system prompt.
+            if not session_id and not fork_sid:
                 parts: list[str] = []
-                if memory_lines:
-                    memory_text = "\n".join(memory_lines)
-                    parts.append(f"<memory>\n{memory_text}\n</memory>")
+                if not system_prompt and memory_context:
+                    # Adapter has no system-prompt channel: fall back to the
+                    # prompt prefix, as before.
+                    parts.append(memory_context)
 
                 if not skip_wiki and agent and agent.wiki:
                     try:
@@ -762,13 +788,11 @@ class AgentRunner:
                 parts.append(prompt)
                 prompt = "\n\n".join(parts)
 
-            # Select adapter and build args
-            adapter = get_adapter(command)
-            self._adapters[task_id] = adapter
             args = adapter.build_args(
                 command, prompt, session_id, fork_sid, agent_cwd,
                 resume_at=fork_resume_at,
                 plan_mode=task_id in self._plan_mode,
+                system_prompt=system_prompt,
             )
             ctx = _RunContext(self, task_id)
 
@@ -1386,6 +1410,9 @@ class AgentRunner:
         self._handoff_pending.discard(task_id)
         self._run_start_index.pop(task_id, None)
         self._input_locks.pop(task_id, None)
+        # Cleared here, not in _cleanup_run_resources: the snapshot must outlive
+        # every run of this task so resumes keep sending identical bytes.
+        self._memory_snapshots.pop(task_id, None)
 
     # ── orphan task restore ─────────────────────────────────────────────
 
