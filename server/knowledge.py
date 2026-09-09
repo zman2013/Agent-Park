@@ -22,16 +22,20 @@ logger = logging.getLogger(__name__)
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 
+# One lock per effective id, guarding the read-modify-write of its documents.
+_eid_locks: dict[str, asyncio.Lock] = {}
+
 
 # ── Directory helpers ──────────────────────────────────────────────────────────
 
 def effective_knowledge_agent_id(agent_id: str) -> str:
-    """Return the agent id whose knowledge dir should be used (same logic as memory)."""
-    from server.state import app_state
-    agent = app_state.get_agent(agent_id)
-    if agent and agent.shared_memory_agent_id:
-        return agent.shared_memory_agent_id
-    return agent_id
+    """Return the agent id whose knowledge dir should be used.
+
+    Thin alias kept for existing callers; the rule itself lives in
+    ``auto_memory.effective_id``.
+    """
+    from server.auto_memory import effective_id
+    return effective_id(agent_id)
 
 
 def knowledge_dir(agent_id: str) -> Path:
@@ -586,8 +590,15 @@ async def generate_summary(
     agent_id: str,
     tasks: list,
     progress_cb=None,
+    hotfiles_tasks: list | None = None,
 ) -> dict:
     """Main entry: extract, merge, write docs, update memory index.
+
+    *tasks* feeds the LLM extraction (usually one day's worth). *hotfiles_tasks*
+    feeds the file-heat statistics, which keep their own multi-day window and
+    must span every agent sharing this knowledge store — computing them from a
+    single agent's tasks and then overwriting the shared document discards the
+    other members' data. Defaults to *tasks* when not given.
 
     progress_cb(step, detail) is called with progress updates if provided.
     Returns {"files_updated": [...], "memory_entries": N}
@@ -605,6 +616,29 @@ async def generate_summary(
         if progress_cb:
             await progress_cb(step, detail)
 
+    # Serialize per effective id: the daily loop and the manual 🧠 button both
+    # read-modify-write the same documents, and an interleaved run would drop
+    # whichever side read first.
+    lock = _eid_locks.setdefault(eid, asyncio.Lock())
+    async with lock:
+        return await _generate_summary_locked(
+            agent_id, eid, tasks,
+            hotfiles_tasks if hotfiles_tasks is not None else tasks,
+            command, recent_days, hotfiles_max, cfg, progress,
+        )
+
+
+async def _generate_summary_locked(
+    agent_id: str,
+    eid: str,
+    tasks: list,
+    hotfiles_tasks: list,
+    command: str,
+    recent_days: int,
+    hotfiles_max: int,
+    cfg: dict,
+    progress,
+) -> dict:
     await progress("extracting", f"分析 {len(tasks)} 个任务...")
 
     # Step 1: Extract signals (no LLM)
@@ -614,7 +648,7 @@ async def generate_summary(
 
     agent = app_state.get_agent(agent_id)
     project_root = (agent.cwd or "").strip() if agent else ""
-    hotfiles = compute_hotfiles(tasks, recent_days, project_root=project_root or None)
+    hotfiles = compute_hotfiles(hotfiles_tasks, recent_days, project_root=project_root or None)
 
     await progress("extracting", f"提取到 {len(error_signals)} 条错误信号，{len(project_signals)} 条知识信号，{len(hotfiles)} 个文件")
 

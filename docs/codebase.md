@@ -25,6 +25,7 @@ agent-park/
 │   ├── routes_ws.py         # WebSocket 路由，消息分发，broadcast()，定时任务
 │   ├── routes_rest.py       # REST API（Agent/Task CRUD、Memory、Knowledge）
 │   ├── memory.py            # Agent 记忆读写（JSONL 格式）
+│   ├── auto_memory.py       # effective_id 唯一定义 + 启动上下文组装（build_context）
 │   ├── knowledge.py         # 知识总结：信号提取、LLM 合并、文档写入、memory 索引
 │   ├── task_notify.py       # Task 终态飞书通知（卡片拼装 + 发送）
 │   └── config.py            # 读取 config.json 配置
@@ -241,12 +242,34 @@ agent_runner._finish_task(task_id, status)
 - `save_sessions()` → 写入 `data/sessions.json`（cco 续话用）
 - 启动时从 JSON 恢复，running/waiting 任务重置为 failed
 
-## Agent 记忆管理（memory.py）
+## Agent 记忆管理（memory.py / auto_memory.py）
 
 - 格式：JSONL，每行一条 `MemoryEntry`（timestamp、type、content）
-- 文件位置：`data/memory/{agent_id}.jsonl`
-- 支持多 Agent 共享记忆（通过 `shared_memory_agent_id`）
+- 文件位置：`data/memory/{effective_id}.jsonl`
 - 最大行数由 `config.json` 的 `memory.max_lines` 控制
+
+### effective_id：唯一定义在 auto_memory.py
+
+`auto_memory.effective_id(agent_id)` 是 memory / knowledge 共用的**唯一**实现（`memory.effective_memory_agent_id` 与 `knowledge.effective_knowledge_agent_id` 都是转发别名）。多个 worktree agent 通过 `shared_memory_agent_id` 指向同一个 eid，共享一份记忆与知识。
+
+只解析一跳，不跟链；指向不存在的 agent 时退回自身并 `logger.warning` —— 否则一个配置 typo 会静默把整个项目的记忆重定向。
+
+配套两个聚合函数：`eid_members(eid)`（全部成员，含 archived）、`active_eids()`（至少一个未 archived 成员的 eid）。
+
+### 上下文注入（agent_runner.py）
+
+`auto_memory.build_context(agent_id)` 组装 `<memory>` 块，纯读、无 LLM、无副作用；无内容返回 `""`。
+
+注入通道取决于 adapter 能力位 `supports_system_prompt()`：
+
+| adapter | 通道 | 新 session | resume | `/compact` 后 |
+|---|---|---|---|---|
+| cco/ccs（`CcoAdapter`） | `--append-system-prompt` | ✅ | ✅ | ✅ **保留** |
+| codex（`CodexAdapter`） | prompt 前缀（无对等 flag） | ✅ | ❌ | ❌ |
+
+system prompt 是**可缓存前缀、不进转录**，所以每轮重复传同样字节几乎免费，且能跨 `/compact` 与 session 续期存活 —— 这正是 prompt 前缀注入做不到的。代价是**内容一变缓存就断**，因此每个 task 用 `_memory_snapshots[task_id]` 锁定一份快照，同一 task 的所有 run 传相同字节。该快照**不落盘**，在 `forget_task()`（task 删除）清理，而不是 `_cleanup_run_resources()`（单轮结束）—— 它必须跨 resume 存活。
+
+`<wiki-context>` **不走** system prompt：它是 per-prompt 检索结果而非持久记忆，仍只在新 session 拼进 prompt。
 
 ## 知识总结系统（knowledge.py）
 
@@ -260,8 +283,6 @@ data/knowledge/{effective_id}/
 ├── project.md      # 项目知识（目录结构、常用命令、约定）
 └── hotfiles.md     # 文件热度统计（最近 7 天读写频率 top 20）
 ```
-
-`effective_id` 与 memory 共用同一套 `shared_memory_agent_id` 逻辑，同项目多 worktree agent 共享同一份知识。
 
 ### 提取流程
 
@@ -282,6 +303,8 @@ Step 3: 写入
   - 删除 memory 中旧的 knowledge_summary 条目，写入新条目
 ```
 
+`generate_summary(agent_id, tasks, progress_cb, hotfiles_tasks)` 分开接收两个任务集：`tasks` 喂 LLM（通常是当天的），`hotfiles_tasks` 喂统计（必须是该 eid 全部成员的，见下节）。每个 eid 一把 `asyncio.Lock`，串行化每日循环与手工 🧠 的读-改-写。
+
 ### Memory 注入格式
 
 ```
@@ -290,11 +313,11 @@ Step 3: 写入
 [热点文件] 近期高频文件: file1(读N/改M), ...。详见 data/knowledge/{eid}/hotfiles.md
 ```
 
-Agent 启动时通过现有 memory 注入路径自动获取，零改动 agent_runner.py。
+写入 memory JSONL，由 `auto_memory.build_context()` 统一注入。
 
 ### LLM 命令配置
 
-`config.json` 中 `knowledge.command`（默认 `minimax`），可改为 `ccs`、`cco` 等。
+`config.json` 中 `knowledge.command`（默认 `minimax`），可改为 `ccs`、`cco` 等。`knowledge.enabled` 控制每日循环与手工触发是否生效。
 
 ## 定时任务（routes_ws.py）
 
@@ -303,14 +326,19 @@ Agent 启动时通过现有 memory 注入路径自动获取，零改动 agent_ru
 | 任务 | 实现 | 触发时机 |
 |------|------|----------|
 | WebSocket 心跳 | `_heartbeat_loop()`，每 20 秒 broadcast ping | 首个 WS 客户端连接时 |
-| 每日知识总结 | `_daily_summary_loop()`，每天凌晨 0 点 | 应用启动时（lifespan） |
+| 每日知识总结 | `_daily_summary_loop()`，每天 00:30（`DAILY_SUMMARY_HOUR/MINUTE`） | 应用启动时（lifespan） |
+| 每日 wiki ingest | `_wiki_ingest_loop()`，默认 00:00（`wiki_ingest.schedule`） | 应用启动时（lifespan） |
+
+知识总结定在 00:30 而非 00:00，是为了与 wiki ingest 错开，避免两套 LLM 调用在午夜串行堆积。
 
 **每日知识总结流程**：
 1. 应用启动 → `lifespan` → `ensure_daily_summary_task()`
-2. 循环计算到下一个本地时间凌晨 0 点的秒数，`asyncio.sleep()`
-3. 醒来 → 对所有 agent 执行 `_run_daily_summary(agent_id, yesterday)`
+2. 循环计算到下一个 00:30 的秒数，`asyncio.sleep()`
+3. 醒来 → `run_daily_summary_all(date)` → 对 `active_eids()` 中每个 **eid** 执行 `_run_daily_summary(eid, date)`
 4. 按 `task.updated_at` 过滤前一天的任务，无任务则跳过
 5. 调用 `generate_summary()`，结果写入 knowledge 文档并更新 memory 索引
+
+**为什么按 eid 而非 agent_id 遍历**：514 个 agent（480 已 archived）只对应 25 个活跃 eid。按 agent_id 遍历时，共享同一份文档的 N 个 agent 会让 LLM 在同一份文档上跑 N 遍（`648e67d1ac10` 有 478 个成员）；更糟的是 `compute_hotfiles()` 只吃单个 agent 的 task 后覆盖写，后写的赢 —— 实测按 eid 汇总得到 6991 个文件，按单 agent 只有 622 个。`_eid_tasks(eid)` 负责汇总，archived agent 的历史已冻结故 `active_eids()` 跳过。手工 🧠（`_run_generate_summary`）走同一条聚合路径。
 
 ## 前端状态管理（agentStore.js）
 

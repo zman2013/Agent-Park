@@ -34,6 +34,7 @@ class CcoAdapter(BaseAdapter):
         agent_cwd: str,
         resume_at: str | None = None,
         plan_mode: bool = False,
+        system_prompt: str = "",
     ) -> list[str]:
         base_args = [
             command,
@@ -43,6 +44,13 @@ class CcoAdapter(BaseAdapter):
             "--include-partial-messages",
             "--dangerously-skip-permissions",
         ]
+
+        if system_prompt:
+            # A cacheable prefix that stays outside the transcript, so unlike
+            # prompt-prefix injection it survives /compact and session renewal
+            # and can be passed identically on every resume. Verified to take
+            # effect alongside --resume.
+            base_args += ["--append-system-prompt", system_prompt]
 
         if plan_mode:
             # The cco/ccs wrappers hardcode --dangerously-skip-permissions,
@@ -358,3 +366,6 @@ class CcoAdapter(BaseAdapter):
         """Clear internal state between sessions."""
         self._current_msg = None
         self._current_block_type = None
+
+    def supports_system_prompt(self) -> bool:
+        return True

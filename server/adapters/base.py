@@ -97,8 +97,14 @@ class BaseAdapter(ABC):
         agent_cwd: str,
         resume_at: str | None = None,
         plan_mode: bool = False,
+        system_prompt: str = "",
     ) -> list[str]:
-        """Build subprocess command-line arguments."""
+        """Build subprocess command-line arguments.
+
+        *system_prompt*, when non-empty, is persistent context to append to the
+        agent's system prompt. Adapters reporting
+        ``supports_system_prompt() is False`` ignore it.
+        """
         ...
 
     @abstractmethod
@@ -109,3 +115,11 @@ class BaseAdapter(ABC):
     def needs_pty(self) -> bool:
         """Whether the subprocess requires a PTY (default True for cco)."""
         return True
+
+    def supports_system_prompt(self) -> bool:
+        """Whether build_args honors the *system_prompt* argument.
+
+        False by default: a protocol with no equivalent flag must keep receiving
+        its context inside the prompt text, or it would silently lose memory.
+        """
+        return False

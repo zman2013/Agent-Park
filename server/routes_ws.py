@@ -19,6 +19,10 @@ clients: set[WebSocket] = set()
 SEND_TIMEOUT_SECONDS = 2.0
 HEARTBEAT_INTERVAL_SECONDS = 20.0
 AGENTLOOP_NOTIFY_INTERVAL_SECONDS = 60.0
+# Staggered off 00:00 so knowledge consolidation and wiki ingest don't both
+# wake into a serial pile of LLM calls at midnight.
+DAILY_SUMMARY_HOUR = 0
+DAILY_SUMMARY_MINUTE = 30
 _heartbeat_task: asyncio.Task | None = None
 _daily_summary_task: asyncio.Task | None = None
 _wiki_ingest_task: asyncio.Task | None = None
@@ -74,56 +78,86 @@ def ensure_daily_summary_task() -> None:
 
 
 async def _daily_summary_loop() -> None:
-    """Sleep until next midnight (local time), then run summary for all agents."""
+    """Sleep until the daily slot, then consolidate knowledge per effective id."""
     from datetime import datetime, timedelta
 
     while True:
         now = datetime.now()
-        # Next midnight
-        next_midnight = (now + timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
+        target = now.replace(
+            hour=DAILY_SUMMARY_HOUR, minute=DAILY_SUMMARY_MINUTE,
+            second=0, microsecond=0,
         )
-        sleep_seconds = (next_midnight - now).total_seconds()
+        if target <= now:
+            target = target + timedelta(days=1)
+        sleep_seconds = (target - now).total_seconds()
         logger.info(
             "Daily summary scheduled in %.0f s (at %s)",
             sleep_seconds,
-            next_midnight.strftime("%Y-%m-%d %H:%M:%S"),
+            target.strftime("%Y-%m-%d %H:%M:%S"),
         )
         await asyncio.sleep(sleep_seconds)
 
-        # Run summary for every agent
-        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        logger.info("Running daily knowledge summary for date %s", yesterday)
-        for agent_id in list(app_state.agents.keys()):
-            try:
-                await _run_daily_summary(agent_id, yesterday)
-            except Exception:
-                logger.exception("Daily summary failed for agent %s", agent_id)
+        # Consolidate the day that just ended, not "now".
+        target_date = (target - timedelta(days=1)).strftime("%Y-%m-%d")
+        await run_daily_summary_all(target_date)
 
 
-async def _run_daily_summary(agent_id: str, date: str) -> None:
-    """Run knowledge summary for a single agent for a specific date."""
+async def run_daily_summary_all(date: str) -> None:
+    """Consolidate every active effective id for *date*.
+
+    Iterates effective ids rather than agent ids: several agents can share one
+    knowledge store, and running once per agent both re-ran the LLM N times
+    over the same documents and let each pass overwrite hotfiles.md with only
+    that one agent's file-access data.
+    """
+    from server.auto_memory import active_eids
+
+    logger.info("Running daily knowledge summary for date %s", date)
+    for eid in active_eids():
+        try:
+            await _run_daily_summary(eid, date)
+        except Exception:
+            logger.exception("Daily summary failed for eid %s", eid)
+
+
+def _eid_tasks(eid: str) -> list:
+    """Return every task belonging to any agent that maps to *eid*."""
+    from server.auto_memory import eid_members
+
+    tasks = []
+    seen: set[str] = set()
+    for aid in eid_members(eid):
+        agent = app_state.get_agent(aid)
+        for tid in agent.task_ids if agent else []:
+            if tid in seen:
+                continue
+            task = app_state.tasks.get(tid)
+            if task is not None:
+                seen.add(tid)
+                tasks.append(task)
+    return tasks
+
+
+async def _run_daily_summary(eid: str, date: str) -> None:
+    """Run knowledge summary for one effective id for a specific date."""
     from server.knowledge import generate_summary
 
-    agent = app_state.get_agent(agent_id)
-    tasks = [
-        app_state.tasks[tid]
-        for tid in (agent.task_ids if agent else [])
-        if tid in app_state.tasks
-    ]
-    # Filter to tasks updated on the target date
-    tasks = [t for t in tasks if (getattr(t, "updated_at", "") or "").startswith(date)]
-    if not tasks:
-        logger.info("No tasks for agent %s on %s, skipping summary", agent_id, date)
+    all_tasks = _eid_tasks(eid)
+    # LLM extraction only looks at the target day; hotfiles keeps its own
+    # multi-day window, so it gets the unfiltered set.
+    day_tasks = [t for t in all_tasks if (getattr(t, "updated_at", "") or "").startswith(date)]
+    if not day_tasks:
+        logger.info("No tasks for eid %s on %s, skipping summary", eid, date)
         return
 
     logger.info(
-        "Daily summary: agent=%s date=%s tasks=%d", agent_id, date, len(tasks)
+        "Daily summary: eid=%s date=%s tasks=%d members_tasks=%d",
+        eid, date, len(day_tasks), len(all_tasks),
     )
-    result = await generate_summary(agent_id, tasks)
+    result = await generate_summary(eid, day_tasks, hotfiles_tasks=all_tasks)
     logger.info(
-        "Daily summary done: agent=%s files=%s memory_entries=%d",
-        agent_id,
+        "Daily summary done: eid=%s files=%s memory_entries=%d",
+        eid,
         result.get("files_updated"),
         result.get("memory_entries", 0),
     )
@@ -549,8 +583,13 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
 
     try:
         cfg = knowledge_config()
-        agent = app_state.get_agent(agent_id)
-        tasks = [app_state.tasks[tid] for tid in (agent.task_ids if agent else []) if tid in app_state.tasks]
+        from server.auto_memory import effective_id
+        eid = effective_id(agent_id)
+        # Aggregate across every agent sharing this knowledge store, matching
+        # the daily loop; otherwise a manual run would shrink hotfiles.md down
+        # to just the agent whose button was clicked.
+        all_tasks = _eid_tasks(eid)
+        tasks = all_tasks
         if date_range == "today":
             from datetime import datetime, timezone
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -562,7 +601,9 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
             completed.sort(key=lambda t: t.updated_at or "", reverse=True)
             tasks = completed[:n]
 
-        result = await generate_summary(agent_id, tasks, progress_cb)
+        result = await generate_summary(
+            eid, tasks, progress_cb, hotfiles_tasks=all_tasks
+        )
         await broadcast({
             "type": "summary_done",
             "agent_id": agent_id,
