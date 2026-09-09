@@ -53,15 +53,6 @@ def upload_config() -> dict:
     }
 
 
-def memory_config() -> dict:
-    """Return the global memory configuration with defaults."""
-    cfg = get_config().get("memory", {})
-    return {
-        "command": cfg.get("command", "cco"),
-        "max_lines": int(cfg.get("max_lines", 200)),
-    }
-
-
 def compact_config() -> dict:
     """Return the compact (auto-trigger / warning) configuration with defaults.
 
@@ -90,14 +81,14 @@ def compact_config() -> dict:
 def automemory_config() -> dict:
     """Return the auto-memory configuration with defaults.
 
-    ``enabled`` gates the layered documents. While it is false, injection falls
-    back to the flat ``data/memory/{eid}.jsonl`` path byte for byte and the
-    daily loop does not consolidate — so this flag is the rollout switch, and
-    flipping it is the whole of Phase 3.
+    There is no ``enabled`` flag: the layered documents are the only memory
+    system, so there is nothing to fall back to. ``daily_enabled`` gates only the
+    unattended 00:30 consolidation loop — injection and the manual 🧠 button run
+    regardless.
     """
     cfg = get_config().get("automemory", {})
     return {
-        "enabled": bool(cfg.get("enabled", False)),
+        "daily_enabled": bool(cfg.get("daily_enabled", True)),
         "command": cfg.get("command", "glm"),
         # merge_errors built a ~17k-char prompt and timed out 3/3 at the old
         # 120s default — indistinguishable, to its callers, from "the model
@@ -108,19 +99,8 @@ def automemory_config() -> dict:
         "lessons_max_items": int(cfg.get("lessons_max_items", 30)),
         "project_max_items": int(cfg.get("project_max_items", 40)),
         "max_signal_chars": int(cfg.get("max_signal_chars", 12000)),
-    }
-
-
-def knowledge_config() -> dict:
-    """Return the knowledge summary configuration with defaults."""
-    cfg = get_config().get("knowledge", {})
-    return {
-        "enabled": cfg.get("enabled", True),
-        "command": cfg.get("command", "minimax"),
-        "errors_max_items": int(cfg.get("errors_max_items", 10)),
-        "errors_max_chars": int(cfg.get("errors_max_chars", 2000)),
-        "project_max_items": int(cfg.get("project_max_items", 15)),
-        "project_max_chars": int(cfg.get("project_max_chars", 2000)),
+        # hotfiles is pure Python statistics; these were the only knowledge_config
+        # keys the layered system still used.
         "hotfiles_max_items": int(cfg.get("hotfiles_max_items", 20)),
         "hotfiles_recent_days": int(cfg.get("hotfiles_recent_days", 7)),
         "default_task_count": int(cfg.get("default_task_count", 5)),

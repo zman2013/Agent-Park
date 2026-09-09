@@ -686,7 +686,7 @@ async def consolidate(
     import asyncio
     from datetime import datetime, timezone
 
-    from server.config import automemory_config, knowledge_config
+    from server.config import automemory_config
     from server.knowledge import compute_hotfiles, extract_project_signals
     from server.state import app_state
 
@@ -707,9 +707,8 @@ async def consolidate(
 
         agent = app_state.get_agent(eid)
         project_root = (agent.cwd or "").strip() if agent else ""
-        kcfg = knowledge_config()
         hotfiles = compute_hotfiles(
-            hotfiles_tasks, kcfg["hotfiles_recent_days"], project_root=project_root or None
+            hotfiles_tasks, cfg["hotfiles_recent_days"], project_root=project_root or None
         )
         await progress(
             "extracting",
@@ -726,7 +725,7 @@ async def consolidate(
         # hotfiles: pure statistics, no LLM. This is the only layer that has
         # never been polluted, across two independent measurements.
         await progress("writing", "写入 hotfiles.md...")
-        write_layer(eid, "hotfiles", _hotfiles_doc(hotfiles, kcfg["hotfiles_max_items"]))
+        write_layer(eid, "hotfiles", _hotfiles_doc(hotfiles, cfg["hotfiles_max_items"]))
 
     totals = {k: sum(r[k] for r in results.values())
               for k in ("added", "updated", "deleted", "refused", "dropped")}
@@ -827,18 +826,8 @@ def build_context(agent_id: str) -> str:
     """Assemble this agent's persistent memory into one injectable block.
 
     Pure read: no LLM, no side effects, no writes. Returns "" when there is
-    nothing to inject, so callers can skip the flag entirely.
-
-    Dispatches on ``automemory.enabled``. While disabled, this returns exactly
-    what the flat-jsonl injection produced, byte for byte — that equality is
-    the regression baseline for the whole layered rollout, so the old path is
-    kept rather than emulated.
+    nothing to inject, so callers need no flag of their own.
     """
-    from server.config import automemory_config
-
-    if not automemory_config()["enabled"]:
-        return _build_context_legacy(agent_id)
-
     eid = effective_id(agent_id)
     blocks: list[str] = []
     for layer in LAYERS:
@@ -861,15 +850,4 @@ def _strip_comments(md: str) -> str:
     """
     out = re.sub(r"<!--.*?-->", "", md, flags=re.DOTALL)
     return "\n".join(l.rstrip() for l in out.splitlines() if l.strip()).strip()
-
-
-def _build_context_legacy(agent_id: str) -> str:
-    """The pre-layer injection: flat ``{eid}.jsonl`` lines in one block."""
-    from server.config import memory_config
-    from server.memory import load_memory
-
-    lines = load_memory(agent_id, memory_config()["max_lines"])
-    if not lines:
-        return ""
-    return f"{_MEMORY_HEADER}\n\n<memory>\n" + "\n".join(lines) + "\n</memory>"
 

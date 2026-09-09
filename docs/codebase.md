@@ -24,8 +24,8 @@ agent-park/
 │   ├── agent_runner.py      # 核心：子进程管理、PTY、流式输出处理
 │   ├── routes_ws.py         # WebSocket 路由，消息分发，broadcast()，定时任务
 │   ├── routes_rest.py       # REST API（Agent/Task CRUD、Memory、Knowledge）
-│   ├── memory.py            # 旧扁平 JSONL 读写（automemory 关闭时的注入源）
 │   ├── auto_memory.py       # 四层记忆：effective_id、build_context、consolidate + 四道闸门
+│   ├── helper_llm.py        # 辅助 LLM 调用的共用管道（只读 settings + stream-json 解析）
 │   ├── profile_store.py     # profile.md ↔ 旧 note 形状的 REST 转接层
 │   ├── knowledge.py         # 热点文件统计 + project 信号提取 + 只读知识归档
 │   ├── task_notify.py       # Task 终态飞书通知（卡片拼装 + 发送）
@@ -60,7 +60,7 @@ agent-park/
 │   │   └── {agent_id}.json
 │   ├── memory/              # Agent 记忆
 │   │   ├── {eid}/            # 四层文档 profile/lessons/project/hotfiles.md
-│   │   └── {eid}.jsonl       # 旧扁平格式（保留，automemory 关闭时的注入源）
+│   │   └── {eid}.jsonl       # 旧扁平格式，只读归档（已无代码读写，留作回滚依据）
 │   └── knowledge/           # 只读归档（迁移前的历史产出，已无代码写入）
 │       └── {effective_id}/  # errors.md / project.md / hotfiles.md
 └── docs/                    # 项目文档
@@ -186,7 +186,7 @@ _run_subprocess()
 | `fork_task` | Fork 一个已有任务（复制消息历史，创建独立会话分支） |
 | `stop_task` | 中止任务 |
 | `set_agent_order` | 重排序 Agent |
-| `generate_summary` | 手动触发巩固（`agent_id`, `date_range: "today"\|"recent_n"`）；不受 `automemory.enabled` 限制 |
+| `generate_summary` | 手动触发巩固（`agent_id`, `date_range: "today"\|"recent_n"`）；不受 `automemory.daily_enabled` 限制 |
 
 ### 服务端 → 客户端（broadcast）
 
@@ -244,7 +244,7 @@ agent_runner._finish_task(task_id, status)
 - `save_sessions()` → 写入 `data/sessions.json`（cco 续话用）
 - 启动时从 JSON 恢复，running/waiting 任务重置为 failed
 
-## Agent 记忆管理（auto_memory.py / memory.py）
+## Agent 记忆管理（auto_memory.py）
 
 ### 四层文档
 
@@ -265,17 +265,25 @@ data/memory/{effective_id}/
 
 **巩固永不写 `profile.md`** —— 它是唯一人工权威源，自动写入会破坏用户对系统的信任基础。
 
-目录（`{eid}/`）与旧的扁平 `{eid}.jsonl` **并存**，迁移只新增文件不替换，回滚就是把 `automemory.enabled` 改回 `false`。
+**这是唯一的记忆系统，没有开关、没有回退路径。** 旧的扁平 `{eid}.jsonl` 读写（`server/memory.py`）连同 `automemory.enabled` 开关一起删掉了 —— 留一个永远为 `true` 的开关，只是把两条代码路径的维护成本伪装成安全感。`automemory.daily_enabled` 只管无人值守的 00:30 循环，注入与手工 🧠 不受它限制。
 
-`automemory.enabled` 是总开关：`false` 时注入沿用 `{eid}.jsonl` 路径（**逐字节不变**，实测 381 个有内容的 agent 全部一致），每日循环不巩固；手工 🧠 不受开关限制，它是在信任无人值守之前拿真实历史压测的通道。
+`data/memory/*.jsonl` 八个文件**留在原地但已无任何代码读写**，与 `data/knowledge/` 同为只读归档。它们是回滚这次删除的唯一依据，所以别顺手清理。
+
+`build_context` 对没有文档的 eid 返回 `""`（`read_layer` 对缺失目录返回 `""`）—— 36 个 eid 里 31 个正处于这个状态，这条路径是常态而非边界情况。
 
 ### effective_id：唯一定义在 auto_memory.py
 
-`auto_memory.effective_id(agent_id)` 是 memory / knowledge 共用的**唯一**实现（`memory.effective_memory_agent_id` 与 `knowledge.effective_knowledge_agent_id` 都是转发别名）。多个 worktree agent 通过 `shared_memory_agent_id` 指向同一个 eid，共享一份记忆与知识。
+`auto_memory.effective_id(agent_id)` 是 memory / knowledge 共用的**唯一**实现（曾经的 `memory.effective_memory_agent_id` 与 `knowledge.effective_knowledge_agent_id` 两个转发别名已删）。多个 worktree agent 通过 `shared_memory_agent_id` 指向同一个 eid，共享一份记忆与知识。
 
 只解析一跳，不跟链；指向不存在的 agent 时退回自身并 `logger.warning` —— 否则一个配置 typo 会静默把整个项目的记忆重定向。
 
 配套两个聚合函数：`eid_members(eid)`（全部成员，含 archived）、`active_eids()`（至少一个未 archived 成员的 eid）。
+
+### 辅助 LLM 调用（helper_llm.py）
+
+`READONLY_SETTINGS` / `parse_stream_json_result` / `compress_content` 原先住在 `memory.py` 里，但它们不属于记忆系统 —— 是所有非 agent 的 LLM 调用（knowledge 抽取、wiki ingest、profile 条目压缩）共用的管道，所以随 `memory.py` 删除一起搬到 `server/helper_llm.py`。
+
+`READONLY_SETTINGS` 是其中要紧的一个：这些命令是带 `--dangerously-skip-permissions` 的完整 coding agent，我们只读它们的 stdout，但不加限制时实测有一次它**改写了 `docs/error_experience.md`** —— 被要求「返回」一份合并后的文档，它找到仓库里一个同样标题格式的文件，认定那就是目标，然后编辑了它。`cwd` 拦不住（agent 用绝对路径），`--disallowed-tools` 是变参会吞掉尾部的 prompt 参数，只有 `--settings` deny 列表这个组合能挡住写工具又不影响文本返回。
 
 ### 上下文注入（agent_runner.py）
 
@@ -312,11 +320,11 @@ MemoryPanel 的 memory tab 早于分层文档，说的是 `[{type, timestamp, co
 
 `scripts/migrate_automemory.py` 的 `render_profile` **复用 `profile_store._render`** 而不是自己拼一份：两者必须对续行约定取得一致，各写一份的话迁移会写出面板静默截断的 bullet。
 
-### 已知缺口：翻 flag 后 6 个 eid 的 project 层需要重新派生
+### 已知缺口：6 个 eid 的 project 层需要重新派生
 
-迁移只把 `note` 迁进 profile、`knowledge_summary` **全部丢弃**，所以只有含 `note` 的 eid 才有内容。实测 36 个 eid 里 8 个有注入内容，翻 `enabled` 前后对照：
+迁移只把 `note` 迁进 profile、`knowledge_summary` **全部丢弃**，所以只有含 `note` 的 eid 才有内容。删除旧系统前实测 36 个 eid 里 8 个有注入内容，新旧对照：
 
-| eid | agent | 近30d 活跃日 | 翻 flag 后 |
+| eid | agent | 近30d 活跃日 | 旧 → 新 |
 |---|---|---|---|
 | `1b158839f8aa` | schumacher-compiler-ci | 0 | 1377c → **0** |
 | `2876150ba8c6` | feishu-bot | 1 | 824c → **0** |
@@ -329,7 +337,7 @@ MemoryPanel 的 memory tab 早于分层文档，说的是 `[{type, timestamp, co
 
 **决定是接受这段真空，不补迁**（备选是把 `knowledge_summary` 剥掉 `。详见 …md` 尾巴后作为 project 种子）。依据是活跃度分布：六个受影响的 eid 近 30 天合计只有 1 个活跃日、总 task 2~17，而两个真正在用的 eid 恰好四层文档已建好。它们的 profile 层照常注入，project 层在**下次被用到的当晚 00:30** 就开始积累（巩固条件是当天有 ≥1 个 task，不是等 7 天）。
 
-数据没丢：三个归零 eid 的 `data/knowledge/{eid}/` 归档都在，`{eid}.jsonl` 一字节未改，事后补迁仍然可行 —— 这不是单向门。
+注意这个决定当初是针对「可翻回去的 flag」做的，删掉旧系统后它变成**永久**的。重做的依据仍在：`data/knowledge/{eid}/` 归档与 `data/memory/*.jsonl` 都留在原地，一字节未改。
 
 ## 巩固：LLM 只出 JSON delta，Markdown 由 Python 渲染
 
@@ -379,7 +387,7 @@ MemoryPanel 的 memory tab 早于分层文档，说的是 `[{type, timestamp, co
 
 - `compute_hotfiles()` / `build_hotfiles_md()` —— 纯 Python 文件热度统计，一个字不改地复用
 - `extract_project_signals()` —— project 层的信号来源
-- `_llm_call()` —— 只读的辅助 LLM 调用（`--settings` deny 列表 + `_clean_env()`），与 auto-memory 共用
+- `_llm_call()` —— 只读的辅助 LLM 调用（`--settings` deny 列表 + `_clean_env()`），与 auto-memory 共用；deny 列表本身在 `helper_llm.py`
 - `read_knowledge_docs()` —— 读归档
 
 
@@ -395,12 +403,14 @@ MemoryPanel 的 memory tab 早于分层文档，说的是 `[{type, timestamp, co
 
 知识总结定在 00:30 而非 00:00，是为了与 wiki ingest 错开，避免两套 LLM 调用在午夜串行堆积。
 
-**每日知识总结流程**：
-1. 应用启动 → `lifespan` → `ensure_daily_summary_task()`
+**每日巩固流程**：
+1. 应用启动 → `lifespan` → `ensure_daily_summary_task()`（受 `automemory.daily_enabled` 控制）
 2. 循环计算到下一个 00:30 的秒数，`asyncio.sleep()`
 3. 醒来 → `run_daily_summary_all(date)` → 对 `active_eids()` 中每个 **eid** 执行 `_run_daily_summary(eid, date)`
 4. 按 `task.updated_at` 过滤前一天的任务，无任务则跳过
-5. 调用 `auto_memory.consolidate()`，经四道闸门后写入四层文档（`automemory.enabled=false` 时整步跳过）
+5. 调用 `auto_memory.consolidate()`，经四道闸门后写入四层文档
+
+> 这个循环曾经**从未启动过**：`main.py` 的门是 `knowledge.enabled`，而它是 `false`（日志里 109 条 "Daily knowledge summary is disabled by config"）。也就是说光把 `automemory.enabled` 翻成 `true` 什么都不会发生 —— 一个开关守着另一套配置的开关，是这类静默失效的典型形状。现在门与被门控的东西同属 `automemory`。
 
 **为什么按 eid 而非 agent_id 遍历**：514 个 agent（480 已 archived）只对应 25 个活跃 eid。按 agent_id 遍历时，共享同一份文档的 N 个 agent 会让 LLM 在同一份文档上跑 N 遍（`648e67d1ac10` 有 478 个成员）；更糟的是 `compute_hotfiles()` 只吃单个 agent 的 task 后覆盖写，后写的赢 —— 实测按 eid 汇总得到 6991 个文件，按单 agent 只有 622 个。`_eid_tasks(eid)` 负责汇总，archived agent 的历史已冻结故 `active_eids()` 跳过。手工 🧠（`_run_generate_summary`）走同一条聚合路径。
 

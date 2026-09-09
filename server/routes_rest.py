@@ -244,12 +244,8 @@ async def get_memory(agent_id: str):
     """
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
-    from server.config import automemory_config
-    from server.memory import list_memory
-
-    if not automemory_config()["enabled"]:
-        return list_memory(agent_id)
     from server.profile_store import list_profile
+
     return list_profile(agent_id)
 
 
@@ -257,11 +253,13 @@ async def get_memory(agent_id: str):
 async def add_memory(agent_id: str, body: MemoryAddBody):
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
-    from server.memory import compress_content, append_memory, MAX_CONTENT_LENGTH, _utcnow_iso
-    from server.config import automemory_config, memory_config
+    from datetime import datetime, timezone
 
-    command = memory_config()["command"]
-    compressed = await compress_content(body.content, command)
+    from server.config import automemory_config
+    from server.helper_llm import MAX_CONTENT_LENGTH, compress_content
+    from server.profile_store import append_profile
+
+    compressed = await compress_content(body.content, automemory_config()["command"])
 
     if len(compressed) > MAX_CONTENT_LENGTH:
         return JSONResponse(
@@ -272,28 +270,23 @@ async def add_memory(agent_id: str, body: MemoryAddBody):
             },
         )
 
-    entry = {"type": body.type, "timestamp": _utcnow_iso(), "content": compressed}
-    if automemory_config()["enabled"]:
-        from server.profile_store import append_profile
-        append_profile(agent_id, compressed)
-    else:
-        append_memory(agent_id, entry)
-    return entry
+    append_profile(agent_id, compressed)
+    # profile.md stores dates only; the full timestamp is echoed back because the
+    # panel renders this response directly without re-fetching.
+    return {
+        "type": body.type,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "content": compressed,
+    }
 
 
 @router.delete("/agents/{agent_id}/memory/{line_index}")
 async def delete_memory(agent_id: str, line_index: int):
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
-    from server.config import automemory_config
+    from server.profile_store import delete_profile_line
 
-    if automemory_config()["enabled"]:
-        from server.profile_store import delete_profile_line
-        ok = delete_profile_line(agent_id, line_index)
-    else:
-        from server.memory import delete_memory_line
-        ok = delete_memory_line(agent_id, line_index)
-    if not ok:
+    if not delete_profile_line(agent_id, line_index):
         raise HTTPException(404, "memory entry not found")
     return {"ok": True}
 
@@ -302,18 +295,12 @@ async def delete_memory(agent_id: str, line_index: int):
 
 @router.get("/agents/{agent_id}/knowledge")
 async def get_knowledge(agent_id: str):
-    """Return the generated layers, plus the frozen pre-migration archive."""
+    """Return the four layers, plus the frozen pre-migration archive."""
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
-    from server.config import automemory_config
+    from server.auto_memory import effective_id, read_layer
     from server.knowledge import read_knowledge_docs
 
-    archive = read_knowledge_docs(agent_id)
-    if not automemory_config()["enabled"]:
-        # Legacy shape: the archive *is* the live document set.
-        return {"lessons": archive["errors"], **archive, "archive": archive}
-
-    from server.auto_memory import effective_id, read_layer
     eid = effective_id(agent_id)
     return {
         "lessons": read_layer(eid, "lessons"),
@@ -321,7 +308,7 @@ async def get_knowledge(agent_id: str):
         "hotfiles": read_layer(eid, "hotfiles"),
         "profile": read_layer(eid, "profile"),
         # Read-only; nothing writes data/knowledge/ any more.
-        "archive": archive,
+        "archive": read_knowledge_docs(agent_id),
     }
 
 

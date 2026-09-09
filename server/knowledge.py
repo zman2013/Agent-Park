@@ -41,18 +41,9 @@ KNOWLEDGE_DIR = DATA_DIR / "knowledge"
 
 # ── Directory helpers ──────────────────────────────────────────────────────────
 
-def effective_knowledge_agent_id(agent_id: str) -> str:
-    """Return the agent id whose knowledge dir should be used.
-
-    Thin alias kept for existing callers; the rule itself lives in
-    ``auto_memory.effective_id``.
-    """
-    from server.auto_memory import effective_id
-    return effective_id(agent_id)
-
-
 def knowledge_dir(agent_id: str) -> Path:
-    eid = effective_knowledge_agent_id(agent_id)
+    from server.auto_memory import effective_id
+    eid = effective_id(agent_id)
     return KNOWLEDGE_DIR / eid
 
 
@@ -258,7 +249,7 @@ async def _llm_call(command: str, prompt: str, timeout: int = 120) -> str:
     while leaving the text result intact.
     """
     from server.agent_runner import _clean_env
-    from server.memory import READONLY_SETTINGS
+    from server.helper_llm import READONLY_SETTINGS
     try:
         proc = await asyncio.create_subprocess_exec(
             command,
@@ -279,8 +270,8 @@ async def _llm_call(command: str, prompt: str, timeout: int = 120) -> str:
             env=_clean_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        from server.memory import _parse_stream_json_result
-        result = _parse_stream_json_result(stdout.decode("utf-8", errors="replace"))
+        from server.helper_llm import parse_stream_json_result
+        result = parse_stream_json_result(stdout.decode("utf-8", errors="replace"))
         return result.strip() if result else ""
     except asyncio.TimeoutError:
         logger.warning("LLM call timed out (command=%s)", command)

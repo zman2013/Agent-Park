@@ -6,36 +6,24 @@
   "frontend": {
     "port": 3000
   },
-  "memory": {
-    "command": "your-memory-command",
-    "max_lines": 200
-  },
   "automemory": {
-    "_comment": "分层 auto-memory。enabled=false 时注入沿用 data/memory/{eid}.jsonl（逐字节不变）、每日循环不巩固；置 true 才启用 profile/lessons/project/hotfiles 四层。",
-    "enabled": false,
+    "_comment": "四层 auto-memory（profile/lessons/project/hotfiles），是唯一的记忆系统。daily_enabled 只管无人值守的 00:30 巩固循环；注入与手工 🧠 不受它限制。",
+    "daily_enabled": true,
     "command": "glm",
     "timeout": 600,
     "retry_commands": ["cco"],
     "lessons_max_items": 30,
     "project_max_items": 40,
-    "max_signal_chars": 12000
+    "max_signal_chars": 12000,
+    "hotfiles_max_items": 20,
+    "hotfiles_recent_days": 7,
+    "default_task_count": 5
   },
   "compact": {
     "_comment": "压缩阈值（绝对 token 数，针对本轮 input_tokens + cache_read + cache_creation 求和）。超过 warn_tokens 发送预警通知；超过 auto_compact_tokens 且 auto_compact_enabled=true 时，当前 turn 结束后自动发送 /compact 指令。默认贴近 Sonnet/Opus 200k 窗口的 compact 触发点（≈78% / ≈85%）。1M 窗口模型请覆盖为例如 820000 / 880000。",
     "warn_tokens": 156000,
     "auto_compact_tokens": 170000,
     "auto_compact_enabled": true
-  },
-  "knowledge": {
-    "enabled": true,
-    "command": "your-knowledge-command",
-    "errors_max_items": 10,
-    "errors_max_chars": 2000,
-    "project_max_items": 15,
-    "project_max_chars": 2000,
-    "hotfiles_max_items": 20,
-    "hotfiles_recent_days": 7,
-    "default_task_count": 5
   },
   "wiki_search": {
     "_comment_backend": "local = 现有行为，让 LLM 从 index.md 中选页；memforge = 走 memforge 向量检索。memforge 失败时自动降级到 local。",

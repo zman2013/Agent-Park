@@ -111,13 +111,8 @@ async def run_daily_summary_all(date: str) -> None:
     that one agent's file-access data.
     """
     from server.auto_memory import active_eids
-    from server.config import automemory_config
 
-    if not automemory_config()["enabled"]:
-        logger.info("Daily consolidation skipped: automemory.enabled is false")
-        return
-
-    logger.info("Running daily knowledge summary for date %s", date)
+    logger.info("Running daily consolidation for date %s", date)
     for eid in active_eids():
         try:
             await _run_daily_summary(eid, date)
@@ -571,12 +566,12 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
 async def _run_generate_summary(agent_id: str, date_range: str) -> None:
     """Consolidate on demand (the 🧠 button) and broadcast progress.
 
-    Deliberately not gated on ``automemory.enabled``: the manual path is how
-    consolidation gets exercised against real history before it is trusted to
-    run unattended. The daily loop is the one that respects the flag.
+    Runs regardless of ``automemory.daily_enabled``: that flag only silences the
+    unattended loop, and the manual path is how consolidation gets exercised
+    against real history.
     """
     from server.auto_memory import consolidate, effective_id
-    from server.config import knowledge_config
+    from server.config import automemory_config
 
     async def progress_cb(step: str, detail: str):
         await broadcast({
@@ -587,7 +582,7 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
         })
 
     try:
-        cfg = knowledge_config()
+        cfg = automemory_config()
         eid = effective_id(agent_id)
         # Aggregate across every agent sharing this store, matching the daily
         # loop; otherwise a manual run would shrink hotfiles.md down to just
