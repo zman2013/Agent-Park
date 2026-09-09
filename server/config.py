@@ -98,13 +98,13 @@ def automemory_config() -> dict:
     cfg = get_config().get("automemory", {})
     return {
         "enabled": bool(cfg.get("enabled", False)),
-        "command": cfg.get("command", "qwen"),
+        "command": cfg.get("command", "glm"),
         # merge_errors built a ~17k-char prompt and timed out 3/3 at the old
         # 120s default — indistinguishable, to its callers, from "the model
         # chose to change nothing". The delta prompts are smaller, but the
         # ceiling stays generous for the same reason.
         "timeout": int(cfg.get("timeout", 600)),
-        "retry_commands": cfg.get("retry_commands", ["glm", "ccs"]),
+        "retry_commands": cfg.get("retry_commands", ["cco"]),
         "lessons_max_items": int(cfg.get("lessons_max_items", 30)),
         "project_max_items": int(cfg.get("project_max_items", 40)),
         "max_signal_chars": int(cfg.get("max_signal_chars", 12000)),

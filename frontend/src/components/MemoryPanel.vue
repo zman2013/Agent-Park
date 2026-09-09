@@ -242,6 +242,11 @@ async function deleteEntry(lineIndex) {
 
 function formatTs(ts) {
   if (!ts) return ''
+  // profile.md stores dates only (YYYY-MM-DD). Rendering those through
+  // toLocaleString appends a time that was never recorded: new Date('2026-04-07')
+  // parses as UTC midnight, so a +08:00 viewer sees "04/07 08:00". Show the date
+  // alone rather than inventing a moment.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(ts)) return ts.slice(5).replace('-', '/')
   try {
     return new Date(ts).toLocaleString('zh-CN', {
       month: '2-digit', day: '2-digit',

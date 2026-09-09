@@ -52,6 +52,7 @@ agent-park/
 │           └── ToastContainer.vue            # 消息提示
 ├── scripts/
 │   └── migrate_automemory.py  # 一次性迁移到四层文档（支持 --dry-run）
+├── tests/                     # pytest（`python3 -m pytest tests/`，venv 内无 pytest）
 ├── data/
 │   ├── agents.json          # Agent 元数据 + 排序顺序
 │   ├── sessions.json        # cco 会话 ID（用于续话）
@@ -303,6 +304,32 @@ system prompt 是**可缓存前缀、不进转录**，所以每轮重复传同�
 ### REST 兼容
 
 MemoryPanel 的 memory tab 早于分层文档，说的是 `[{type, timestamp, content, line_index}]`。它一直在编辑的就是 profile 层，所以 `server/profile_store.py` 做一层形状转换（bullet ↔ note，日期存为行尾注释），整个 tab 无需改动。
+
+两处不对等，都是刻意的：
+
+- **多行条目**：磁盘格式是「一个条目一个 bullet」，所以第 2 行起用两空格续行缩进。`POST /memory` 接受用户自由输入（上限 300 字符），两行规则很正常 —— 没有续行约定的话第 1 行之后会被静默丢掉，**连带行尾的日期注释**。条目**内部的空行不保留**：那需要输出只含缩进的行，而多数编辑器保存时会剥掉行尾空白，profile.md 是给人手改的，这个格式没法诚实地承诺往返。`tests/test_profile_store.py` 钉住这条契约。
+- **时间戳精度**：旧的是 ISO（`2026-04-07T03:22:11Z`），profile.md 只存日期。前端 `formatTs` 对 date-only 单独分支 —— 否则 `new Date('2026-04-07')` 按 UTC 午夜解析，东八区看到 `04/07 08:00`，一个从未记录过的时刻。
+
+`scripts/migrate_automemory.py` 的 `render_profile` **复用 `profile_store._render`** 而不是自己拼一份：两者必须对续行约定取得一致，各写一份的话迁移会写出面板静默截断的 bullet。
+
+### 已知缺口：翻 flag 后 6 个 eid 的 project 层需要重新派生
+
+迁移只把 `note` 迁进 profile、`knowledge_summary` **全部丢弃**，所以只有含 `note` 的 eid 才有内容。实测 36 个 eid 里 8 个有注入内容，翻 `enabled` 前后对照：
+
+| eid | agent | 近30d 活跃日 | 翻 flag 后 |
+|---|---|---|---|
+| `1b158839f8aa` | schumacher-compiler-ci | 0 | 1377c → **0** |
+| `2876150ba8c6` | feishu-bot | 1 | 824c → **0** |
+| `440f3041c89a` | fm | 0 | 1291c → **0** |
+| `ce7611e7481e` | talk | 0 | 2078c → 243c |
+| `867aac932032` | ccgs | 0 | 915c → 244c |
+| `41dd70bc1d00` | claude-code-router | 0 | 1526c → 242c |
+| `f4bfb91dfc93` | agent-park | 4 | 2590c → **6160c** |
+| `648e67d1ac10` | compiler | 11 | 1110c → **1232c** |
+
+**决定是接受这段真空，不补迁**（备选是把 `knowledge_summary` 剥掉 `。详见 …md` 尾巴后作为 project 种子）。依据是活跃度分布：六个受影响的 eid 近 30 天合计只有 1 个活跃日、总 task 2~17，而两个真正在用的 eid 恰好四层文档已建好。它们的 profile 层照常注入，project 层在**下次被用到的当晚 00:30** 就开始积累（巩固条件是当天有 ≥1 个 task，不是等 7 天）。
+
+数据没丢：三个归零 eid 的 `data/knowledge/{eid}/` 归档都在，`{eid}.jsonl` 一字节未改，事后补迁仍然可行 —— 这不是单向门。
 
 ## 巩固：LLM 只出 JSON delta，Markdown 由 Python 渲染
 

@@ -22,23 +22,38 @@ _LINE_RE = re.compile(r"^-\s+(?P<content>.*?)(?:\s*<!--\s*(?P<date>[\d-]+)\s*-->
 
 _HEADER = "<!-- Interaction rules. Authored by the user. Highest priority. -->"
 
+# Continuation indent for the 2nd+ line of a multi-line entry. POST /memory
+# takes free-form user input up to 300 chars, so a two-line rule is ordinary —
+# and a bullet-per-line parser would keep line 1 and silently drop the rest
+# (along with the date comment, which sits on line 1's tail). Blank lines
+# *inside* an entry are not preserved: they would render as trailing-whitespace-
+# only lines, which most editors strip on save, so round-tripping them is not
+# something this format can honestly promise.
+_CONT = "  "
+
 
 def _parse(md: str) -> list[tuple[str, str]]:
     """Return [(content, date)] for each bullet, in file order."""
-    out = []
+    out: list[tuple[str, str]] = []
     for line in md.splitlines():
-        if not line.startswith("- "):
-            continue
-        m = _LINE_RE.match(line)
-        if m and m.group("content").strip():
-            out.append((m.group("content").strip(), m.group("date") or ""))
+        if line.startswith("- "):
+            m = _LINE_RE.match(line)
+            if m and m.group("content").strip():
+                out.append((m.group("content").strip(), m.group("date") or ""))
+        elif out and line.startswith(_CONT) and line.strip():
+            # Strip exactly the indent we added, so content that was itself
+            # indented comes back indented.
+            content, date = out[-1]
+            out[-1] = (f"{content}\n{line[len(_CONT):]}", date)
     return out
 
 
 def _render(rows: list[tuple[str, str]]) -> str:
     lines = [_HEADER, "# Profile", ""]
     for content, date in rows:
-        lines.append(f"- {content}" + (f"  <!-- {date} -->" if date else ""))
+        head, *rest = content.splitlines() or [""]
+        lines.append(f"- {head}" + (f"  <!-- {date} -->" if date else ""))
+        lines.extend(f"{_CONT}{r}" for r in rest if r.strip())
     return "\n".join(lines) + "\n"
 
 

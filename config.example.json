@@ -13,9 +13,9 @@
   "automemory": {
     "_comment": "分层 auto-memory。enabled=false 时注入沿用 data/memory/{eid}.jsonl（逐字节不变）、每日循环不巩固；置 true 才启用 profile/lessons/project/hotfiles 四层。",
     "enabled": false,
-    "command": "qwen",
+    "command": "glm",
     "timeout": 600,
-    "retry_commands": ["glm", "ccs"],
+    "retry_commands": ["cco"],
     "lessons_max_items": 30,
     "project_max_items": 40,
     "max_signal_chars": 12000

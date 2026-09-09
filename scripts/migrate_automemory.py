@@ -43,8 +43,6 @@ from server import auto_memory as am  # noqa: E402
 # agent-park store rather than every eid.
 ERROR_EXPERIENCE_EID = "f4bfb91dfc93"
 
-PROFILE_HEADER = "<!-- Interaction rules. Authored by the user. Highest priority. -->"
-
 
 def collect_notes() -> dict[str, list[tuple[str, str]]]:
     """Return {eid: [(content, date)]} from the flat jsonl files."""
@@ -66,10 +64,15 @@ def collect_notes() -> dict[str, list[tuple[str, str]]]:
 
 
 def render_profile(rows: list[tuple[str, str]]) -> str:
-    lines = [PROFILE_HEADER, "# Profile", ""]
-    for content, date in rows:
-        lines.append(f"- {content}" + (f"  <!-- {date} -->" if date else ""))
-    return "\n".join(lines) + "\n"
+    """Render via profile_store so the REST shim reads back what we write.
+
+    Not a local copy: the two must agree on the continuation-indent convention
+    for multi-line entries, and a divergent copy here would write bullets the
+    panel silently truncates.
+    """
+    from server.profile_store import _render
+
+    return _render(rows)
 
 
 def parse_error_experience() -> list[dict]:
