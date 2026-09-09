@@ -235,16 +235,30 @@ _LAYER_HEADERS = {
 def truncate_entries(layer: str, entries: list[dict]) -> tuple[list[dict], int]:
     """Drop the least-established entries until *layer* fits its limit.
 
-    Ordering is ``n DESC, last DESC`` — frequency first, recency to break ties.
-    Deterministic and explainable on purpose: a relevance score would decide
-    what the user loses using a number they cannot see or correct.
+    Ordering is ``n DESC, last DESC``, then **newest-arrival first** as the
+    final tiebreak. Deterministic and explainable on purpose: a relevance score
+    would decide what the user loses using a number they cannot see or correct.
+
+    That last tiebreak is not cosmetic. A 12-day replay of real history showed
+    every entry sitting at ``n=1`` with the same ``last`` — a document acquires
+    genuinely distinct facts far more often than it re-sees one. With all keys
+    tied, a stable sort preserves document order, which is oldest-first, so
+    truncation kept the oldest entries and dropped every new one: once the
+    document filled up on day 5 it froze and no new knowledge could ever enter.
+    Breaking ties toward recent arrivals makes a full document behave as a
+    rolling window instead of a sealed one.
 
     Returns (kept, dropped_count).
     """
     limit = LAYER_LIMITS[layer]
     if len(render_entries(layer, entries)) <= limit:
         return entries, 0
-    ranked = sorted(entries, key=lambda e: (e.get("n", 1), e.get("last", "")), reverse=True)
+    order = {id(e): i for i, e in enumerate(entries)}
+    ranked = sorted(
+        entries,
+        key=lambda e: (e.get("n", 1), e.get("last", ""), order[id(e)]),
+        reverse=True,
+    )
     kept: list[dict] = []
     for e in ranked:
         if len(render_entries(layer, kept + [e])) > limit:
@@ -257,7 +271,6 @@ def truncate_entries(layer: str, entries: list[dict]) -> tuple[list[dict], int]:
             layer, limit, dropped, "y" if dropped == 1 else "ies",
         )
     # Restore document order so a diff stays readable across runs.
-    order = {id(e): i for i, e in enumerate(entries)}
     kept.sort(key=lambda e: order[id(e)])
     return kept, dropped
 
@@ -391,9 +404,35 @@ def apply_delta(
             if target is None:
                 res["refused"] += 1
                 continue
-            target["title"] = title
             target["body"] = body
             target["last"] = today
+            # An update is also a re-sighting: the model was shown the existing
+            # entries alongside the new conversation and chose to revise this
+            # one, which means the new material spoke to it again. Without this,
+            # n only grew when a title hashed identically — and a 12-day replay
+            # of real history produced n=1 for every single entry, leaving the
+            # frequency half of the truncation ranking dead and ordering by
+            # recency alone.
+            target["n"] = target.get("n", 1) + 1
+            # A rename must re-key the entry, or its id no longer matches its
+            # title and the next `add` of that same title hashes to a different
+            # id and lands as a duplicate with an identical heading.
+            if title != target["title"]:
+                new_id = entry_id(title)
+                if new_id != target["id"] and new_id in by_id:
+                    # The rename collides with another entry: fold into it
+                    # rather than creating two rows with the same title.
+                    other = by_id[new_id]
+                    other["n"] = other.get("n", 1) + target.get("n", 1)
+                    other["last"] = today
+                    entries.remove(target)
+                    del by_id[target["id"]]
+                    res["updated"] += 1
+                    continue
+                del by_id[target["id"]]
+                target["id"] = new_id
+                by_id[new_id] = target
+            target["title"] = title
             res["updated"] += 1
             continue
 
