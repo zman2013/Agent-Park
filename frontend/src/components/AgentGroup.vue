@@ -400,8 +400,21 @@ function onSummaryDone(e) {
   if (e.detail?.agentId !== props.agent.id) return
   summaryLoading.value = false
   summaryStatus.value = ''
-  const files = (e.detail.files_updated || []).join(', ')
-  store.addToast(`知识总结完成: ${files}`, 'success')
+  const d = e.detail
+  const parts = []
+  if (d.added) parts.push(`新增 ${d.added}`)
+  if (d.updated) parts.push(`更新 ${d.updated}`)
+  if (d.deleted) parts.push(`删除 ${d.deleted}`)
+  if (d.refused) parts.push(`拒绝 ${d.refused}`)
+  const summary = parts.length ? parts.join('，') : '无变化'
+  // A layer whose LLM produced nothing usable left its document untouched.
+  // Surfacing that as success would repeat the bug where a dead pipeline
+  // looked healthy for five months.
+  if (d.failed_layers?.length) {
+    store.addToast(`知识巩固部分失败（${d.failed_layers.join(', ')} 未更新）: ${summary}`, 'error')
+  } else {
+    store.addToast(`知识巩固完成: ${summary}`, 'success')
+  }
 }
 
 function onSummaryError(e) {

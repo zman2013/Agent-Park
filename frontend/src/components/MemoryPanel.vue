@@ -145,14 +145,14 @@ const loading = ref(false)
 const listEl = ref(null)
 
 const activeTab = ref('memory')
-const activeKnowledgeDoc = ref('errors')
+const activeKnowledgeDoc = ref('lessons')
 const knowledgeLoading = ref(false)
 const knowledgeDocs = [
-  { key: 'errors', label: '错误经验' },
+  { key: 'lessons', label: '错误经验' },
   { key: 'project', label: '项目知识' },
   { key: 'hotfiles', label: '热点文件' },
 ]
-const knowledgeData = ref({ errors: '', project: '', hotfiles: '' })
+const knowledgeData = ref({ lessons: '', project: '', hotfiles: '' })
 
 const currentKnowledgeDoc = computed(() => knowledgeData.value[activeKnowledgeDoc.value] || '')
 
@@ -179,7 +179,7 @@ async function fetchMemory() {
 
 async function switchToKnowledge() {
   activeTab.value = 'knowledge'
-  if (!knowledgeData.value.errors && !knowledgeData.value.project) {
+  if (!knowledgeData.value.lessons && !knowledgeData.value.project) {
     await fetchKnowledge()
   }
 }

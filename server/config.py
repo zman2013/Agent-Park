@@ -87,6 +87,30 @@ def compact_config() -> dict:
     }
 
 
+def automemory_config() -> dict:
+    """Return the auto-memory configuration with defaults.
+
+    ``enabled`` gates the layered documents. While it is false, injection falls
+    back to the flat ``data/memory/{eid}.jsonl`` path byte for byte and the
+    daily loop does not consolidate — so this flag is the rollout switch, and
+    flipping it is the whole of Phase 3.
+    """
+    cfg = get_config().get("automemory", {})
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "command": cfg.get("command", "qwen"),
+        # merge_errors built a ~17k-char prompt and timed out 3/3 at the old
+        # 120s default — indistinguishable, to its callers, from "the model
+        # chose to change nothing". The delta prompts are smaller, but the
+        # ceiling stays generous for the same reason.
+        "timeout": int(cfg.get("timeout", 600)),
+        "retry_commands": cfg.get("retry_commands", ["glm", "ccs"]),
+        "lessons_max_items": int(cfg.get("lessons_max_items", 30)),
+        "project_max_items": int(cfg.get("project_max_items", 40)),
+        "max_signal_chars": int(cfg.get("max_signal_chars", 12000)),
+    }
+
+
 def knowledge_config() -> dict:
     """Return the knowledge summary configuration with defaults."""
     cfg = get_config().get("knowledge", {})

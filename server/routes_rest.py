@@ -235,10 +235,22 @@ class MemoryAddBody(BaseModel):
 
 @router.get("/agents/{agent_id}/memory")
 async def get_memory(agent_id: str):
+    """Return profile entries in the legacy note shape.
+
+    The panel's memory tab predates the layered documents and speaks
+    ``[{type, timestamp, content, line_index}]``. profile.md is the layer it was
+    always editing — human-authored interaction rules — so a shim here keeps the
+    whole tab working without a frontend change.
+    """
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
+    from server.config import automemory_config
     from server.memory import list_memory
-    return list_memory(agent_id)
+
+    if not automemory_config()["enabled"]:
+        return list_memory(agent_id)
+    from server.profile_store import list_profile
+    return list_profile(agent_id)
 
 
 @router.post("/agents/{agent_id}/memory")
@@ -246,7 +258,7 @@ async def add_memory(agent_id: str, body: MemoryAddBody):
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
     from server.memory import compress_content, append_memory, MAX_CONTENT_LENGTH, _utcnow_iso
-    from server.config import memory_config
+    from server.config import automemory_config, memory_config
 
     command = memory_config()["command"]
     compressed = await compress_content(body.content, command)
@@ -261,7 +273,11 @@ async def add_memory(agent_id: str, body: MemoryAddBody):
         )
 
     entry = {"type": body.type, "timestamp": _utcnow_iso(), "content": compressed}
-    append_memory(agent_id, entry)
+    if automemory_config()["enabled"]:
+        from server.profile_store import append_profile
+        append_profile(agent_id, compressed)
+    else:
+        append_memory(agent_id, entry)
     return entry
 
 
@@ -269,8 +285,15 @@ async def add_memory(agent_id: str, body: MemoryAddBody):
 async def delete_memory(agent_id: str, line_index: int):
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
-    from server.memory import delete_memory_line
-    if not delete_memory_line(agent_id, line_index):
+    from server.config import automemory_config
+
+    if automemory_config()["enabled"]:
+        from server.profile_store import delete_profile_line
+        ok = delete_profile_line(agent_id, line_index)
+    else:
+        from server.memory import delete_memory_line
+        ok = delete_memory_line(agent_id, line_index)
+    if not ok:
         raise HTTPException(404, "memory entry not found")
     return {"ok": True}
 
@@ -279,11 +302,27 @@ async def delete_memory(agent_id: str, line_index: int):
 
 @router.get("/agents/{agent_id}/knowledge")
 async def get_knowledge(agent_id: str):
-    """Return the three knowledge documents for an agent."""
+    """Return the generated layers, plus the frozen pre-migration archive."""
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
+    from server.config import automemory_config
     from server.knowledge import read_knowledge_docs
-    return read_knowledge_docs(agent_id)
+
+    archive = read_knowledge_docs(agent_id)
+    if not automemory_config()["enabled"]:
+        # Legacy shape: the archive *is* the live document set.
+        return {"lessons": archive["errors"], **archive, "archive": archive}
+
+    from server.auto_memory import effective_id, read_layer
+    eid = effective_id(agent_id)
+    return {
+        "lessons": read_layer(eid, "lessons"),
+        "project": read_layer(eid, "project"),
+        "hotfiles": read_layer(eid, "hotfiles"),
+        "profile": read_layer(eid, "profile"),
+        # Read-only; nothing writes data/knowledge/ any more.
+        "archive": archive,
+    }
 
 
 # ── Prompts endpoints ─────────────────────────────────────────────────────────
