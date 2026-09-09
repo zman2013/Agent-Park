@@ -35,6 +35,17 @@ export const useAgentStore = defineStore('agent', () => {
     autoCompactDisabled.value = newState
   }
 
+  // Plan-mode per-task state (synced from server via WS)
+  const planMode = ref({})  // { task_id: bool }
+
+  function setPlanMode(taskId, enabled) {
+    planMode.value[taskId] = enabled
+  }
+
+  function resetPlanMode(newState) {
+    planMode.value = newState
+  }
+
   // Archived agent filter
   const showArchived = ref(false)
 
@@ -848,5 +859,8 @@ export const useAgentStore = defineStore('agent', () => {
     setAutoCompactDisabled,
     resetAutoCompactDisabled,
     // plan mode
+    planMode,
+    setPlanMode,
+    resetPlanMode,
   }
 })

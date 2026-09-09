@@ -33,6 +33,7 @@ class CcoAdapter(BaseAdapter):
         fork_sid: str | None,
         agent_cwd: str,
         resume_at: str | None = None,
+        plan_mode: bool = False,
     ) -> list[str]:
         base_args = [
             command,
@@ -42,6 +43,17 @@ class CcoAdapter(BaseAdapter):
             "--include-partial-messages",
             "--dangerously-skip-permissions",
         ]
+
+        if plan_mode:
+            # The cco/ccs wrappers hardcode --dangerously-skip-permissions,
+            # and bypassPermissions wins over --permission-mode plan. Disabling
+            # the bypass mode via --settings lets plan mode actually take
+            # effect, so the agent researches and writes a plan document
+            # instead of editing files.
+            base_args += [
+                "--permission-mode", "plan",
+                "--settings", '{"permissions":{"disableBypassPermissionsMode":"disable"}}',
+            ]
 
         if fork_sid:
             if resume_at:

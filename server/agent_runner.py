@@ -549,6 +549,7 @@ class AgentRunner:
         self._compact_warned: set[str] = set()    # task_ids that already got a compact warning this round
         self._compact_pending: set[str] = set()   # task_ids slated to receive an auto /compact after this turn
         self._auto_compact_disabled: set[str] = set()  # task_ids with auto-compact manually disabled
+        self._plan_mode: set[str] = set()          # task_ids running in plan (read-only) mode
         # task_ids whose handoff turn just finished — broadcast completion notice next.
         self._handoff_pending: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
@@ -764,7 +765,11 @@ class AgentRunner:
             # Select adapter and build args
             adapter = get_adapter(command)
             self._adapters[task_id] = adapter
-            args = adapter.build_args(command, prompt, session_id, fork_sid, agent_cwd, resume_at=fork_resume_at)
+            args = adapter.build_args(
+                command, prompt, session_id, fork_sid, agent_cwd,
+                resume_at=fork_resume_at,
+                plan_mode=task_id in self._plan_mode,
+            )
             ctx = _RunContext(self, task_id)
 
             # Validate working directory before spawning subprocess
@@ -904,6 +909,23 @@ class AgentRunner:
         task = app_state.tasks.get(task_id)
         if task is not None:
             object.__setattr__(task, "auto_compact_disabled", disabled)
+            app_state.save_agent_tasks(task.agent_id)
+
+    def toggle_plan_mode(self, task_id: str, enabled: bool) -> None:
+        """Enable or disable plan (read-only research) mode for a task.
+
+        Takes effect on the NEXT run: build_args reads _plan_mode when the
+        subprocess is spawned, so toggling mid-run does not affect the
+        in-flight turn.
+        """
+        if enabled:
+            self._plan_mode.add(task_id)
+        else:
+            self._plan_mode.discard(task_id)
+        # Persist toggle state so it survives server restarts
+        task = app_state.tasks.get(task_id)
+        if task is not None:
+            object.__setattr__(task, "plan_mode", enabled)
             app_state.save_agent_tasks(task.agent_id)
 
     async def maybe_dispatch_handoff(self, task_id: str, *, success: bool) -> None:
@@ -1456,6 +1478,8 @@ class AgentRunner:
         for task in app_state.tasks.values():
             if getattr(task, "auto_compact_disabled", False):
                 self._auto_compact_disabled.add(task.id)
+            if getattr(task, "plan_mode", False):
+                self._plan_mode.add(task.id)
         return cleaned
 
 
