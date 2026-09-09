@@ -239,6 +239,16 @@ _LAYER_HEADERS = {
 }
 
 
+def max_items_for(layer: str) -> int:
+    """Configured entry cap for an LLM-driven layer.
+
+    Read here rather than threaded through ``truncate_entries`` so the migration
+    script and the consolidation path cannot disagree about the ceiling.
+    """
+    from server.config import automemory_config
+    return automemory_config()[f"{layer}_max_items"]
+
+
 def truncate_entries(layer: str, entries: list[dict]) -> tuple[list[dict], int]:
     """Drop the least-established entries until *layer* fits its limit.
 
@@ -252,10 +262,18 @@ def truncate_entries(layer: str, entries: list[dict]) -> tuple[list[dict], int]:
     findings. It is a genuine but narrow improvement — it only reorders entries
     that are already tied on both frequency and recency.
 
+    Two ceilings apply, and both are enforced here rather than in the prompt:
+    ``{layer}_max_items`` from config, and ``LAYER_LIMITS`` in characters. The
+    item cap was previously only *stated* to the model, so a run that ignored it
+    left the configured number meaning nothing — the character ceiling is far
+    looser (40 items of ~50 chars is 2000 of a 10000 budget), so it would not
+    catch the overrun either.
+
     Returns (kept, dropped_count).
     """
     limit = LAYER_LIMITS[layer]
-    if len(render_entries(layer, entries)) <= limit:
+    max_items = max_items_for(layer)
+    if len(entries) <= max_items and len(render_entries(layer, entries)) <= limit:
         return entries, 0
     order = {id(e): i for i, e in enumerate(entries)}
     ranked = sorted(
@@ -265,14 +283,17 @@ def truncate_entries(layer: str, entries: list[dict]) -> tuple[list[dict], int]:
     )
     kept: list[dict] = []
     for e in ranked:
+        if len(kept) >= max_items:
+            break
         if len(render_entries(layer, kept + [e])) > limit:
             continue
         kept.append(e)
     dropped = len(entries) - len(kept)
     if dropped:
         logger.warning(
-            "%s exceeded its %d-char limit; dropped %d least-established entr%s",
-            layer, limit, dropped, "y" if dropped == 1 else "ies",
+            "%s exceeded its budget (%d items / %d chars); dropped %d "
+            "least-established entr%s",
+            layer, max_items, limit, dropped, "y" if dropped == 1 else "ies",
         )
     # Restore document order so a diff stays readable across runs.
     kept.sort(key=lambda e: order[id(e)])
@@ -359,6 +380,21 @@ class ConsolidationResult(dict):
         return s
 
 
+def _fold(text: str) -> str:
+    """Collapse a delta field to a single line.
+
+    Every field the model returns is interpolated into structural Markdown, so a
+    newline inside one is not cosmetic — it breaks the document's grammar. A
+    multiline ``title`` pushes the ``<!-- id:… -->`` marker onto its own line,
+    where ``_ENTRY_RE`` no longer sees a heading, and the entry is silently
+    dropped or re-read under whatever text happens to precede the marker. A
+    newline in a body field can likewise open a ``## `` heading and split one
+    entry into two. Folding (rather than refusing) keeps the content: the model
+    said something valid and only formatted it wrongly.
+    """
+    return " ".join((text or "").split())
+
+
 def apply_delta(
     layer: str,
     entries: list[dict],
@@ -379,7 +415,7 @@ def apply_delta(
             res["refused"] += 1
             continue
         kind = op.get("op")
-        title = str(op.get("title") or "").strip()
+        title = _fold(str(op.get("title") or ""))
         body = _op_body(op)
 
         # Gate 2: meta-narration in any user-visible field.
@@ -468,9 +504,10 @@ def _op_body(op: dict) -> list[str]:
 
     lessons ops carry wrong/right; project ops carry a single fact. Both shapes
     become plain bullets here — Python decides the Markdown, never the model.
+    Fields are folded to one line each: see ``_fold``.
     """
-    wrong = str(op.get("wrong") or "").strip()
-    right = str(op.get("right") or "").strip()
+    wrong = _fold(str(op.get("wrong") or ""))
+    right = _fold(str(op.get("right") or ""))
     if wrong or right:
         lines = []
         if wrong:
@@ -478,7 +515,7 @@ def _op_body(op: dict) -> list[str]:
         if right:
             lines.append(f"- 正确：{right}")
         return lines
-    fact = str(op.get("fact") or "").strip()
+    fact = _fold(str(op.get("fact") or ""))
     return [f"- {fact}"] if fact else []
 
 
@@ -532,7 +569,8 @@ _LESSONS_PROMPT = """你是错误经验提取器。从对话片段中提取「�
 - title 不超过 40 字；wrong / right 各不超过 200 字。
 - 必须是可复用的结论式陈述，不是本次 case 的局部描述。
 - 只提取用户明确纠正过、或工具/任务确实失败过的内容。不要提取推测。
-- 最多 {max_items} 条。
+- 最多 {max_items} 条；超出的会按出现次数被丢弃。
+- 每个字段必须是单行，不要包含换行。
 """
 
 _PROJECT_PROMPT = """你是项目事实提取器。从对话片段中提取可复用的项目事实，输出对已有条目的增量操作。
@@ -558,7 +596,8 @@ _PROJECT_PROMPT = """你是项目事实提取器。从对话片段中提取可�
 - title 不超过 40 字；fact 不超过 200 字。
 - 陈述事实，不要写成命令式指令。
 - 只保留对后续任务有直接帮助的信息，去掉一次性的具体细节。
-- 最多 {max_items} 条。
+- 最多 {max_items} 条；超出的会按出现次数被丢弃。
+- 每个字段必须是单行，不要包含换行。
 """
 
 _PROMPTS = {"lessons": _LESSONS_PROMPT, "project": _PROJECT_PROMPT}
