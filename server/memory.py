@@ -19,6 +19,19 @@ MEMORY_DIR = DATA_DIR / "memory"
 
 MAX_CONTENT_LENGTH = 300  # characters; reject if compressed result exceeds this
 
+# Deny the write/exec tools for helper LLM calls. These commands are full coding
+# agents launched with --dangerously-skip-permissions and we only read their
+# stdout, but unrestricted they will happily "helpfully" edit repo files they
+# mistake for the intended output target (observed on docs/error_experience.md).
+# cwd does not contain this — the agent uses absolute paths — and
+# --disallowed-tools is variadic, swallowing the trailing prompt argument.
+READONLY_SETTINGS = json.dumps({
+    "permissions": {
+        "deny": ["Write", "Edit", "MultiEdit", "NotebookEdit", "Bash",
+                 "Task", "WebFetch", "WebSearch"],
+    }
+})
+
 
 def effective_memory_agent_id(agent_id: str) -> str:
     """Return the agent id whose memory file should be used.
@@ -122,15 +135,21 @@ async def compress_content(content: str, command: str) -> str:
         + content
     )
     try:
+        from server.agent_runner import _clean_env
         proc = await asyncio.create_subprocess_exec(
             command,
             "-p",
             "--output-format", "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
+            "--settings", READONLY_SETTINGS,
             compress_prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            # See _clean_env: the child must not inherit EPT_CLAUDE_RUNNING, or
+            # the wrapper treats it as a nested launch and exits 1 with no
+            # stdout, which here silently degrades to "return content unchanged".
+            env=_clean_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
         result_text = _parse_stream_json_result(stdout.decode("utf-8", errors="replace"))

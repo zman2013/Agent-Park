@@ -307,7 +307,21 @@ def build_hotfiles_md(hotfiles: list[dict], max_items: int = 20) -> str:
 # ── LLM merge ─────────────────────────────────────────────────────────────────
 
 async def _llm_call(command: str, prompt: str, timeout: int = 120) -> str:
-    """Call an LLM command with -p flag and stream-json output, return result text."""
+    """Call an LLM command with -p flag and stream-json output, return result text.
+
+    Denies the write tools. These commands are full coding agents launched with
+    ``--dangerously-skip-permissions``, and we only ever read their stdout — but
+    left unrestricted one was observed rewriting ``docs/error_experience.md``:
+    asked to *return* a merged ``errors.md``, it found a repo doc with the same
+    heading format, decided that was the intended target, and edited it.
+
+    ``cwd`` alone does not contain this (the agent uses absolute paths), and
+    ``--disallowed-tools`` is variadic and swallows the trailing prompt argument.
+    A ``--settings`` deny list is the combination that blocks the write tools
+    while leaving the text result intact.
+    """
+    from server.agent_runner import _clean_env
+    from server.memory import READONLY_SETTINGS
     try:
         proc = await asyncio.create_subprocess_exec(
             command,
@@ -315,9 +329,17 @@ async def _llm_call(command: str, prompt: str, timeout: int = 120) -> str:
             "--output-format", "stream-json",
             "--verbose",
             "--dangerously-skip-permissions",
+            "--settings", READONLY_SETTINGS,
             prompt,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
+            # Without this the child inherits EPT_CLAUDE_RUNNING whenever the
+            # server itself runs under `ept claude`; the wrapper reads that as a
+            # nested launch, prints usage to stderr and exits 1. stderr is
+            # discarded, so the failure surfaces only as an empty result — and
+            # every caller treats empty as "nothing to change", turning the whole
+            # pipeline into a silent no-op.
+            env=_clean_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         from server.memory import _parse_stream_json_result
