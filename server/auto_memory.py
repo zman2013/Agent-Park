@@ -114,6 +114,12 @@ LAYER_LIMITS = {
 
 LAYERS = ("profile", "lessons", "project", "history")
 
+# Hard guard on the signal section of a consolidation prompt, independent of the
+# configured character budget. See ``_format_signals`` for why bytes and not
+# characters: MAX_ARG_STRLEN is 131072, and this leaves room for the prompt
+# skeleton and the uncapped existing-entries JSON alongside it.
+MAX_SIGNAL_BYTES = 100_000
+
 
 def memory_dir(eid: str) -> Path:
     """Return the directory holding *eid*'s layer documents.
@@ -679,19 +685,42 @@ async def consolidate_layer(
 
 
 def _format_signals(signals: list[dict], max_chars: int) -> str:
-    """Join signals into prompt text, stopping at *max_chars*.
+    """Join signals into prompt text, stopping at *max_chars* or the byte guard.
 
     Truncation is logged rather than silent: a run that saw half its input
     should not read like a run that saw all of it.
+
+    Two ceilings, because the configured one counts characters while the real
+    constraint counts bytes. The prompt reaches the helper LLM as a single argv
+    entry, and Linux caps one of those at MAX_ARG_STRLEN = 131072 bytes. CJK text
+    is ~3 bytes per character, so a 50000-char budget is 150 KB of Chinese —
+    over the limit. Exceeding it raises E2BIG inside ``_llm_call``, whose except
+    returns "" , which every gate reads as "no usable output": the pipeline would
+    go quietly dead in exactly the shape we spent this whole redesign removing.
+
+    The byte guard is deliberately invisible in config. ``max_signal_chars``
+    keeps its literal meaning so the number stays readable, and the guard only
+    bites on CJK-dense input, where 100 KB still leaves 30 KB of headroom for
+    the prompt skeleton and the existing-entries JSON (neither of which is
+    capped).
     """
     parts: list[str] = []
     total = 0
+    total_bytes = 0
     for i, s in enumerate(signals):
         label = f"[{s.get('source', '?')}]"
         for flag in ("task_failed", "high_turns"):
             if s.get(flag):
                 label += f"[{flag}]"
         piece = f"{label} {s.get('content', '')}"
+        piece_bytes = len(piece.encode("utf-8"))
+        if total_bytes + piece_bytes > MAX_SIGNAL_BYTES:
+            logger.info(
+                "signal text hit the %d-byte argv guard at %d chars; "
+                "used %d of %d signals",
+                MAX_SIGNAL_BYTES, total, i, len(signals),
+            )
+            break
         if total + len(piece) > max_chars:
             logger.info(
                 "signal text hit the %d-char cap; used %d of %d signals",
@@ -700,6 +729,7 @@ def _format_signals(signals: list[dict], max_chars: int) -> str:
             break
         parts.append(piece)
         total += len(piece)
+        total_bytes += piece_bytes
     return "\n---\n".join(parts)
 
 
@@ -920,6 +950,62 @@ def extract_history_signals(eid: str) -> list[dict]:
 
 # ── Signal extraction ─────────────────────────────────────────────────────────
 
+# A tool result looks like a failure when it *reports* one, not when it merely
+# contains the word. The old criterion was "content.lower() holds error, failed,
+# exception, errno or traceback anywhere", which matched every source file and
+# document that happens to discuss errors. Measured on one real task: 291 of 291
+# hits, of which 276 carried no failure at all — docs/codebase.md because line 60
+# reads `├── errors.md`, an `ls` listing because a filename contains "errors",
+# server/memory.py because of `except json.JSONDecodeError`, adapters/base.py
+# because of a parameter named `errors: list[str]`. 19k characters of source code
+# then crowded out every real signal in the prompt budget.
+#
+# So match the shape of a failure being *raised and printed*:
+_TOOL_ERROR_RE = re.compile(
+    # `FooError:` / `FooException` at line start. The trailing `(?::|\s*$)` is
+    # load-bearing and was added after measurement: without it `saveError` and
+    # `errors: list[str]` still matched, because identifiers in source are
+    # followed by `(`, `=` or `,` while a raised exception is followed by `: `
+    # or end of line.
+    r"^\s*(?:\w+Error|\w+Exception)(?::|\s*$)"
+    r"|^Traceback \(most recent call last\)"
+    r"|^\s*(?:error|ERROR|fatal|FATAL|FAILED)[:\s]"
+    r"|\bexit(?:ed with)? (?:code )?[1-9]"
+    r"|command not found|No such file or directory"
+    r"|Permission denied|is not recognized",
+    re.M,
+)
+
+_ERROR_WINDOW = 800
+
+# Tool output is frequently coloured (pytest, cargo, npm). The escapes land in
+# the middle of the very phrases we key on — pytest writes
+# "\x1b[31mFAILED\x1b[0m tests/x.py - AssertionError: ..." — so anchors like
+# `^\s*` miss. Strip before matching rather than threading `\x1b\[[0-9;]*m` into
+# every branch: a first attempt did the latter, covered only a leading reset, and
+# real transcripts still had two escaped AssertionErrors slipping through.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def _around(text: str, pos: int, width: int = _ERROR_WINDOW) -> str:
+    """Return a *width*-char window of *text* centred on *pos*.
+
+    The old code took ``content[:800]`` from the head, which put 34% of signals
+    (99 of 289 on a real task) in the prompt *without the error in them* — the
+    match sat at character 2682 of a 13k-char file listing, so the model received
+    an unremarkable chunk of source and no failure to learn from. Centring costs
+    nothing and is the difference between a signal and a random excerpt.
+    """
+    if len(text) <= width:
+        return text
+    start = max(0, pos - width // 3)   # a third of context before, the rest after
+    return text[start:start + width]
+
+
 def extract_lesson_signals(tasks: list) -> list[dict]:
     """Extract fragments that plausibly contain a lesson.
 
@@ -943,12 +1029,14 @@ def extract_lesson_signals(tasks: list) -> list[dict]:
             content = getattr(msg, "content", "") or ""
 
             if role == "agent" and msg_type == "tool_result":
-                low = content.lower()
-                if any(kw in low for kw in
-                       ("error", "traceback", "failed", "exception", "errno")):
+                # Match and slice on the de-coloured text: an offset into the
+                # original would be shifted by however many escapes precede it.
+                plain = _plain(content)
+                m = _TOOL_ERROR_RE.search(plain)
+                if m:
                     task_signals.append({
                         "source": "tool_error",
-                        "content": content[:800],
+                        "content": _around(plain, m.start()),
                         "task_id": task.id,
                     })
 

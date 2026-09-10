@@ -406,6 +406,41 @@ MemoryPanel 的 memory tab 早于分层文档，说的是 `[{type, timestamp, co
 
 `extract_lesson_signals()` 比旧的 `extract_error_signals()` 窄得多：旧版把**任何** 5–200 字的 user 消息都当「纠正」，几乎每条消息都命中，用噪声拼出的 prompt 正是模型开始叙述的原因。新版三个有明确语义的来源：task 失败、工具报错、高 turns 弯路；且只保留确实出错过的 task 的信号。
 
+#### tool_error 判据：报告了失败，而非提到了失败
+
+最初的判据是「`content.lower()` 含 `error`/`failed`/`exception`/`errno`/`traceback` 任一子串」—— 这重犯了它想修的毛病。实测一个真实 task：**291 条命中里 276 条根本没有失败**，全是讨论错误的源码和文档：
+
+| 命中内容 | 触发词位置 |
+|---|---|
+| `docs/codebase.md` 全文 | 第 60 行 `├── errors.md` |
+| `ls data/knowledge/*/` 输出 | 文件名含 `errors` |
+| `server/memory.py` 源码 | `except json.JSONDecodeError` |
+| `adapters/base.py` 源码 | 参数名 `errors: list[str]` |
+
+19 万字源码于是挤满 prompt 预算，把真信号全截在后面。改成匹配「异常被抛出并打印」的形状（`_TOOL_ERROR_RE`）：**291 → 25 条，降 92%**。
+
+三个细节都是测出来的，不是想出来的：
+
+- `^\s*(?:\w+Error|\w+Exception)(?::|\s*$)` 末尾那个 `(?::|\s*$)` 是承重的 —— 没有它，`saveError` 和 `errors: list[str]` 仍然命中。源码里标识符后跟 `(`/`=`/`,`，真异常后跟 `: ` 或行尾。
+- **匹配前先剥 ANSI**（`_plain`）。pytest 输出是 `\x1b[31mFAILED\x1b[0m tests/x.py - AssertionError:`，转义码夹在词中间，`^\s*` 锚不到。第一版试着在正则里加 `\x1b\[[0-9;]*m` 分支，只覆盖了行首着色，真实转录里仍漏两条。
+- `exit [1-9]` 而非 `\d` —— `exit code 0` 是成功。
+
+反向验过假阴性：漏掉的 276 条里含 `Traceback|panic|AssertionError|FAILED` 字样的只有 4 条，全部是文字里写「0 个 Traceback/Error/FAIL」这类**正确的不命中**。
+
+#### 截断以报错为中心
+
+`content[:800]` 从头切会让 **34%（99/289）的信号里看不到触发它的报错** —— 匹配位置在 13k 字文件列表的第 2682 字，送进 prompt 的是一段无关的源码开头。`_around()` 以匹配点为中心取窗口（前 1/3、后 2/3），修完后「看不见报错的信号」是 0 条。
+
+#### 预算：字符配置 + 不可见的字节保险
+
+`max_signal_chars` 从 12000 提到 **50000**。12000 是当初随手填的，无测量依据，实际扮演的角色是「在噪声里盲选前 14 条」。
+
+但配置项单位是**字符**，真正的硬约束是**字节**：prompt 通过 argv 传给辅助 LLM，单条 argv 上限 `MAX_ARG_STRLEN = 131072` 字节。5 万字符纯中文 = 15 万字节，**超限**。超限时 `_llm_call` 的 except 返回空串，闸门判定「没拿到可用输出」—— 不崩，但静默失效，正是整套重构要消除的故障形状。
+
+所以加一道 `MAX_SIGNAL_BYTES = 100_000` 的字节闸门，**故意不出现在 config 里**：`max_signal_chars` 保留字面含义，字节闸门只在 CJK 密集时生效，留 3 万字节余量给骨架和 `existing`（后者无 cap 且随文档增长）。实测英文输入由字符闸门挡下（49,893 字符），纯中文由字节闸门挡下（33,656 字符 / 99,256 字节，字符数远未到 5 万）。
+
+判据修好后 4 个活跃 eid 的 8 个层**全部零截断**，history 信号 13/13 进入 —— 所以没有引入按来源排序的优先级，信号顺序保持原样。
+
 ### 迁移（scripts/migrate_automemory.py）
 
 一次性、全确定性、**零 LLM** —— 对迁移做一次 LLM 处理，正是产生了那批污染文档的步骤。

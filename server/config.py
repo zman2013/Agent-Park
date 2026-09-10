@@ -98,7 +98,7 @@ def automemory_config() -> dict:
         "retry_commands": cfg.get("retry_commands", ["cco"]),
         "lessons_max_items": int(cfg.get("lessons_max_items", 30)),
         "project_max_items": int(cfg.get("project_max_items", 40)),
-        "max_signal_chars": int(cfg.get("max_signal_chars", 12000)),
+        "max_signal_chars": int(cfg.get("max_signal_chars", 50000)),
         "default_task_count": int(cfg.get("default_task_count", 5)),
         # Appends to history.md between consolidations. Every finished run
         # appends one line for free; this is how many of those buy an LLM pass.
