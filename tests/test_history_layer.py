@@ -217,3 +217,61 @@ def test_the_trigger_fires_on_at_least_the_threshold_not_only_on_multiples(eid,
     assert fires(stuck), "a full window at a non-multiple remainder must fire"
     assert not modulo(stuck), "which the old condition did not"
     assert not fires(every - 1), "a partial window must still not fire"
+
+
+def test_only_the_unconsumed_window_is_fed_back(eid, monkeypatch):
+    """Reported by review, and the reason it was P1. reset_history_counter clears
+    the counter but history.md keeps its rows (deliberately — it is also a
+    human-readable log and build_context injects it). So the next pass re-fed
+    every row it had already consolidated: at 20 runs the first 10 go through
+    twice, and at the 50-row steady state most of the input is replayed every
+    cycle. Each replay reads as a re-sighting and bumps `n` on entries nothing
+    new happened to, corrupting the exact ranking signal `n` exists to provide.
+    """
+    for i in range(12):
+        am.append_history(eid, "a", "success", f"旧运行 {i}")
+    _stub(monkeypatch, '[{"op":"add","title":"T","fact":"F"}]')
+    asyncio.run(am.consolidate(eid, [], history_window_only=True))
+    assert am.read_history_counter(eid) == 0
+
+    for i in range(3):
+        am.append_history(eid, "a", "success", f"新运行 {i}")
+
+    seen: list[str] = []
+
+    async def capture(command, prompt, timeout=0):
+        seen.append(prompt)
+        return '[{"op":"add","title":"T2","fact":"F2"}]'
+
+    monkeypatch.setattr(knowledge, "_llm_call", capture)
+    asyncio.run(am.consolidate(eid, [], history_window_only=True))
+    assert seen
+    for p in seen:
+        assert "新运行 2" in p, "the unconsumed window must be fed"
+        assert "旧运行 0" not in p, "an already-consolidated row must not be re-fed"
+
+
+def test_the_slice_takes_the_newest_rows_not_the_oldest(eid, monkeypatch):
+    for i in range(10):
+        am.append_history(eid, "a", "success", f"运行 {i}")
+    am.reset_history_counter(eid)
+    for i in range(2):
+        am.append_history(eid, "a", "success", f"窗口内 {i}")
+    signals = am.extract_history_signals(eid, am.read_history_counter(eid))
+    assert len(signals) == 2
+    assert all("窗口内" in s["content"] for s in signals)
+
+
+def test_the_whole_file_is_fed_when_no_window_is_given(eid):
+    """The nightly loop and the 🧠 button are not consuming a window and are
+    explicitly asked to look at everything."""
+    for i in range(5):
+        am.append_history(eid, "a", "success", f"运行 {i}")
+    assert len(am.extract_history_signals(eid)) == 5
+    assert len(am.extract_history_signals(eid, None)) == 5
+
+
+def test_a_zero_window_feeds_no_history(eid):
+    """A pass triggered with nothing unconsumed must not fall back to the file."""
+    am.append_history(eid, "a", "success", "运行")
+    assert am.extract_history_signals(eid, 0) == []

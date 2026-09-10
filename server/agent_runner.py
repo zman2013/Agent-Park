@@ -1347,18 +1347,28 @@ class AgentRunner:
         would serialize them, but queueing N of them would keep firing LLM
         calls long after the window that triggered them.
         """
+        # Reserved synchronously, before create_task. The reservation used to be
+        # made inside run(), which does not start until the loop next yields —
+        # so two completions crossing the threshold back to back both saw an
+        # empty set, both queued, and the second re-consolidated the same history
+        # behind the lock, bumping every entry's n a second time.
         if eid in self._consolidating:
             logger.info("eid %s already consolidating, skipping this trigger", eid)
             return
+        self._consolidating.add(eid)
 
         async def run() -> None:
             from server import auto_memory
             from server.routes_ws import _eid_tasks
 
-            self._consolidating.add(eid)
+            consumed_window = False
             try:
                 logger.info("history reached %d entries for eid %s, consolidating", n, eid)
-                result = await auto_memory.consolidate(eid, _eid_tasks(eid))
+                result = await auto_memory.consolidate(
+                    eid, _eid_tasks(eid), history_window_only=True)
+                # consolidate() clears the window when at least one layer
+                # produced a usable delta, and deliberately keeps it otherwise.
+                consumed_window = len(result["failed_layers"]) < 2
                 logger.info(
                     "history-triggered consolidation done: eid=%s added=%d updated=%d "
                     "deleted=%d refused=%d%s",
@@ -1372,10 +1382,18 @@ class AgentRunner:
                 self._consolidating.discard(eid)
             # Re-check the persisted counter. Runs that finished during the two
             # LLM calls bumped it after this pass took its snapshot, and their
-            # own trigger was dropped by the `_consolidating` guard above — so
-            # without this they wait for the next append, or forever if the eid
-            # goes quiet with daily consolidation disabled. Outside the finally
-            # so a crashed pass does not immediately re-enter.
+            # own trigger was dropped by the guard above — so without this they
+            # wait for the next append, or forever if the eid goes quiet with
+            # daily consolidation disabled.
+            #
+            # Only when the window was actually consumed. A pass where every
+            # helper command failed leaves the counter untouched on purpose, so
+            # re-arming on it would spin: a missing CLI would become a subprocess
+            # and log loop, and a provider returning malformed output would bill
+            # for retries forever with no new history to look at. That retry
+            # belongs to the next append or the nightly run.
+            if not consumed_window:
+                return
             try:
                 left = auto_memory.read_history_counter(eid)
             except Exception:

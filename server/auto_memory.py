@@ -828,6 +828,7 @@ async def consolidate(
     tasks: list,
     progress_cb=None,
     today: str | None = None,
+    history_window_only: bool = False,
 ) -> dict:
     """Consolidate the LLM-derived layers for *eid*.
 
@@ -839,6 +840,13 @@ async def consolidate(
     current date. Callers replaying history must pass the date being replayed,
     or every entry lands on the same date and ``last`` stops discriminating —
     which silently disables the recency half of the truncation ranking.
+
+    *history_window_only* restricts the history signals to the unconsumed window
+    (the counter's value) rather than the whole file. The threshold-triggered
+    caller sets it, because the rows it already consolidated are still on disk
+    and re-feeding them inflates ``n`` on entries nothing new happened to. The
+    nightly loop and the manual 🧠 button leave it False: neither is consuming a
+    window, and both are explicitly asked to look at everything.
 
     ``profile.md`` is never touched: it is the user's own file. ``history.md``
     is not rewritten either — consolidation reads it and marks it consumed.
@@ -873,7 +881,8 @@ async def consolidate(
                        reverse=True)
         lesson_signals = extract_lesson_signals(tasks)
         project_signals = extract_project_signals(tasks)
-        history_signals = extract_history_signals(eid)
+        history_signals = extract_history_signals(
+            eid, consumed if history_window_only else None)
         await progress(
             "extracting",
             f"提取到 {len(lesson_signals)} 条经验信号，"
@@ -1053,16 +1062,32 @@ def reset_history_counter(eid: str, consumed: int | None = None) -> None:
             logger.exception("%s: failed to reset history counter", eid)
 
 
-def extract_history_signals(eid: str) -> list[dict]:
+def extract_history_signals(eid: str, unconsumed: int | None = None) -> list[dict]:
     """Feed history into extraction as one signal per logged run.
 
     This is the only signal source describing what was *accomplished*; the
     other three all describe something going wrong (task failed, tool error,
     high turn count).
+
+    *unconsumed* limits the snapshot to the newest N rows — the window this pass
+    is about to mark consumed. ``reset_history_counter`` only clears the counter;
+    ``history.md`` keeps its rows (deliberately: it is also a human-readable log,
+    and ``build_context`` injects it). So without this slice the next pass re-fed
+    every already-consolidated row: at 20 runs the first 10 are consolidated
+    twice, and at the 50-row steady state most of the input is replayed every
+    cycle. Each replay is a re-sighting to the model, which bumps ``n`` on
+    entries nothing new happened to — precisely corrupting the frequency half of
+    the truncation ranking that ``n`` exists to provide.
+
+    None means "all of it", which is what the manual 🧠 button and the nightly
+    loop want: neither is consuming a trigger window.
     """
+    rows = parse_history(read_layer(eid, "history"))
+    if unconsumed is not None:
+        rows = rows[-unconsumed:] if unconsumed > 0 else []
     return [
         {"source": "recent_action", "content": f"[{r['status']}] {r['who']}: {r['text']}"}
-        for r in parse_history(read_layer(eid, "history"))
+        for r in rows
     ]
 
 
