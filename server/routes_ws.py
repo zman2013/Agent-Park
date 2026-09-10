@@ -105,14 +105,13 @@ async def _daily_summary_loop() -> None:
 async def run_daily_summary_all(date: str) -> None:
     """Consolidate every active effective id for *date*.
 
-    Iterates effective ids rather than agent ids: several agents can share one
-    knowledge store, and running once per agent both re-ran the LLM N times
-    over the same documents and let each pass overwrite hotfiles.md with only
-    that one agent's file-access data.
+    Iterates effective ids rather than agent ids: several agents share one
+    memory store, so running once per agent would re-run the LLM N times over
+    the same documents (one eid here has 478 members).
     """
     from server.auto_memory import active_eids
 
-    logger.info("Running daily knowledge summary for date %s", date)
+    logger.info("Running daily consolidation for date %s", date)
     for eid in active_eids():
         try:
             await _run_daily_summary(eid, date)
@@ -139,12 +138,10 @@ def _eid_tasks(eid: str) -> list:
 
 
 async def _run_daily_summary(eid: str, date: str) -> None:
-    """Run knowledge summary for one effective id for a specific date."""
-    from server.knowledge import generate_summary
+    """Consolidate one effective id for a specific date."""
+    from server.auto_memory import consolidate
 
     all_tasks = _eid_tasks(eid)
-    # LLM extraction only looks at the target day; hotfiles keeps its own
-    # multi-day window, so it gets the unfiltered set.
     day_tasks = [t for t in all_tasks if (getattr(t, "updated_at", "") or "").startswith(date)]
     if not day_tasks:
         logger.info("No tasks for eid %s on %s, skipping summary", eid, date)
@@ -154,12 +151,16 @@ async def _run_daily_summary(eid: str, date: str) -> None:
         "Daily summary: eid=%s date=%s tasks=%d members_tasks=%d",
         eid, date, len(day_tasks), len(all_tasks),
     )
-    result = await generate_summary(eid, day_tasks, hotfiles_tasks=all_tasks)
+    # today=date, not the wall clock. This path deliberately consolidates the
+    # day that just ended, and `last` feeds the truncation ranking: stamping
+    # "now" dates every nightly result one day late, and dates a replay of old
+    # history as the replay day — which is how `last` stops discriminating and
+    # the recency half of the ranking goes quietly dead.
+    result = await consolidate(eid, day_tasks, today=date)
     logger.info(
-        "Daily summary done: eid=%s files=%s memory_entries=%d",
-        eid,
-        result.get("files_updated"),
-        result.get("memory_entries", 0),
+        "Daily summary done: eid=%s added=%d updated=%d deleted=%d refused=%d%s",
+        eid, result["added"], result["updated"], result["deleted"], result["refused"],
+        f" FAILED_LAYERS={result['failed_layers']}" if result["failed_layers"] else "",
     )
 
 
@@ -557,10 +558,6 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
         await broadcast(task_created_message(new_task))
 
     elif msg_type == "generate_summary":
-        from server.config import knowledge_config
-        if not knowledge_config().get("enabled", True):
-            logger.info("generate_summary ignored: knowledge summary is disabled by config")
-            return
         agent_id = data.get("agent_id", "")
         date_range = data.get("date_range", "recent_n")
         if not agent_id or agent_id not in app_state.agents:
@@ -569,9 +566,14 @@ async def _handle_client_message(data: dict, ws: WebSocket) -> None:
 
 
 async def _run_generate_summary(agent_id: str, date_range: str) -> None:
-    """Run knowledge summary generation and broadcast progress."""
-    from server.knowledge import generate_summary
-    from server.config import knowledge_config
+    """Consolidate on demand (the 🧠 button) and broadcast progress.
+
+    Runs regardless of ``automemory.daily_enabled``: that flag only silences the
+    unattended loop, and the manual path is how consolidation gets exercised
+    against real history.
+    """
+    from server.auto_memory import consolidate, effective_id
+    from server.config import automemory_config
 
     async def progress_cb(step: str, detail: str):
         await broadcast({
@@ -582,12 +584,11 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
         })
 
     try:
-        cfg = knowledge_config()
-        from server.auto_memory import effective_id
+        cfg = automemory_config()
         eid = effective_id(agent_id)
-        # Aggregate across every agent sharing this knowledge store, matching
-        # the daily loop; otherwise a manual run would shrink hotfiles.md down
-        # to just the agent whose button was clicked.
+        # Aggregate across every agent sharing this store, matching the daily
+        # loop: the documents are shared, so a manual run must see the same
+        # task set the unattended one would.
         all_tasks = _eid_tasks(eid)
         tasks = all_tasks
         if date_range == "today":
@@ -595,20 +596,27 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             tasks = [t for t in tasks if (t.updated_at or "").startswith(today)]
         else:
-            # recent_n: last N completed tasks
+            # recent_n: last N completed tasks. status_value, not str(): status is
+            # a str-Enum whose str() is "TaskStatus.success", so this filter used
+            # to match nothing and the button consolidated an empty task list.
             n = cfg.get("default_task_count", 5)
-            completed = [t for t in tasks if str(t.status) in ("success", "failed")]
+            from server.auto_memory import status_value
+            completed = [t for t in tasks if status_value(t) in ("success", "failed")]
             completed.sort(key=lambda t: t.updated_at or "", reverse=True)
             tasks = completed[:n]
 
-        result = await generate_summary(
-            eid, tasks, progress_cb, hotfiles_tasks=all_tasks
-        )
+        result = await consolidate(eid, tasks, progress_cb=progress_cb)
         await broadcast({
             "type": "summary_done",
             "agent_id": agent_id,
-            "files_updated": result.get("files_updated", []),
-            "memory_entries": result.get("memory_entries", 0),
+            # The four counts are the whole observability story: they are what
+            # distinguishes "nothing needed changing" from "the model returned
+            # something we refused to write".
+            "added": result["added"],
+            "updated": result["updated"],
+            "deleted": result["deleted"],
+            "refused": result["refused"],
+            "failed_layers": result["failed_layers"],
         })
     except Exception as exc:
         logger.exception("generate_summary failed for agent %s", agent_id)

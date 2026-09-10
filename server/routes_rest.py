@@ -235,21 +235,31 @@ class MemoryAddBody(BaseModel):
 
 @router.get("/agents/{agent_id}/memory")
 async def get_memory(agent_id: str):
+    """Return profile entries in the legacy note shape.
+
+    The panel's memory tab predates the layered documents and speaks
+    ``[{type, timestamp, content, line_index}]``. profile.md is the layer it was
+    always editing — human-authored interaction rules — so a shim here keeps the
+    whole tab working without a frontend change.
+    """
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
-    from server.memory import list_memory
-    return list_memory(agent_id)
+    from server.profile_store import list_profile
+
+    return list_profile(agent_id)
 
 
 @router.post("/agents/{agent_id}/memory")
 async def add_memory(agent_id: str, body: MemoryAddBody):
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
-    from server.memory import compress_content, append_memory, MAX_CONTENT_LENGTH, _utcnow_iso
-    from server.config import memory_config
+    from datetime import datetime, timezone
 
-    command = memory_config()["command"]
-    compressed = await compress_content(body.content, command)
+    from server.config import automemory_config
+    from server.helper_llm import MAX_CONTENT_LENGTH, compress_content
+    from server.profile_store import ProfileFull, append_profile
+
+    compressed = await compress_content(body.content, automemory_config()["command"])
 
     if len(compressed) > MAX_CONTENT_LENGTH:
         return JSONResponse(
@@ -260,17 +270,32 @@ async def add_memory(agent_id: str, body: MemoryAddBody):
             },
         )
 
-    entry = {"type": body.type, "timestamp": _utcnow_iso(), "content": compressed}
-    append_memory(agent_id, entry)
-    return entry
+    try:
+        append_profile(agent_id, compressed)
+    except ProfileFull as exc:
+        # 422, same as the per-note ceiling above: the panel already renders
+        # `detail` and echoes `compressed` back into the editor, so the user
+        # keeps what they typed.
+        return JSONResponse(
+            status_code=422,
+            content={"detail": str(exc), "compressed": compressed},
+        )
+    # profile.md stores dates only; the full timestamp is echoed back because the
+    # panel renders this response directly without re-fetching.
+    return {
+        "type": body.type,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "content": compressed,
+    }
 
 
 @router.delete("/agents/{agent_id}/memory/{line_index}")
 async def delete_memory(agent_id: str, line_index: int):
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
-    from server.memory import delete_memory_line
-    if not delete_memory_line(agent_id, line_index):
+    from server.profile_store import delete_profile_line
+
+    if not delete_profile_line(agent_id, line_index):
         raise HTTPException(404, "memory entry not found")
     return {"ok": True}
 
@@ -279,11 +304,21 @@ async def delete_memory(agent_id: str, line_index: int):
 
 @router.get("/agents/{agent_id}/knowledge")
 async def get_knowledge(agent_id: str):
-    """Return the three knowledge documents for an agent."""
+    """Return the four layers, plus the frozen pre-migration archive."""
     if agent_id not in app_state.agents:
         raise HTTPException(404, "agent not found")
+    from server.auto_memory import effective_id, read_layer
     from server.knowledge import read_knowledge_docs
-    return read_knowledge_docs(agent_id)
+
+    eid = effective_id(agent_id)
+    return {
+        "lessons": read_layer(eid, "lessons"),
+        "project": read_layer(eid, "project"),
+        "history": read_layer(eid, "history"),
+        "profile": read_layer(eid, "profile"),
+        # Read-only; nothing writes data/knowledge/ any more.
+        "archive": read_knowledge_docs(agent_id),
+    }
 
 
 # ── Prompts endpoints ─────────────────────────────────────────────────────────

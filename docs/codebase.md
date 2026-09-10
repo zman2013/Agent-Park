@@ -13,7 +13,7 @@
 
 ```
 agent-park/
-├── config.json              # 全局配置（端口、Agent 列表、memory、knowledge）
+├── config.json              # 全局配置（端口、Agent 列表、automemory、wiki、task_notify）
 ├── run.sh                   # 启动/停止/重启脚本
 ├── requirements.txt
 ├── pyproject.toml
@@ -24,9 +24,10 @@ agent-park/
 │   ├── agent_runner.py      # 核心：子进程管理、PTY、流式输出处理
 │   ├── routes_ws.py         # WebSocket 路由，消息分发，broadcast()，定时任务
 │   ├── routes_rest.py       # REST API（Agent/Task CRUD、Memory、Knowledge）
-│   ├── memory.py            # Agent 记忆读写（JSONL 格式）
-│   ├── auto_memory.py       # effective_id 唯一定义 + 启动上下文组装（build_context）
-│   ├── knowledge.py         # 知识总结：信号提取、LLM 合并、文档写入、memory 索引
+│   ├── auto_memory.py       # 四层记忆：effective_id、build_context、consolidate + 四道闸门
+│   ├── helper_llm.py        # 辅助 LLM 调用的共用管道（只读 settings + stream-json 解析）
+│   ├── profile_store.py     # profile.md ↔ 旧 note 形状的 REST 转接层
+│   ├── knowledge.py         # project 信号提取 + 只读知识归档
 │   ├── task_notify.py       # Task 终态飞书通知（卡片拼装 + 发送）
 │   └── config.py            # 读取 config.json 配置
 ├── frontend/
@@ -49,18 +50,19 @@ agent-park/
 │           ├── FileBrowserNode.vue           # 文件树节点
 │           ├── UnseenTasksPanel.vue          # 未读任务指示
 │           └── ToastContainer.vue            # 消息提示
+├── scripts/
+│   └── migrate_automemory.py  # 一次性迁移到四层文档（支持 --dry-run）
+├── tests/                     # pytest（`python3 -m pytest tests/`，venv 内无 pytest）
 ├── data/
 │   ├── agents.json          # Agent 元数据 + 排序顺序
 │   ├── sessions.json        # cco 会话 ID（用于续话）
 │   ├── tasks/               # 按 Agent 分离的任务文件
 │   │   └── {agent_id}.json
-│   ├── memory/              # Agent 记忆（JSONL 格式）
-│   │   └── {agent_id}.jsonl
-│   └── knowledge/           # Agent 知识文档（每日 summary 产出）
-│       └── {effective_id}/
-│           ├── errors.md    # 错误经验
-│           ├── project.md   # 项目知识
-│           └── hotfiles.md  # 文件热度统计
+│   ├── memory/              # Agent 记忆
+│   │   ├── {eid}/            # 四层文档 profile/lessons/project/history.md + history_count
+│   │   └── {eid}.jsonl       # 旧扁平格式，只读归档（已无代码读写，留作回滚依据）
+│   └── knowledge/           # 只读归档（迁移前的历史产出，已无代码写入）
+│       └── {effective_id}/  # errors.md / project.md / hotfiles.md
 └── docs/                    # 项目文档
 ```
 
@@ -184,7 +186,7 @@ _run_subprocess()
 | `fork_task` | Fork 一个已有任务（复制消息历史，创建独立会话分支） |
 | `stop_task` | 中止任务 |
 | `set_agent_order` | 重排序 Agent |
-| `generate_summary` | 手动触发知识总结（`agent_id`, `date_range: "today"\|"recent_n"`） |
+| `generate_summary` | 手动触发巩固（`agent_id`, `date_range: "today"\|"recent_n"`）；不受 `automemory.daily_enabled` 限制 |
 
 ### 服务端 → 客户端（broadcast）
 
@@ -198,9 +200,9 @@ _run_subprocess()
 | `message_done` | 消息流结束 |
 | `agent_created` | Agent 创建完成 |
 | `agents_reordered` | Agent 排序更新 |
-| `summary_progress` | 知识总结进度（`step`, `detail`） |
-| `summary_done` | 知识总结完成（`files_updated`, `memory_entries`） |
-| `summary_error` | 知识总结失败（`error`） |
+| `summary_progress` | 巩固进度（`step`, `detail`） |
+| `summary_done` | 巩固完成（`added`/`updated`/`deleted`/`refused` + `failed_layers`） |
+| `summary_error` | 巩固失败（`error`） |
 
 ## Task 完成飞书通知（task_notify.py）
 
@@ -242,23 +244,93 @@ agent_runner._finish_task(task_id, status)
 - `save_sessions()` → 写入 `data/sessions.json`（cco 续话用）
 - 启动时从 JSON 恢复，running/waiting 任务重置为 failed
 
-## Agent 记忆管理（memory.py / auto_memory.py）
+## Agent 记忆管理（auto_memory.py）
 
-- 格式：JSONL，每行一条 `MemoryEntry`（timestamp、type、content）
-- 文件位置：`data/memory/{effective_id}.jsonl`
-- 最大行数由 `config.json` 的 `memory.max_lines` 控制
+### 四层文档
+
+```
+data/memory/{effective_id}/
+├── profile.md      # L1 交互偏好/人工规则 —— 人写，巩固永不改
+├── lessons.md      # L2 错误 → 正确做法 —— 纠正/失败派生
+├── project.md      # L3 项目事实 —— 观察派生
+└── history.md      # L4 近期行动日志 —— 每轮追加，零 LLM
+```
+
+| 层 | 优先级 | 权威来源 | 字符上限 | 条数上限 |
+|---|---|---|---|---|
+| profile | 1 | 人工 | 2,000 | — |
+| lessons | 2 | 纠正/失败派生 | 8,000 | 30 |
+| project | 3 | 观察派生 | 10,000 | 40 |
+| history | 4（无权威） | 每轮追加的日志 | 4,000 | 50 |
+
+**巩固永不写 `profile.md`** —— 它是唯一人工权威源，自动写入会破坏用户对系统的信任基础。
+
+**这是唯一的记忆系统，没有开关、没有回退路径。** 旧的扁平 `{eid}.jsonl` 读写（`server/memory.py`）连同 `automemory.enabled` 开关一起删掉了 —— 留一个永远为 `true` 的开关，只是把两条代码路径的维护成本伪装成安全感。`automemory.daily_enabled` 只管无人值守的 00:30 循环，注入与手工 🧠 不受它限制。
+
+`data/memory/*.jsonl` 八个文件**留在原地但已无任何代码读写**，与 `data/knowledge/` 同为只读归档。它们是回滚这次删除的唯一依据，所以别顺手清理。
+
+`build_context` 对没有文档的 eid 返回 `""`（`read_layer` 对缺失目录返回 `""`）—— 36 个 eid 里 31 个正处于这个状态，这条路径是常态而非边界情况。
+
+### history 层：每轮零 LLM 追加，每 10 条触发巩固
+
+`history.md` 是**唯一每轮都写的层**，格式是时间序列而非去重条目 —— 同一件事发生两次是信号，不是碰撞：
+
+```
+- 2026-09-09 21:40 · agent-park / 删除 hotfiles · success — <本轮最后一条 agent text，220 字以内>
+```
+
+写入挂在 `_finish_task`，**照抄通知路径的三处边界**（缺一处就会错记）：
+
+| 边界 | 不做会怎样 |
+|---|---|
+| `_resuming` 提前返回之后 | 每次 resume 都误记一条 |
+| `if task and not was_terminal` 之内 | 幂等重入重复记 |
+| 尊重 `compact_will_continue` | auto-compact 续接前就记，本轮其实没结束 |
+
+同样必须**在第一个 `await` 之前**读取：并发 `send_input()` 会推进 `_run_start_index`，await 之后读到的是下一轮的消息。
+
+`text` 来自任意 agent 输出，所以 `_one_line()` 折叠换行、把 `·`/`—` 替换掉 —— 不是转义而是替换，因为这是给人读的日志不是序列化格式。**换行必须折叠而不是丢弃**：parse 按行首 `- ` 匹配，未折叠的第 2 行会被静默丢掉而条目看起来仍然正常。`tests/test_history_layer.py` 用变异测试确认了这条断言真的会失败（先前一版只断言「1 条、无换行」，两者在丢数据时仍成立，测不出来）。
+
+**触发**：`history_count` 文件记录距上次巩固的追加数，满 `consolidate_every`（默认 10）触发一次。计数**落盘**，重启不丢 —— 否则忙时永远攒不到触发点。
+
+**计数只在至少一层成功时清零**。无条件清零会让 LLM 返回不可用内容时把整个窗口白白消耗掉，那批 run 再也不会被看到 —— 和旧代码「超时返回 `existing_md`」是同一种静默数据丢失。`history.md` 本身不被巩固改写，只是被标记消费。
+
+巩固是 **detached task**（`_consolidate_tasks`）：它要发两次 LLM 调用，而 `_finish_task` 在给 UI 报完成的路径上。同 eid 有巩固在飞时跳过新触发 —— per-eid 锁能串行化，但排队 N 个会在触发窗口早就过去之后还在发 LLM 调用。
+
+关机 drain 只等 5s（`CONSOLIDATE_DRAIN_SECONDS`）：通知 drain 已经可能吃掉 `run.sh` 95s 宽限里的 80s，没有余量等 LLM（单次 600s 超时），也不需要 —— `write_layer` 靠 `os.replace` 原子，计数又只在成功后清零，所以被打断的窗口是**重试**而非丢失。
+
+### 为什么删掉 hotfiles
+
+它是唯一零污染、零 LLM 的层，这个对照当初是诊断的关键。但**一张按访问次数排序的文件表只告诉模型哪些文件被碰过，从不说发生了什么** —— 拿它做不了决策，却占 4000 字符预算，而预算实测第 5 天就 binding。history 接替了它：同样零 LLM，但记录的是结果。
+
+`compute_hotfiles` / `build_hotfiles_md` 及五个路径辅助函数（`_is_under_root` / `_is_project_file` / `_extract_file_path` / `_extract_paths_from_bash` / `_HOTFILE_EXCLUDE_PREFIXES`）一并从 `knowledge.py` 删除，共 141 行 —— 它们的唯一消费方就是这一层。磁盘上已有的 `hotfiles.md` 不删，成为归档；它不在 `LAYERS` 里，所以不再被注入。
 
 ### effective_id：唯一定义在 auto_memory.py
 
-`auto_memory.effective_id(agent_id)` 是 memory / knowledge 共用的**唯一**实现（`memory.effective_memory_agent_id` 与 `knowledge.effective_knowledge_agent_id` 都是转发别名）。多个 worktree agent 通过 `shared_memory_agent_id` 指向同一个 eid，共享一份记忆与知识。
+`auto_memory.effective_id(agent_id)` 是 memory / knowledge 共用的**唯一**实现（曾经的 `memory.effective_memory_agent_id` 与 `knowledge.effective_knowledge_agent_id` 两个转发别名已删）。多个 worktree agent 通过 `shared_memory_agent_id` 指向同一个 eid，共享一份记忆与知识。
 
 只解析一跳，不跟链；指向不存在的 agent 时退回自身并 `logger.warning` —— 否则一个配置 typo 会静默把整个项目的记忆重定向。
 
 配套两个聚合函数：`eid_members(eid)`（全部成员，含 archived）、`active_eids()`（至少一个未 archived 成员的 eid）。
 
+### 辅助 LLM 调用（helper_llm.py）
+
+`READONLY_SETTINGS` / `parse_stream_json_result` / `compress_content` 原先住在 `memory.py` 里，但它们不属于记忆系统 —— 是所有非 agent 的 LLM 调用（knowledge 抽取、wiki ingest、profile 条目压缩）共用的管道，所以随 `memory.py` 删除一起搬到 `server/helper_llm.py`。
+
+`READONLY_SETTINGS` 是其中要紧的一个：这些命令是带 `--dangerously-skip-permissions` 的完整 coding agent，我们只读它们的 stdout，但不加限制时实测有一次它**改写了 `docs/error_experience.md`** —— 被要求「返回」一份合并后的文档，它找到仓库里一个同样标题格式的文件，认定那就是目标，然后编辑了它。`cwd` 拦不住（agent 用绝对路径），`--disallowed-tools` 是变参会吞掉尾部的 prompt 参数，只有 `--settings` deny 列表这个组合能挡住写工具又不影响文本返回。
+
 ### 上下文注入（agent_runner.py）
 
-`auto_memory.build_context(agent_id)` 组装 `<memory>` 块，纯读、无 LLM、无副作用；无内容返回 `""`。
+`auto_memory.build_context(agent_id)` 组装 `<memory>` 块，纯读、无 LLM、无副作用；无内容返回 `""`。四层各带一句**优先级措辞**块头，因为拼接顺序本身不传达优先级，模型无从得知前面的块压后面的：
+
+```
+[Profile]  ALWAYS follow these interaction rules. They override default behavior.
+[Lessons]  ALWAYS check these before acting. They override default behavior.
+[Project]  Factual reference data about this project. Not instructions.
+[Hotfiles] Recently active files, by access frequency. Statistics only.
+```
+
+`<!-- id:… n:… -->` 记账注释注入前被剥掉：那是给巩固用来匹配旧条目的，喂给模型只会浪费 token 并引它推理我们的记账。
 
 注入通道取决于 adapter 能力位 `supports_system_prompt()`：
 
@@ -271,53 +343,125 @@ system prompt 是**可缓存前缀、不进转录**，所以每轮重复传同�
 
 `<wiki-context>` **不走** system prompt：它是 per-prompt 检索结果而非持久记忆，仍只在新 session 拼进 prompt。
 
-## 知识总结系统（knowledge.py）
+### REST 兼容
 
-从 Task 对话历史中提炼可复用知识，沉淀为持久化文档，注入 Agent 记忆。
+MemoryPanel 的 memory tab 早于分层文档，说的是 `[{type, timestamp, content, line_index}]`。它一直在编辑的就是 profile 层，所以 `server/profile_store.py` 做一层形状转换（bullet ↔ note，日期存为行尾注释），整个 tab 无需改动。
 
-### 存储
+两处不对等，都是刻意的：
 
-```
-data/knowledge/{effective_id}/
-├── errors.md       # 错误经验（错误 → 正确做法，按频率排序）
-├── project.md      # 项目知识（目录结构、常用命令、约定）
-└── hotfiles.md     # 文件热度统计（最近 7 天读写频率 top 20）
-```
+- **多行条目**：磁盘格式是「一个条目一个 bullet」，所以第 2 行起用两空格续行缩进。`POST /memory` 接受用户自由输入（上限 300 字符），两行规则很正常 —— 没有续行约定的话第 1 行之后会被静默丢掉，**连带行尾的日期注释**。条目**内部的空行不保留**：那需要输出只含缩进的行，而多数编辑器保存时会剥掉行尾空白，profile.md 是给人手改的，这个格式没法诚实地承诺往返。`tests/test_profile_store.py` 钉住这条契约。
+- **时间戳精度**：旧的是 ISO（`2026-04-07T03:22:11Z`），profile.md 只存日期。前端 `formatTs` 对 date-only 单独分支 —— 否则 `new Date('2026-04-07')` 按 UTC 午夜解析，东八区看到 `04/07 08:00`，一个从未记录过的时刻。
 
-### 提取流程
+`scripts/migrate_automemory.py` 的 `render_profile` **复用 `profile_store._render`** 而不是自己拼一份：两者必须对续行约定取得一致，各写一份的话迁移会写出面板静默截断的 bullet。
 
-```
-Step 1: 规则提取（无 LLM）
-  - extract_error_signals()：tool_result 含 error/traceback + user 纠正消息
-  - extract_project_signals()：agent text 含路径/命令描述 + user 告知的事实
-  - compute_hotfiles()：统计 Read/Edit/Write tool_use 中的文件访问频率
+### 已知缺口：6 个 eid 的 project 层需要重新派生
 
-Step 2: LLM 合并
-  - 旧 errors.md + 新信号 → LLM → 新 errors.md（去重、合并计数、排序）
-  - 旧 project.md + 新信号 → LLM → 新 project.md（同主题覆盖、保持分类）
-  - hotfiles：纯计算，无需 LLM
+迁移只把 `note` 迁进 profile、`knowledge_summary` **全部丢弃**，所以只有含 `note` 的 eid 才有内容。删除旧系统前实测 36 个 eid 里 8 个有注入内容，新旧对照：
 
-Step 3: 写入
-  - 覆盖写三个 .md 文件
-  - 从文档内容逐条构建 memory 条目（每条知识独立一条）
-  - 删除 memory 中旧的 knowledge_summary 条目，写入新条目
-```
+| eid | agent | 近30d 活跃日 | 旧 → 新 |
+|---|---|---|---|
+| `1b158839f8aa` | schumacher-compiler-ci | 0 | 1377c → **0** |
+| `2876150ba8c6` | feishu-bot | 1 | 824c → **0** |
+| `440f3041c89a` | fm | 0 | 1291c → **0** |
+| `ce7611e7481e` | talk | 0 | 2078c → 243c |
+| `867aac932032` | ccgs | 0 | 915c → 244c |
+| `41dd70bc1d00` | claude-code-router | 0 | 1526c → 242c |
+| `f4bfb91dfc93` | agent-park | 4 | 2590c → **6160c** |
+| `648e67d1ac10` | compiler | 11 | 1110c → **1232c** |
 
-`generate_summary(agent_id, tasks, progress_cb, hotfiles_tasks)` 分开接收两个任务集：`tasks` 喂 LLM（通常是当天的），`hotfiles_tasks` 喂统计（必须是该 eid 全部成员的，见下节）。每个 eid 一把 `asyncio.Lock`，串行化每日循环与手工 🧠 的读-改-写。
+**决定是接受这段真空，不补迁**（备选是把 `knowledge_summary` 剥掉 `。详见 …md` 尾巴后作为 project 种子）。依据是活跃度分布：六个受影响的 eid 近 30 天合计只有 1 个活跃日、总 task 2~17，而两个真正在用的 eid 恰好四层文档已建好。它们的 profile 层照常注入，project 层在**下次被用到的当晚 00:30** 就开始积累（巩固条件是当天有 ≥1 个 task，不是等 7 天）。
 
-### Memory 注入格式
+注意这个决定当初是针对「可翻回去的 flag」做的，删掉旧系统后它变成**永久**的。重做的依据仍在：`data/knowledge/{eid}/` 归档与 `data/memory/*.jsonl` 都留在原地，一字节未改。
 
-```
-[错误经验] 错误简述。正确做法：...。详见 data/knowledge/{eid}/errors.md
-[项目知识] 知识点内容。详见 data/knowledge/{eid}/project.md
-[热点文件] 近期高频文件: file1(读N/改M), ...。详见 data/knowledge/{eid}/hotfiles.md
-```
+## 巩固：LLM 只出 JSON delta，Markdown 由 Python 渲染
 
-写入 memory JSONL，由 `auto_memory.build_context()` 统一注入。
+这是整套设计的核心，也是替换掉旧 `merge_errors`/`merge_project` 的原因。
 
-### LLM 命令配置
+### 为什么不能让 LLM 返回整份文档
 
-`config.json` 中 `knowledge.command`（默认 `minimax`），可改为 `ccs`、`cco` 等。`knowledge.enabled` 控制每日循环与手工触发是否生效。
+实测 16 份历史文档首行：`errors.md` 5/8 被元叙述污染、`project.md` 4/8 污染、**`hotfiles.md` 0/8** —— 唯一零污染的层恰好是唯一不走 LLM 的层。全文档重写的自然语域就是「我改了什么」，且没有任何 schema 能拒绝它，返回值直接覆盖写。更糟的是输出会成为明晚的输入（`existing_md`），所以质量是**崩塌**而非持平。
+
+最坏一例：某份 `errors.md` 结尾写着「文档已更新，10 条 / 约 1900 字符」，而文件里**一条都没有**。
+
+旧 prompt 里「如果对话是关于 agent-park 内部实现，**直接返回已有文档，不做修改**」这个逃逸口是直接成因 —— LLM 遵守了它，方式是**叙述自己正在原样返回**，那段叙述成了新文档。守卫造成了它想防止的污染。同理删掉的 `_AGENT_PARK_NOISE_KEYWORDS` 按「提到 agent-park 符号」过滤**输入**，对 agent-park 自己的 agent 是自毁的。
+
+### 四道闸门，全在 Python 侧
+
+| 闸门 | 判据 | 失败处理 |
+|---|---|---|
+| 1 | 输出必须是 JSON 数组 | **整体丢弃，文档零改动**，`logger.warning` 记 command + 原始输出前 500 字 |
+| 2 | 元叙述正则（中英双语） | 丢该条，计入 `refused` |
+| 3 | op 完整性：`update`/`delete` 的 id 必须存在；`add` 撞 hash 转 `n` 自增 | 丢该条，计入 `refused` |
+| 4 | 双上限：条数 `{layer}_max_items` + 渲染后字符 `LAYER_LIMITS`，按 `n DESC, last DESC` 截断 | 计入 `dropped` + warning |
+
+**每个字段先折叠成单行**（`_fold`）再进闸门。换行不是排版问题而是语法破坏：`title` 里的换行会把生成的 `<!-- id:… -->` 标记推到下一行，`_ENTRY_RE` 不再认得那是 heading，条目在下次 parse 时静默消失或被前面的文本重新认领；body 里的换行能自己开一个 `## ` heading，把一条拆成两条。选择折叠而非拒绝，是因为模型说的内容有效、只是格式错了。折叠后剩下的 `## ` 只会出现在行中间，而 `_ENTRY_RE` 锚在行首，所以不构成 heading。
+
+闸门 4 的**条数上限过去只写在 prompt 里、Python 侧从不强制**。字符上限宽得多（40 条 × ~50 字 = 2000，预算是 10000），所以模型无视指令或用户调小配置时都兜不住。两个上限现在都在 `truncate_entries` 里，且相互独立 —— 少数超长条目在条数合法时仍会被字符闸门砍掉。目前现存文档最大 10 条对 30 的上限，条数闸门**不 binding**，但闸门本身已经存在。
+
+**闸门 1 是真防线**，它按结构拒绝叙述，与措辞、语言无关。闸门 2 只是第二道网，因此按**精确率**而非召回率调：假阳性会静默丢掉一条真经验（数据损失），假阴性只是让一条脏条目进到人能编辑的 Markdown 里 —— 两种错误不对称。所以规则要求句式而非裸子串，实测里 `本轮`、`已合并` 这类子串会误伤 `本轮起始消息位置`、`已合并分支` 这样的正常技术表述。
+
+`ConsolidationResult` 把 `refused`（有输出但被拒）和 `failed`（没拿到可用输出）**分开**。旧代码超时返回 `existing_md`，让「LLM 没产出可用内容」和「没什么需要改」变成同一个可观测结果 —— 这正是一条已死五个月的流水线看起来仍健康的原因。
+
+### 信号来源
+
+`extract_lesson_signals()` 比旧的 `extract_error_signals()` 窄得多：旧版把**任何** 5–200 字的 user 消息都当「纠正」，几乎每条消息都命中，用噪声拼出的 prompt 正是模型开始叙述的原因。新版三个有明确语义的来源：task 失败、工具报错、高 turns 弯路；且只保留确实出错过的 task 的信号。
+
+#### tool_error 判据：报告了失败，而非提到了失败
+
+最初的判据是「`content.lower()` 含 `error`/`failed`/`exception`/`errno`/`traceback` 任一子串」—— 这重犯了它想修的毛病。实测一个真实 task：**291 条命中里 276 条根本没有失败**，全是讨论错误的源码和文档：
+
+| 命中内容 | 触发词位置 |
+|---|---|
+| `docs/codebase.md` 全文 | 第 60 行 `├── errors.md` |
+| `ls data/knowledge/*/` 输出 | 文件名含 `errors` |
+| `server/memory.py` 源码 | `except json.JSONDecodeError` |
+| `adapters/base.py` 源码 | 参数名 `errors: list[str]` |
+
+19 万字源码于是挤满 prompt 预算，把真信号全截在后面。改成匹配「异常被抛出并打印」的形状（`_TOOL_ERROR_RE`）：**291 → 25 条，降 92%**。
+
+三个细节都是测出来的，不是想出来的：
+
+- `^\s*(?:\w+Error|\w+Exception)(?::|\s*$)` 末尾那个 `(?::|\s*$)` 是承重的 —— 没有它，`saveError` 和 `errors: list[str]` 仍然命中。源码里标识符后跟 `(`/`=`/`,`，真异常后跟 `: ` 或行尾。
+- **匹配前先剥 ANSI**（`_plain`）。pytest 输出是 `\x1b[31mFAILED\x1b[0m tests/x.py - AssertionError:`，转义码夹在词中间，`^\s*` 锚不到。第一版试着在正则里加 `\x1b\[[0-9;]*m` 分支，只覆盖了行首着色，真实转录里仍漏两条。
+- `exit [1-9]` 而非 `\d` —— `exit code 0` 是成功。
+
+反向验过假阴性：漏掉的 276 条里含 `Traceback|panic|AssertionError|FAILED` 字样的只有 4 条，全部是文字里写「0 个 Traceback/Error/FAIL」这类**正确的不命中**。
+
+#### 截断以报错为中心
+
+`content[:800]` 从头切会让 **34%（99/289）的信号里看不到触发它的报错** —— 匹配位置在 13k 字文件列表的第 2682 字，送进 prompt 的是一段无关的源码开头。`_around()` 以匹配点为中心取窗口（前 1/3、后 2/3），修完后「看不见报错的信号」是 0 条。
+
+#### 预算：字符配置 + 不可见的字节保险
+
+`max_signal_chars` 从 12000 提到 **50000**。12000 是当初随手填的，无测量依据，实际扮演的角色是「在噪声里盲选前 14 条」。
+
+但配置项单位是**字符**，真正的硬约束是**字节**：prompt 通过 argv 传给辅助 LLM，单条 argv 上限 `MAX_ARG_STRLEN = 131072` 字节。5 万字符纯中文 = 15 万字节，**超限**。超限时 `_llm_call` 的 except 返回空串，闸门判定「没拿到可用输出」—— 不崩，但静默失效，正是整套重构要消除的故障形状。
+
+所以加一道 `MAX_SIGNAL_BYTES = 100_000` 的字节闸门，**故意不出现在 config 里**：`max_signal_chars` 保留字面含义，字节闸门只在 CJK 密集时生效，留 3 万字节余量给骨架和 `existing`（后者无 cap 且随文档增长）。实测英文输入由字符闸门挡下（49,893 字符），纯中文由字节闸门挡下（33,656 字符 / 99,256 字节，字符数远未到 5 万）。
+
+判据修好后 4 个活跃 eid 的 8 个层**全部零截断**，history 信号 13/13 进入 —— 所以没有引入按来源排序的优先级，信号顺序保持原样。
+
+### 迁移（scripts/migrate_automemory.py）
+
+一次性、全确定性、**零 LLM** —— 对迁移做一次 LLM 处理，正是产生了那批污染文档的步骤。
+
+| 现存 | 处理 | 理由 |
+|---|---|---|
+| `note` × 22 | 迁进 `profile.md`，原文保留，日期存为行尾注释 | 全部是人工写的交互规则，正好就是 profile 层 |
+| `knowledge_summary` × 64 | **全部丢弃** | 每条是 `<一条 bullet>。详见 …md` 的有损派生，且 16 份源文档中 9 份已污染 |
+| `data/knowledge/{eid}/*.md` | 原地保留、只读归档、**不导入** | 8 份文档 8 种形状，且导入污染内容会立刻触发反馈放大 |
+| `docs/error_experience.md` | 作为 agent-park eid 的 `lessons.md` 种子 | 41 行、10 条编号错误模式带出现次数、零污染、人工校验过 |
+
+原 `{eid}.jsonl` **一个字节都不改**（md5 校验过），四层文档写进同级的 `{eid}/` 目录。重复运行会**拒绝覆盖**已存在的文档并以 exit 1 退出 —— 否则第二次迁移会盖掉巩固之后的产出。
+
+## 知识文档归档（knowledge.py）
+
+`data/knowledge/{eid}/` 保留为**只读归档**，供回滚；已无任何代码写入它。`knowledge.py` 剩下的部分：
+
+- `extract_project_signals()` —— project 层的信号来源
+- `_llm_call()` —— 只读的辅助 LLM 调用（`--settings` deny 列表 + `_clean_env()`），与 auto-memory 共用；deny 列表本身在 `helper_llm.py`
+- `read_knowledge_docs()` —— 读归档
+
 
 ## 定时任务（routes_ws.py）
 
@@ -331,14 +475,26 @@ Step 3: 写入
 
 知识总结定在 00:30 而非 00:00，是为了与 wiki ingest 错开，避免两套 LLM 调用在午夜串行堆积。
 
-**每日知识总结流程**：
-1. 应用启动 → `lifespan` → `ensure_daily_summary_task()`
+**巩固有三个触发点**，都走同一个 `auto_memory.consolidate()`：
+
+| 触发 | 时机 | 受 `daily_enabled` 限制 |
+|---|---|---|
+| history 计数 | 每满 `consolidate_every`（10）条追加 | 否 |
+| 每日循环 | 00:30，按 eid | **是** |
+| 手工 🧠 | WS `generate_summary` | 否 |
+
+history 触发是主力：实测近 30 天日均 26 次 run、最忙一天 102 次，按 10 条一次约合每天 2~10 次巩固。而 `_finish_task` **每轮都进**（不是每 task 一次，单 task 最多进过 118 次），所以那里绝不能直接发 LLM 调用 —— 一个 20 轮调试 task 的第 1 轮抽出来的「结论」往往是后来被否证的错误假设。零 LLM 追加 + 计数触发就是为了拿到每轮的记录而不付每轮的代价。
+
+**每日巩固流程**：
+1. 应用启动 → `lifespan` → `ensure_daily_summary_task()`（受 `automemory.daily_enabled` 控制）
 2. 循环计算到下一个 00:30 的秒数，`asyncio.sleep()`
 3. 醒来 → `run_daily_summary_all(date)` → 对 `active_eids()` 中每个 **eid** 执行 `_run_daily_summary(eid, date)`
 4. 按 `task.updated_at` 过滤前一天的任务，无任务则跳过
-5. 调用 `generate_summary()`，结果写入 knowledge 文档并更新 memory 索引
+5. 调用 `auto_memory.consolidate()`，经四道闸门后写入四层文档
 
-**为什么按 eid 而非 agent_id 遍历**：514 个 agent（480 已 archived）只对应 25 个活跃 eid。按 agent_id 遍历时，共享同一份文档的 N 个 agent 会让 LLM 在同一份文档上跑 N 遍（`648e67d1ac10` 有 478 个成员）；更糟的是 `compute_hotfiles()` 只吃单个 agent 的 task 后覆盖写，后写的赢 —— 实测按 eid 汇总得到 6991 个文件，按单 agent 只有 622 个。`_eid_tasks(eid)` 负责汇总，archived agent 的历史已冻结故 `active_eids()` 跳过。手工 🧠（`_run_generate_summary`）走同一条聚合路径。
+> 这个循环曾经**从未启动过**：`main.py` 的门是 `knowledge.enabled`，而它是 `false`（日志里 109 条 "Daily knowledge summary is disabled by config"）。也就是说光把 `automemory.enabled` 翻成 `true` 什么都不会发生 —— 一个开关守着另一套配置的开关，是这类静默失效的典型形状。现在门与被门控的东西同属 `automemory`。
+
+**为什么按 eid 而非 agent_id 遍历**：514 个 agent（480 已 archived）只对应 25 个活跃 eid。按 agent_id 遍历时，共享同一份文档的 N 个 agent 会让 LLM 在同一份文档上跑 N 遍（`648e67d1ac10` 有 478 个成员）。`_eid_tasks(eid)` 负责汇总，archived agent 的历史已冻结故 `active_eids()` 跳过。手工 🧠（`_run_generate_summary`）走同一条聚合路径。
 
 ## 前端状态管理（agentStore.js）
 
@@ -366,7 +522,7 @@ memoryPanelOpen / memoryAgentId / agentMemory  // 记忆面板
 | GET | `/api/agents/{id}/memory` | 读取 Agent 记忆 |
 | POST | `/api/agents/{id}/memory` | 添加记忆条目（LLM 压缩） |
 | DELETE | `/api/agents/{id}/memory/{idx}` | 删除记忆条目 |
-| GET | `/api/agents/{id}/knowledge` | 读取知识文档（errors/project/hotfiles） |
+| GET | `/api/agents/{id}/knowledge` | 读取四层文档（lessons/project/history/profile）+ 只读 archive |
 | GET | `/api/agents/{id}/files` | 文件浏览 |
 | GET | `/api/agents/{id}/files/content` | 读取文件内容 |
 | POST | `/api/agents/{id}/tasks` | 创建任务 |
@@ -387,5 +543,5 @@ tail -f logs/frontend.log
 cat data/agents.json            # Agent 列表
 cat data/sessions.json          # cco 会话 ID
 cat data/tasks/{agent_id}.json  # 某 Agent 的所有任务
-ls data/knowledge/              # 各 Agent 的知识文档
+ls data/memory/                 # 各 eid 的四层记忆文档
 ```

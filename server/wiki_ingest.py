@@ -195,13 +195,13 @@ def _fix_json_newlines(json_str: str) -> str:
 async def _llm_call(command: str, prompt: str, timeout: int = 300) -> str:
     """Call an LLM command with -p flag, return result text.
 
-    Denies the write tools (see ``memory.READONLY_SETTINGS``): every wiki file is
-    written by Python from the returned JSON, so the agent needs no filesystem
+    Denies the write tools (see ``helper_llm.READONLY_SETTINGS``): every wiki file
+    is written by Python from the returned JSON, so the agent needs no filesystem
     access, and left unrestricted these agents will edit repo files they mistake
     for the intended output target.
     """
     from server.agent_runner import _clean_env
-    from server.memory import READONLY_SETTINGS
+    from server.helper_llm import READONLY_SETTINGS
     try:
         proc = await asyncio.create_subprocess_exec(
             command,
@@ -219,8 +219,8 @@ async def _llm_call(command: str, prompt: str, timeout: int = 300) -> str:
             env=_clean_env(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        from server.memory import _parse_stream_json_result
-        result = _parse_stream_json_result(stdout.decode("utf-8", errors="replace"))
+        from server.helper_llm import parse_stream_json_result
+        result = parse_stream_json_result(stdout.decode("utf-8", errors="replace"))
         return result.strip() if result else ""
     except asyncio.TimeoutError:
         logger.warning("Wiki ingest LLM call timed out (command=%s)", command)

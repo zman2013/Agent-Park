@@ -42,11 +42,11 @@ async def lifespan(app: FastAPI):
             len(reconciled), reconciled,
         )
 
-    from server.config import knowledge_config
-    if knowledge_config().get("enabled", True):
+    from server.config import automemory_config
+    if automemory_config()["daily_enabled"]:
         ensure_daily_summary_task()
     else:
-        logging.getLogger(__name__).info("Daily knowledge summary is disabled by config")
+        logging.getLogger(__name__).info("Daily consolidation is disabled by config")
 
     ensure_wiki_ingest_task()
     ensure_agentloop_notify_task()

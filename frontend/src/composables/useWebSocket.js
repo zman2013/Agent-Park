@@ -260,7 +260,14 @@ export function useWebSocket() {
 
       case 'summary_done':
         window.dispatchEvent(new CustomEvent('summary-done', {
-          detail: { agentId: data.agent_id, files_updated: data.files_updated, memory_entries: data.memory_entries }
+          detail: {
+            agentId: data.agent_id,
+            added: data.added,
+            updated: data.updated,
+            deleted: data.deleted,
+            refused: data.refused,
+            failed_layers: data.failed_layers
+          }
         }))
         break
 

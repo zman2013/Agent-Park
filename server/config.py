@@ -53,15 +53,6 @@ def upload_config() -> dict:
     }
 
 
-def memory_config() -> dict:
-    """Return the global memory configuration with defaults."""
-    cfg = get_config().get("memory", {})
-    return {
-        "command": cfg.get("command", "cco"),
-        "max_lines": int(cfg.get("max_lines", 200)),
-    }
-
-
 def compact_config() -> dict:
     """Return the compact (auto-trigger / warning) configuration with defaults.
 
@@ -87,19 +78,31 @@ def compact_config() -> dict:
     }
 
 
-def knowledge_config() -> dict:
-    """Return the knowledge summary configuration with defaults."""
-    cfg = get_config().get("knowledge", {})
+def automemory_config() -> dict:
+    """Return the auto-memory configuration with defaults.
+
+    There is no ``enabled`` flag: the layered documents are the only memory
+    system, so there is nothing to fall back to. ``daily_enabled`` gates only the
+    unattended 00:30 consolidation loop — injection and the manual 🧠 button run
+    regardless.
+    """
+    cfg = get_config().get("automemory", {})
     return {
-        "enabled": cfg.get("enabled", True),
-        "command": cfg.get("command", "minimax"),
-        "errors_max_items": int(cfg.get("errors_max_items", 10)),
-        "errors_max_chars": int(cfg.get("errors_max_chars", 2000)),
-        "project_max_items": int(cfg.get("project_max_items", 15)),
-        "project_max_chars": int(cfg.get("project_max_chars", 2000)),
-        "hotfiles_max_items": int(cfg.get("hotfiles_max_items", 20)),
-        "hotfiles_recent_days": int(cfg.get("hotfiles_recent_days", 7)),
+        "daily_enabled": bool(cfg.get("daily_enabled", True)),
+        "command": cfg.get("command", "glm"),
+        # merge_errors built a ~17k-char prompt and timed out 3/3 at the old
+        # 120s default — indistinguishable, to its callers, from "the model
+        # chose to change nothing". The delta prompts are smaller, but the
+        # ceiling stays generous for the same reason.
+        "timeout": int(cfg.get("timeout", 600)),
+        "retry_commands": cfg.get("retry_commands", ["cco"]),
+        "lessons_max_items": int(cfg.get("lessons_max_items", 30)),
+        "project_max_items": int(cfg.get("project_max_items", 40)),
+        "max_signal_chars": int(cfg.get("max_signal_chars", 50000)),
         "default_task_count": int(cfg.get("default_task_count", 5)),
+        # Appends to history.md between consolidations. Every finished run
+        # appends one line for free; this is how many of those buy an LLM pass.
+        "consolidate_every": max(1, int(cfg.get("consolidate_every", 10))),
     }
 
 

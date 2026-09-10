@@ -41,6 +41,29 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 # under run.sh's force-kill grace for the backend.
 NOTIFY_DRAIN_BASE_SECONDS = 40
 
+# shutdown()'s drain window for history-triggered consolidations. Deliberately
+# small: the notify drain above can already consume 80s of run.sh's 95s
+# force-kill grace, so there is no room to wait out a consolidation's LLM calls
+# (600s timeout each) and it is not necessary to. An interrupted consolidation
+# loses nothing — write_layer is atomic via os.replace, and the history counter
+# is only reset after both layers clear the gates, so the window is retried
+# instead of dropped. This wait exists only to let a consolidation that is
+# already past its LLM calls finish writing.
+CONSOLIDATE_DRAIN_SECONDS = 5
+
+# After cancelling, how long to let the kill-and-reap path in _llm_call run.
+# Its own reap wait is 5s, so this must exceed it or shutdown returns while the
+# child is still being collected.
+CONSOLIDATE_KILL_SECONDS = 8
+
+
+def _consolidate_drain_seconds() -> int:
+    return CONSOLIDATE_DRAIN_SECONDS
+
+
+def _consolidate_kill_seconds() -> int:
+    return CONSOLIDATE_KILL_SECONDS
+
 
 def _notify_drain_max_seconds() -> int:
     from server.task_notify import MAX_SERIAL_SENDS
@@ -554,6 +577,8 @@ class AgentRunner:
         self._handoff_pending: set[str] = set()
         self._subprocess_tasks: dict[str, asyncio.Task] = {}  # task_id -> asyncio.Task
         self._notify_tasks: set[asyncio.Task] = set()  # detached feishu-notify tasks (survive runner cancellation)
+        self._consolidate_tasks: set[asyncio.Task] = set()  # detached history-triggered consolidations
+        self._consolidating: set[str] = set()  # eids with a consolidation in flight
         # PTY read transports currently awaiting EOF, so shutdown() can force
         # them closed instead of waiting out their internal 60s lingering-
         # grandchild safety net (see _run_pty_mode) within its own bounded
@@ -1264,11 +1289,141 @@ class AgentRunner:
         if task and not was_terminal and not compact_will_continue:
             notify_args = self._prepare_notify(task_id, task)
 
+        # Same three boundaries as the notification, for the same reasons: skip
+        # resume kills (handled above), skip idempotent re-entry (was_terminal),
+        # and skip a success that auto-compact is about to continue. Read before
+        # the await so the text belongs to this run.
+        history_args = None
+        if task and not was_terminal and not compact_will_continue:
+            history_args = self._prepare_history(task_id, task, status)
+
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
             app_state.save_agent_tasks(task.agent_id)
         if notify_args:
             self._schedule_notify(*notify_args)
+        if history_args:
+            self._record_history(*history_args)
+
+    def _prepare_history(self, task_id: str, task: Task,
+                         status: TaskStatus) -> tuple[str, str, str, str] | None:
+        """Build (eid, who, status, text) for the history append, or None.
+
+        Called before the first await in _finish_task, so ``_run_start_index``
+        still points at this run: a concurrent send_input() would advance it and
+        we would summarize the wrong run.
+        """
+        from server import auto_memory
+        from server.task_notify import _last_agent_text
+
+        text = _last_agent_text(task, self._run_start_index.get(task_id, 0))
+        if not text:
+            return None
+        agent = app_state.get_agent(task.agent_id)
+        who = f"{agent.name if agent else task.agent_id} / {task.name}"
+        return auto_memory.effective_id(task.agent_id), who, str(status.value), text
+
+    def _record_history(self, eid: str, who: str, status: str, text: str) -> None:
+        """Append to history.md and, every Nth append, consolidate.
+
+        The append itself is synchronous and LLM-free — one file rewrite of at
+        most 4KB. Consolidation is detached: it makes two LLM calls, and
+        _finish_task is on the path that reports task completion to the UI.
+        """
+        from server import auto_memory
+
+        try:
+            n = auto_memory.append_history(eid, who, status, text)
+        except Exception:
+            logger.exception("Failed to append history for eid %s", eid)
+            return
+        # `>=`, not `n % every == 0`. The counter is no longer guaranteed to land
+        # on a multiple: a pass that finishes subtracts only the appends it
+        # actually consumed, so a window can start at any remainder. Modulo then
+        # meant a full unconsumed window sat waiting for the count to reach the
+        # *next* multiple — 10 appends stuck at 11 needing 9 more, or forever if
+        # the eid went quiet with daily consolidation off.
+        if n >= auto_memory.consolidate_every():
+            self._schedule_consolidate(eid, n)
+
+    def _schedule_consolidate(self, eid: str, n: int) -> None:
+        """Run consolidation detached from the finishing task's coroutine.
+
+        Held in ``_consolidate_tasks`` for the same reason notifications are:
+        a resume calls kill_task(cancel_existing=True), and a consolidation
+        awaiting an LLM inside that coroutine would be cancelled mid-write.
+        Also guards against overlap — the per-eid lock inside consolidate()
+        would serialize them, but queueing N of them would keep firing LLM
+        calls long after the window that triggered them.
+        """
+        # Reserved synchronously, before create_task. The reservation used to be
+        # made inside run(), which does not start until the loop next yields —
+        # so two completions crossing the threshold back to back both saw an
+        # empty set, both queued, and the second re-consolidated the same history
+        # behind the lock, bumping every entry's n a second time.
+        if eid in self._consolidating:
+            logger.info("eid %s already consolidating, skipping this trigger", eid)
+            return
+        self._consolidating.add(eid)
+
+        async def run() -> None:
+            from server import auto_memory
+            from server.routes_ws import _eid_tasks
+
+            consumed_window = False
+            try:
+                tasks = _window_tasks(_eid_tasks(eid), n)
+                logger.info(
+                    "history reached %d entries for eid %s, consolidating %d tasks",
+                    n, eid, len(tasks),
+                )
+                result = await auto_memory.consolidate(
+                    eid, tasks, history_window_only=True)
+                consumed_window = len(result["failed_layers"]) < 2
+                logger.info(
+                    "history-triggered consolidation done: eid=%s added=%d updated=%d "
+                    "deleted=%d refused=%d%s",
+                    eid, result["added"], result["updated"], result["deleted"],
+                    result["refused"],
+                    f" FAILED_LAYERS={result['failed_layers']}" if result["failed_layers"] else "",
+                )
+            except Exception:
+                logger.exception("History-triggered consolidation failed for eid %s", eid)
+            finally:
+                self._consolidating.discard(eid)
+            # Re-check for runs that finished during the two LLM calls: they bumped
+            # the counter after this pass took its snapshot, and their own trigger
+            # was dropped by the guard above — so without this they wait for the
+            # next append, or forever if the eid goes quiet with daily
+            # consolidation disabled.
+            #
+            # Keyed on the *minimum* pending across layers, not the maximum.
+            # Since window accounting went per layer, a partial failure (lessons
+            # succeeds, project times out) leaves project's pending count at the
+            # threshold forever, and the maximum can no longer tell "new runs
+            # arrived" from "a failed layer still owes this window". Re-arming on
+            # the latter spins: the succeeded layer has no signals and returns
+            # success without an LLM call, the failed one fails again, repeat —
+            # hammering the broken helper with no new history. The minimum is what
+            # every layer still owes, which only a genuine arrival can raise. A
+            # failed layer's retry belongs to the next append or the nightly run.
+            if not consumed_window:
+                return
+            try:
+                left = auto_memory.min_pending(eid)
+            except Exception:
+                logger.exception("Failed to re-read history counter for eid %s", eid)
+                return
+            if left >= auto_memory.consolidate_every():
+                logger.info(
+                    "eid %s accumulated %d more entries while consolidating, "
+                    "re-arming", eid, left,
+                )
+                self._schedule_consolidate(eid, left)
+
+        t = asyncio.create_task(run(), name=f"consolidate-{eid}")
+        self._consolidate_tasks.add(t)
+        t.add_done_callback(self._consolidate_tasks.discard)
 
     def _prepare_notify(self, task_id: str, task: Task) -> tuple[str, Task, int] | None:
         """Build the (agent_name, task_snapshot, start_index) args for
@@ -1649,8 +1804,62 @@ class AgentRunner:
                 list(self._notify_tasks), timeout=_notify_drain_max_seconds()
             )
 
+        # History-triggered consolidations write layer documents, so cancelling
+        # one mid-flight is worse than waiting: os.replace makes the write itself
+        # atomic, but the history counter is only reset after both layers pass
+        # the gates, so an interrupted run re-consolidates next time rather than
+        # losing the window. Bounded by one layer's LLM timeout — we are not
+        # obliged to finish, only to not corrupt.
+        if self._consolidate_tasks:
+            pending = list(self._consolidate_tasks)
+            _, still_running = await asyncio.wait(
+                pending, timeout=_consolidate_drain_seconds()
+            )
+            # asyncio.wait's timeout leaves the unfinished ones pending, and loop
+            # teardown would then drop them without their `except CancelledError`
+            # ever running — which is where _llm_call kills its helper child.
+            # run.sh signals only the backend PID, so an unsignalled glm/cco
+            # would be orphaned and keep running (and billing) for up to its own
+            # 600s timeout. Cancel explicitly and give the kill paths a moment.
+            for t in still_running:
+                t.cancel()
+            if still_running:
+                await asyncio.wait(still_running, timeout=_consolidate_kill_seconds())
+
 
 # ── helpers ─────────────────────────────────────────────────────────────
+
+_TERMINAL_STATUSES = ("success", "failed")
+
+
+def _window_tasks(tasks: list, window: int) -> list:
+    """The *window* newest finished tasks, for a threshold-triggered pass.
+
+    Two filters, both fixing the same class of bug as the history slice:
+
+    Terminal only. ``_eid_tasks`` returns every task the eid owns, including one
+    still running in another member — and ``extract_project_signals`` checks
+    neither status nor ``streaming``, so a half-generated agent message that
+    happens to contain a path or a command keyword would be persisted as project
+    knowledge before that run reached its actual conclusion.
+
+    Newest *window* only. Slicing ``history.md`` alone was not enough: the tasks
+    themselves were still every task ever stored, and both extractors walk their
+    complete message lists. Old tool errors and corrections that fit under the
+    signal cap were therefore re-fed every ten completions, letting the model
+    update the same entries again and inflate ``n`` — the exact retention-ranking
+    corruption the history slice existed to remove.
+
+    The nightly loop and the 🧠 button do not come through here: they select
+    their own task sets (a date, or the last N completed) and are meant to look
+    across the whole record.
+    """
+    from server.auto_memory import status_value
+
+    finished = [t for t in tasks if status_value(t) in _TERMINAL_STATUSES]
+    finished.sort(key=lambda t: getattr(t, "updated_at", "") or "", reverse=True)
+    return finished[:window] if window > 0 else []
+
 
 def _read_proc_start_time(pid: int) -> int | None:
     """Read /proc/<pid>/stat field 22 (process start time since boot)."""

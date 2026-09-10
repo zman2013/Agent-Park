@@ -258,6 +258,10 @@ class AppState:
             messages=forked_messages,
             fork_session_id=source_session_id,
             fork_resume_at=resume_at,
+            # Auto-memory's per-task watermark keys on task id, and a fork gets a
+            # new one — so without this the copied transcript reads as entirely
+            # new and its already-consolidated errors are fed again.
+            inherited_messages=len(forked_messages),
         )
         self.tasks[task.id] = task
         agent.task_ids.append(task.id)
