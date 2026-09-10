@@ -606,3 +606,80 @@ def test_both_layers_succeeding_consumes_both_windows(eid, monkeypatch):
     asyncio.run(am.consolidate(eid, [], history_window_only=True))
     assert am.read_pending(eid) == {}
     assert not am._counter_path(eid).exists(), "a fully consumed window leaves no file"
+
+
+def test_the_whole_record_path_also_accounts_per_layer(eid, monkeypatch):
+    """Reported by review: the nightly loop and 🧠 button do not slice by window,
+    but they must still not clear a failed layer's pending count because the other
+    layer succeeded — the next nightly pass selects a different date's tasks, and a
+    later threshold pass is bounded to its own newer window, so those signals would
+    never be retried."""
+    for i in range(4):
+        am.append_history(eid, "a", "success", f"run {i}")
+    _per_layer(monkeypatch, {"lessons": "[]", "project": "分析完成，没有新增。"})
+    result = asyncio.run(am.consolidate(eid, []))          # no history_window_only
+    assert result["failed_layers"] == ["project"]
+    pending = am.read_pending(eid)
+    assert pending.get("lessons", 0) == 0
+    assert pending.get("project") == 4, "the failed layer must keep its window"
+
+
+def test_the_whole_record_path_still_preserves_mid_flight_appends(eid, monkeypatch):
+    """Subtracting the snapshot, not clearing: runs finishing during the calls
+    must still count toward the next threshold."""
+    for i in range(3):
+        am.append_history(eid, "a", "success", f"run {i}")
+
+    async def fake(command, prompt, timeout=0):
+        am.append_history(eid, "a", "success", "late run")
+        return '[{"op":"add","title":"T","fact":"F"}]'
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+    asyncio.run(am.consolidate(eid, []))
+    assert am.read_history_counter(eid) == 2, "one late append per layer call"
+
+
+# ── upgrade from the pre-split marks file ─────────────────────────────────────
+
+def test_legacy_shared_marks_seed_both_layers(eid):
+    """Reported by review: the marks are as persistent as the pending counts, so
+    without a migration the first pass after upgrading re-feeds every selected
+    transcript in full."""
+    import json
+
+    am.append_history(eid, "a", "success", "run")          # creates the directory
+    (am.memory_dir(eid) / "consumed_marks.json").write_text(
+        json.dumps({"t1": 4, "t2": 2}), encoding="utf-8")
+    for layer in am.LLM_LAYERS:
+        assert am.read_consumed_marks(eid, layer) == {"t1": 4, "t2": 2}
+
+
+def test_a_per_layer_file_wins_over_the_legacy_one(eid):
+    import json
+
+    am.write_consumed_marks(eid, "lessons", {"t1": 9})
+    (am.memory_dir(eid) / "consumed_marks.json").write_text(
+        json.dumps({"t1": 4}), encoding="utf-8")
+    assert am.read_consumed_marks(eid, "lessons") == {"t1": 9}
+    assert am.read_consumed_marks(eid, "project") == {"t1": 4}, "project has no file yet"
+
+
+def test_the_legacy_marks_actually_prevent_a_replay(eid, monkeypatch):
+    """End to end: an upgrade must not re-feed an already-consolidated transcript."""
+    import json
+
+    task = _RT("t1", 3)
+    am.append_history(eid, "a", "success", "run")
+    (am.memory_dir(eid) / "consumed_marks.json").write_text(
+        json.dumps({"t1": 3}), encoding="utf-8")
+
+    seen: list[str] = []
+
+    async def capture(command, prompt, timeout=0):
+        seen.append(prompt)
+        return "[]"
+
+    monkeypatch.setattr(knowledge, "_llm_call", capture)
+    asyncio.run(am.consolidate(eid, [task], history_window_only=True))
+    assert all("第 0 条" not in p for p in seen), \
+        "the legacy watermark must still be honoured after the split"

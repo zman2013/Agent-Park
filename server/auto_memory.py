@@ -946,12 +946,19 @@ async def consolidate(
                 marks.update(endpoints)
                 write_consumed_marks(eid, layer, marks)
 
-        # The whole-record callers (nightly loop, 🧠 button) consume the window
-        # once for the pass, not once per layer: subtracting `consumed` inside the
-        # loop would deduct it twice and swallow the mid-flight appends the
-        # subtraction exists to preserve.
-        if not history_window_only and any(not r["failed"] for r in results.values()):
-            reset_history_counter(eid, consumed)
+        # The whole-record callers (nightly loop, 🧠 button) do not slice by
+        # window, but they must still account per layer: clearing a failed layer's
+        # pending count because the *other* layer succeeded loses those signals
+        # for good — the next nightly pass selects a different date's tasks, and a
+        # later threshold pass is bounded to its own newer window.
+        #
+        # Subtracted once per successful layer, from the snapshot taken before the
+        # pass, so appends that arrived mid-flight still count toward the next
+        # threshold.
+        if not history_window_only:
+            for layer, res in results.items():
+                if not res["failed"]:
+                    consume_pending(eid, layer, consumed)
 
     totals = {k: sum(r[k] for r in results.values())
               for k in ("added", "updated", "deleted", "refused", "dropped")}
@@ -1062,6 +1069,23 @@ def read_history_counter(eid: str) -> int:
     attempt, the window is worth a pass.
     """
     return max(read_pending(eid).values(), default=0)
+
+
+def min_pending(eid: str) -> int:
+    """The smallest pending window across the LLM layers.
+
+    What the post-pass re-arm keys on. ``read_history_counter``'s maximum cannot
+    distinguish "new runs arrived" from "a failed layer still owes this window":
+    after a partial failure the failed layer's count sits at the threshold
+    forever, and re-arming on it spins — the succeeded layer has no signals and
+    returns success without an LLM call, the failed one fails again, repeat. The
+    minimum is the count of rows *every* layer still owes, which only a genuine
+    arrival can raise.
+    """
+    pending = read_pending(eid)
+    if not pending:
+        return 0
+    return min(pending.get(layer, 0) for layer in LLM_LAYERS)
 
 
 def _bump_history_counter(eid: str) -> int:
@@ -1176,13 +1200,19 @@ def reset_history_counter(eid: str, consumed: int | None = None) -> None:
 # consumed, and vice versa.
 _MARKS_FILE = "consumed_marks.{layer}.json"
 
+# What the marks lived in before they were split per layer. Read as a seed when a
+# layer has no file of its own: the state is as persistent as the pending counts,
+# so without this the first pass after an upgrade re-feeds every selected
+# transcript in full and inflates `n` — the corruption the marks exist to prevent,
+# arriving via the upgrade itself.
+_LEGACY_MARKS_FILE = "consumed_marks.json"
+
 
 def _marks_path(eid: str, layer: str):
     return memory_dir(eid) / _MARKS_FILE.format(layer=layer)
 
 
-def read_consumed_marks(eid: str, layer: str) -> dict[str, int]:
-    p = _marks_path(eid, layer)
+def _read_marks_file(p, eid: str, layer: str) -> dict[str, int]:
     if not p.exists():
         return {}
     try:
@@ -1195,6 +1225,16 @@ def read_consumed_marks(eid: str, layer: str) -> dict[str, int]:
         # correctness.
         logger.warning("%s/%s: unreadable consumed marks, treating as empty", eid, layer)
         return {}
+
+
+def read_consumed_marks(eid: str, layer: str) -> dict[str, int]:
+    p = _marks_path(eid, layer)
+    if p.exists():
+        return _read_marks_file(p, eid, layer)
+    # No per-layer file yet: seed from the pre-split one if it is still there.
+    # Both layers seed from the same map, which is correct — it is exactly what
+    # both had consumed when the file was shared.
+    return _read_marks_file(memory_dir(eid) / _LEGACY_MARKS_FILE, eid, layer)
 
 
 # Cap on the watermark map. Marks are merged rather than pruned to the current

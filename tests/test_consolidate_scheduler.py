@@ -354,3 +354,62 @@ def test_a_timed_out_llm_call_also_kills_its_helper():
     assert proc.returncode is not None
     with pytest.raises(ProcessLookupError):
         os.kill(proc.pid, 0)
+
+
+def test_a_partial_failure_does_not_spin_the_re_arm(env, monkeypatch):
+    """Reported by review after window accounting went per layer: a failed layer
+    keeps its pending count at the threshold forever, so a re-arm keyed on the
+    maximum re-fires immediately — the succeeded layer has no signals and returns
+    success without an LLM call, the failed one fails again, repeat, hammering the
+    broken helper with no new history."""
+    calls: list = []
+
+    async def fake(command, prompt, timeout=0):
+        calls.append(command)
+        # lessons keeps succeeding, project keeps failing.
+        if "错误经验提取器" in prompt:
+            return OK
+        return GARBAGE
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+    every = am.consolidate_every()
+
+    async def go():
+        stub = _Stub()
+        for i in range(every):
+            am.append_history(EID, "a", "success", f"run {i}")
+        stub._schedule_consolidate(EID, every)
+        await _drain(stub)
+
+    asyncio.run(go())
+    from server.config import automemory_config
+    per_layer = 1 + len(automemory_config()["retry_commands"])
+    # One pass: lessons once, project once per command.
+    assert len(calls) <= 1 + per_layer, f"the partial failure re-armed: {calls}"
+    # And the failed layer kept its window for a later append or nightly run.
+    assert am.read_pending(EID).get("project") == every
+
+
+def test_the_re_arm_still_fires_for_genuine_arrivals(env, monkeypatch):
+    """The property must survive the fix: min_pending rises only on real appends."""
+    every = am.consolidate_every()
+    passes: list = []
+
+    async def fake(command, prompt, timeout=0):
+        passes.append(command)
+        if len(passes) <= 2:                       # first pass only
+            for i in range(every):
+                am.append_history(EID, "a", "success", f"late {i}")
+        return OK
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+
+    async def go():
+        stub = _Stub()
+        for i in range(every):
+            am.append_history(EID, "a", "success", f"run {i}")
+        stub._schedule_consolidate(EID, every)
+        await _drain(stub)
+
+    asyncio.run(go())
+    assert len(passes) >= 4, "a full window arriving mid-flight must re-arm"

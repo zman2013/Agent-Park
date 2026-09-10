@@ -1379,8 +1379,6 @@ class AgentRunner:
                 )
                 result = await auto_memory.consolidate(
                     eid, tasks, history_window_only=True)
-                # consolidate() clears the window when at least one layer
-                # produced a usable delta, and deliberately keeps it otherwise.
                 consumed_window = len(result["failed_layers"]) < 2
                 logger.info(
                     "history-triggered consolidation done: eid=%s added=%d updated=%d "
@@ -1393,22 +1391,26 @@ class AgentRunner:
                 logger.exception("History-triggered consolidation failed for eid %s", eid)
             finally:
                 self._consolidating.discard(eid)
-            # Re-check the persisted counter. Runs that finished during the two
-            # LLM calls bumped it after this pass took its snapshot, and their
-            # own trigger was dropped by the guard above — so without this they
-            # wait for the next append, or forever if the eid goes quiet with
-            # daily consolidation disabled.
+            # Re-check for runs that finished during the two LLM calls: they bumped
+            # the counter after this pass took its snapshot, and their own trigger
+            # was dropped by the guard above — so without this they wait for the
+            # next append, or forever if the eid goes quiet with daily
+            # consolidation disabled.
             #
-            # Only when the window was actually consumed. A pass where every
-            # helper command failed leaves the counter untouched on purpose, so
-            # re-arming on it would spin: a missing CLI would become a subprocess
-            # and log loop, and a provider returning malformed output would bill
-            # for retries forever with no new history to look at. That retry
-            # belongs to the next append or the nightly run.
+            # Keyed on the *minimum* pending across layers, not the maximum.
+            # Since window accounting went per layer, a partial failure (lessons
+            # succeeds, project times out) leaves project's pending count at the
+            # threshold forever, and the maximum can no longer tell "new runs
+            # arrived" from "a failed layer still owes this window". Re-arming on
+            # the latter spins: the succeeded layer has no signals and returns
+            # success without an LLM call, the failed one fails again, repeat —
+            # hammering the broken helper with no new history. The minimum is what
+            # every layer still owes, which only a genuine arrival can raise. A
+            # failed layer's retry belongs to the next append or the nightly run.
             if not consumed_window:
                 return
             try:
-                left = auto_memory.read_history_counter(eid)
+                left = auto_memory.min_pending(eid)
             except Exception:
                 logger.exception("Failed to re-read history counter for eid %s", eid)
                 return
