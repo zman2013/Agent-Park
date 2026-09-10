@@ -162,3 +162,38 @@ def test_history_is_injected_with_a_priority_intro():
     # Ordered last: it is context, and must not outrank the user's own rules.
     assert am.LAYERS.index("history") == len(am.LAYERS) - 1
     assert am.LAYERS.index("profile") == 0
+
+
+def test_appends_during_consolidation_survive_the_reset(eid, monkeypatch):
+    """Reported by review: tasks finishing while the two LLM calls are in
+    flight bump the same on-disk counter, but their lines were not in the
+    snapshot consolidation read. Clearing the file unconditionally swallowed
+    them — with daily_enabled off, or an eid that then went quiet, those runs
+    would never trigger a pass of their own."""
+    for i in range(3):
+        am.append_history(eid, "a", "success", f"run {i}")
+
+    async def fake(command, prompt, timeout=0):
+        # Two more runs finish mid-flight, after the snapshot was taken.
+        am.append_history(eid, "a", "success", "late run")
+        return '[{"op":"add","title":"T","fact":"F"}]'
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+    asyncio.run(am.consolidate(eid, []))
+    # One append per layer call, both after the snapshot of 3.
+    assert am.read_history_counter(eid) == 2
+
+
+def test_reset_clears_the_file_when_nothing_arrived_late(eid, monkeypatch):
+    for i in range(3):
+        am.append_history(eid, "a", "success", f"run {i}")
+    _stub(monkeypatch, '[{"op":"add","title":"T","fact":"F"}]')
+    asyncio.run(am.consolidate(eid, []))
+    assert am.read_history_counter(eid) == 0
+    assert not am._counter_path(eid).exists(), "a consumed window leaves no file"
+
+
+def test_reset_does_not_go_negative(eid):
+    am.append_history(eid, "a", "success", "one")
+    am.reset_history_counter(eid, consumed=99)
+    assert am.read_history_counter(eid) == 0

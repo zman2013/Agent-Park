@@ -64,3 +64,76 @@ def test_flags_are_labelled_and_counted_against_the_budget():
     assert "[task_failed]" in out
     tight = am._format_signals(sig, 45)  # content alone fits, content+label does not
     assert tight == ""
+
+
+# ── which signals survive the cut ─────────────────────────────────────────────
+#
+# Reported by review, and the reason it was P1: _format_signals keeps a *prefix*.
+# The history-triggered path hands consolidate() every task the eid ever ran, in
+# stored (oldest-first) order, with history_signals appended last. On an eid with
+# enough backlog to fill the budget, the ten runs that just fired the trigger were
+# cut in favour of the same ancient tasks — every time. The trigger fired forever
+# and never saw its own window.
+
+class _Msg:
+    def __init__(self, content):
+        self.role, self.type, self.content = "agent", "tool_result", content
+
+
+class _Task:
+    def __init__(self, tid, updated_at, content):
+        self.id, self.updated_at, self.name = tid, updated_at, tid
+        self.status, self.num_turns = "failed", 1
+        self.messages = [_Msg(content)]
+
+
+def test_consolidation_sees_the_newest_tasks_when_the_budget_binds(tmp_path, monkeypatch):
+    """Oldest-first input plus a binding budget must still reach the newest run."""
+    import asyncio
+
+    from server import knowledge
+
+    monkeypatch.setattr(am, "MEMORY_DIR", tmp_path)
+    # Enough oldest-first bulk to overflow any reasonable prefix on its own.
+    tasks = [_Task(f"old{i}", f"2026-01-{i % 28 + 1:02d}", "ValueError: boom " + "x" * 3000)
+             for i in range(60)]
+    tasks.append(_Task("newest", "2026-09-09", "ValueError: 最新那次运行 " + "y" * 3000))
+
+    seen: list[str] = []
+
+    async def fake(command, prompt, timeout=0):
+        seen.append(prompt)
+        return "[]"
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+    asyncio.run(am.consolidate("__test_order__", tasks, today="2026-09-09"))
+    assert seen, "consolidation must have called the LLM"
+    assert any("最新那次运行" in p for p in seen), \
+        "the newest task was crowded out by the oldest ones"
+
+
+def test_the_history_window_is_never_the_part_that_gets_cut(tmp_path, monkeypatch):
+    """History is what the run is about to mark consumed, so losing it to the
+    prefix cut means those appends are discarded unread."""
+    import asyncio
+
+    from server import knowledge
+
+    monkeypatch.setattr(am, "MEMORY_DIR", tmp_path)
+    eid = "__test_order2__"
+    am.append_history(eid, "agent / t", "success", "刚刚完成的那件事")
+    # Enough task bulk to exhaust the budget on its own, so history only
+    # survives by being ordered ahead of it rather than by luck.
+    tasks = [_Task(f"old{i}", f"2026-01-{i % 28 + 1:02d}", "ValueError: boom " + "x" * 3000)
+             for i in range(400)]
+
+    seen: list[str] = []
+
+    async def fake(command, prompt, timeout=0):
+        seen.append(prompt)
+        return "[]"
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+    asyncio.run(am.consolidate(eid, tasks, today="2026-09-09"))
+    assert all("刚刚完成的那件事" in p for p in seen), \
+        "the history window must reach every layer's prompt"

@@ -401,6 +401,34 @@ def _fold(text: str) -> str:
     return " ".join((text or "").split())
 
 
+# Per-field ceilings, generous multiples of what the prompts ask for (title 40,
+# body fields 200). The prompt limits alone were unenforced, and an oversized
+# `update` was destructive rather than merely ugly: the new body made the entry
+# too large to fit the layer even by itself, so `truncate_entries` dropped it,
+# and `consolidate_layer` still wrote the document because the op counted as
+# updated — malformed model output silently deleted a previously valid entry.
+#
+# Refusing beyond the ceiling rather than truncating: a model that goes slightly
+# over still said something useful verbatim, while a 5000-char blob cut at 200
+# chars is a sentence fragment presented as a fact. Refusing keeps the original
+# entry intact and shows up in `refused`.
+#
+# The numbers also guarantee a single entry always fits its layer alone
+# (120 + 2×600 + markup ≈ 1.4k against the 8000/10000 layer limits), which is
+# what removes the drop-on-update path entirely.
+FIELD_LIMITS = {"title": 120, "body": 600}
+
+
+def _oversized(title: str, op: dict) -> str | None:
+    """Return the name of the first field over its ceiling, or None."""
+    if len(title) > FIELD_LIMITS["title"]:
+        return "title"
+    for key in ("wrong", "right", "fact"):
+        if len(_fold(str(op.get(key) or ""))) > FIELD_LIMITS["body"]:
+            return key
+    return None
+
+
 def apply_delta(
     layer: str,
     entries: list[dict],
@@ -429,6 +457,18 @@ def apply_delta(
             logger.warning("%s: refused meta-narration op: %.120s", layer, op)
             res["refused"] += 1
             continue
+
+        # Gate 2b: a field the model blew past its stated limit on. Checked
+        # before any mutation, because an oversized `update` body used to
+        # destroy the entry it replaced (see FIELD_LIMITS).
+        if kind != "delete":
+            over = _oversized(title, op)
+            if over:
+                logger.warning(
+                    "%s: refused op with oversized %s field: %.120s", layer, over, op
+                )
+                res["refused"] += 1
+                continue
 
         if kind == "delete":
             # Gate 3: an id we never wrote means the model invented it.
@@ -775,6 +815,17 @@ async def consolidate(
     lock = _eid_locks.setdefault(eid, asyncio.Lock())
     async with lock:
         await progress("extracting", f"分析 {len(tasks)} 个任务...")
+        # Snapshot before extraction: everything appended after this point is
+        # not in `history_signals`, so it must survive the reset below.
+        consumed = read_history_counter(eid)
+        # Newest first, because _format_signals keeps a *prefix* of whatever it
+        # is handed. The history-triggered path passes every task the eid has
+        # ever run, in stored (oldest-first) order, so on an eid with enough
+        # backlog to fill max_signal_chars the ten runs that just triggered
+        # consolidation were cut in favour of the same ancient tasks, every
+        # time — the trigger fired forever and never saw its own window.
+        tasks = sorted(tasks, key=lambda t: getattr(t, "updated_at", "") or "",
+                       reverse=True)
         lesson_signals = extract_lesson_signals(tasks)
         project_signals = extract_project_signals(tasks)
         history_signals = extract_history_signals(eid)
@@ -785,12 +836,16 @@ async def consolidate(
         )
 
         results: dict[str, ConsolidationResult] = {}
+        # History first, for the same prefix reason: it is the window this run
+        # is consuming and about to mark consumed, so it must not be the part
+        # that gets cut. It is also bounded (history.md is ≤4KB), so it can
+        # never crowd out the task signals in turn.
         await progress("merging", "巩固 lessons.md...")
         results["lessons"] = await consolidate_layer(
-            eid, "lessons", lesson_signals + history_signals, today, cfg)
+            eid, "lessons", history_signals + lesson_signals, today, cfg)
         await progress("merging", "巩固 project.md...")
         results["project"] = await consolidate_layer(
-            eid, "project", project_signals + history_signals, today, cfg)
+            eid, "project", history_signals + project_signals, today, cfg)
 
         # Only clear the window if at least one layer actually consumed it.
         # Resetting unconditionally would discard the window whenever the helper
@@ -798,7 +853,7 @@ async def consolidate(
         # runs would never be looked at again, which is the same silent-data-loss
         # shape as the old "timeout returns existing_md" behaviour.
         if any(not r["failed"] for r in results.values()):
-            reset_history_counter(eid)
+            reset_history_counter(eid, consumed)
         else:
             logger.warning(
                 "%s: every layer failed, keeping the history window for a retry", eid
@@ -926,8 +981,26 @@ def _bump_history_counter(eid: str) -> int:
     return n
 
 
-def reset_history_counter(eid: str) -> None:
+def reset_history_counter(eid: str, consumed: int | None = None) -> None:
+    """Mark *consumed* appends as processed, or clear the window entirely.
+
+    *consumed* is the count snapshotted before consolidation started. Tasks
+    finishing while the two LLM calls are in flight bump the same on-disk
+    counter, and those appends were never in the snapshot — clearing the file
+    unconditionally would swallow them, so with ``daily_enabled`` off or a
+    subsequently quiet eid they would never trigger a pass of their own.
+    Subtracting instead leaves the post-snapshot appends counting toward the
+    next threshold.
+    """
     p = _counter_path(eid)
+    if consumed is not None:
+        remaining = max(0, read_history_counter(eid) - consumed)
+        if remaining:
+            try:
+                p.write_text(str(remaining), encoding="utf-8")
+            except Exception:
+                logger.exception("%s: failed to decrement history counter", eid)
+            return
     if p.exists():
         try:
             p.unlink()

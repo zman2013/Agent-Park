@@ -151,7 +151,12 @@ async def _run_daily_summary(eid: str, date: str) -> None:
         "Daily summary: eid=%s date=%s tasks=%d members_tasks=%d",
         eid, date, len(day_tasks), len(all_tasks),
     )
-    result = await consolidate(eid, day_tasks)
+    # today=date, not the wall clock. This path deliberately consolidates the
+    # day that just ended, and `last` feeds the truncation ranking: stamping
+    # "now" dates every nightly result one day late, and dates a replay of old
+    # history as the replay day — which is how `last` stops discriminating and
+    # the recency half of the ranking goes quietly dead.
+    result = await consolidate(eid, day_tasks, today=date)
     logger.info(
         "Daily summary done: eid=%s added=%d updated=%d deleted=%d refused=%d%s",
         eid, result["added"], result["updated"], result["deleted"], result["refused"],

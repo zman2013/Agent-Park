@@ -105,3 +105,66 @@ def test_the_cap_keeps_the_most_established_entries():
     kept, dropped = am.truncate_entries("project", rows)
     assert dropped == 5
     assert min(e["n"] for e in kept) == 5, "the five lowest-n entries must go"
+
+
+# ── per-field ceilings ────────────────────────────────────────────────────────
+#
+# The destructive case, reported by review: an `update` whose body exceeds the
+# layer limit made the entry unfittable, so gate 4 dropped it — and the write
+# still happened because the op counted as `updated`. Net effect of one
+# malformed reply: a previously valid entry silently gone.
+
+def test_an_oversized_update_does_not_destroy_the_entry_it_replaces():
+    existing = [{"id": am.entry_id("原标题"), "title": "原标题", "n": 3,
+                 "last": "2026-01-01", "body": ["- 原有事实"]}]
+    entries, res = am.apply_delta("project", existing, [
+        {"op": "update", "id": existing[0]["id"], "title": "原标题",
+         "fact": "x" * (am.LAYER_LIMITS["project"] + 500)},
+    ], "2026-09-09")
+    assert res["refused"] == 1 and res["updated"] == 0
+    assert res["dropped"] == 0, "the entry must not be dropped to make room"
+    assert len(entries) == 1
+    assert entries[0]["body"] == ["- 原有事实"], "the original body must survive"
+    assert entries[0]["n"] == 3 and entries[0]["last"] == "2026-01-01"
+
+
+@pytest.mark.parametrize("op", [
+    _add("t" * (am.FIELD_LIMITS["title"] + 1), fact="f"),
+    _add("t", fact="f" * (am.FIELD_LIMITS["body"] + 1)),
+    _add("t", wrong="w" * (am.FIELD_LIMITS["body"] + 1), right="r"),
+    _add("t", wrong="w", right="r" * (am.FIELD_LIMITS["body"] + 1)),
+])
+def test_oversized_fields_are_refused_not_truncated(op):
+    """Refused, so it shows up in `refused` and the content is not presented as
+    a fact in fragment form."""
+    entries, res, _ = _apply("project", [op])
+    assert entries == [] and res["refused"] == 1 and res["added"] == 0
+
+
+def test_fields_at_the_ceiling_are_accepted():
+    entries, res, _ = _apply("project", [
+        _add("t" * am.FIELD_LIMITS["title"], fact="f" * am.FIELD_LIMITS["body"]),
+    ])
+    assert res["added"] == 1 and res["refused"] == 0
+
+
+@pytest.mark.parametrize("layer", ["lessons", "project"])
+def test_a_max_size_entry_always_fits_its_layer_alone(layer):
+    """This is what removes the drop-on-update path: no field-legal entry can
+    be too big for its own layer, so gate 4 never has to discard one."""
+    e = {"id": "a" * 6, "title": "t" * am.FIELD_LIMITS["title"], "n": 1,
+         "last": "2026-01-01",
+         "body": [f"- 错误：{'w' * am.FIELD_LIMITS['body']}",
+                  f"- 正确：{'r' * am.FIELD_LIMITS['body']}"]}
+    kept, dropped = am.truncate_entries(layer, [e])
+    assert dropped == 0 and len(kept) == 1
+
+
+def test_the_field_gate_does_not_block_deletes():
+    """A delete carries no content fields; refusing it on field size would make
+    an oversized entry unremovable."""
+    existing = [{"id": "abc123", "title": "t", "n": 1, "last": "2026-01-01",
+                 "body": ["- " + "x" * 5000]}]
+    entries, res = am.apply_delta("project", existing,
+                                  [{"op": "delete", "id": "abc123"}], "2026-09-09")
+    assert res["deleted"] == 1 and entries == []
