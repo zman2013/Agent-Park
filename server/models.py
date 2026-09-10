@@ -62,6 +62,11 @@ class Task(BaseModel):
     fork_session_id: str | None = None
     # CCo message uuid to truncate history at when forking; consumed on first message
     fork_resume_at: str | None = None
+    # How many messages this task inherited from its fork source. A fork gets a
+    # new id but a deep copy of the source's transcript, so auto-memory's
+    # per-task watermark would see that whole copy as new and re-feed material it
+    # already consolidated under the source id. Seeds the watermark instead.
+    inherited_messages: int = 0
 
 
 class Agent(BaseModel):

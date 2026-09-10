@@ -328,21 +328,25 @@ def test_a_resumed_task_does_not_replay_its_earlier_messages(eid, monkeypatch):
 
 def test_a_task_with_nothing_new_is_dropped_entirely(eid):
     task = _RT("t1", 2)
-    marks = {"t1": 2}
-    assert am.slice_new_messages([task], marks) == []
+    views, endpoints = am.slice_new_messages([task], {"t1": 2})
+    assert views == []
+    assert endpoints == {"t1": 2}, "a dropped task still needs its endpoint recorded"
 
 
 def test_the_view_exposes_only_new_messages_but_forwards_other_fields(eid):
     task = _RT("t1", 5)
-    view = am.slice_new_messages([task], {"t1": 3})[0]
+    views, endpoints = am.slice_new_messages([task], {"t1": 3})
+    view = views[0]
     assert len(view.messages) == 2
     assert view.id == "t1" and view.status == "failed", "other fields must forward"
     assert len(task.messages) == 5, "the live task must not be mutated"
+    assert endpoints == {"t1": 5}
 
 
 def test_a_mark_beyond_the_transcript_does_not_crash(eid):
     """A task whose messages were trimmed must not raise or resurrect old ones."""
-    assert am.slice_new_messages([_RT("t1", 2)], {"t1": 99}) == []
+    views, _ = am.slice_new_messages([_RT("t1", 2)], {"t1": 99})
+    assert views == []
 
 
 def test_a_failed_pass_does_not_advance_the_marks(eid, monkeypatch):
@@ -397,3 +401,94 @@ def test_the_manual_path_still_sees_whole_transcripts(eid, monkeypatch):
     asyncio.run(am.consolidate(eid, [task]))          # no history_window_only
     lessons = [p for p in seen if "错误经验提取器" in p]
     assert lessons and all("第 0 条" in p for p in lessons)
+
+
+def test_messages_arriving_during_consolidation_are_not_marked_consumed(eid, monkeypatch):
+    """Reported by review. The window's start and end must come from the same
+    snapshot: reading len(task.messages) after the two LLM calls records messages
+    that were never in either prompt as consumed, permanently skipping that run.
+    """
+    task = _RT("t1", 2)
+    am.append_history(eid, "a", "success", "run 1")
+
+    async def resume_mid_flight(command, prompt, timeout=0):
+        # A user resumes this task while the helper is thinking.
+        task.messages.append(_M("ValueError: 巩固期间到达"))
+        return '[{"op":"add","title":"T","fact":"F"}]'
+
+    monkeypatch.setattr(knowledge, "_llm_call", resume_mid_flight)
+    asyncio.run(am.consolidate(eid, [task], history_window_only=True))
+    # Two messages were snapshotted and fed; the later arrivals were not.
+    assert am.read_consumed_marks(eid) == {"t1": 2}
+
+    seen: list[str] = []
+
+    async def capture(command, prompt, timeout=0):
+        seen.append(prompt)
+        return "[]"
+
+    monkeypatch.setattr(knowledge, "_llm_call", capture)
+    am.append_history(eid, "a", "success", "run 2")
+    asyncio.run(am.consolidate(eid, [task], history_window_only=True))
+    lessons = [p for p in seen if "错误经验提取器" in p]
+    assert lessons and all("巩固期间到达" in p for p in lessons), \
+        "a message appended mid-pass must still be fed by the next one"
+
+
+def test_the_endpoint_is_snapshotted_even_for_a_task_with_nothing_new(eid):
+    """Otherwise a task that contributed nothing loses its watermark entirely and
+    replays its whole transcript next time."""
+    task = _RT("t1", 3)
+    _, endpoints = am.slice_new_messages([task], {"t1": 3})
+    assert endpoints == {"t1": 3}
+
+
+# ── forks inherit a transcript under a new id ──────────────────────────────────
+
+def test_a_fork_does_not_re_feed_its_inherited_transcript(eid):
+    """Reported by review: state.fork_task deep-copies the source's messages, but
+    the fork has a new id and therefore no watermark — so the default of 0 read
+    the whole inherited copy as new."""
+    fork = _RT("fork1", 5)
+    fork.inherited_messages = 4
+    views, endpoints = am.slice_new_messages([fork], {})
+    assert len(views) == 1
+    assert len(views[0].messages) == 1, "only the post-fork message is new"
+    assert endpoints == {"fork1": 5}
+
+
+def test_a_forks_own_watermark_wins_once_it_has_one(eid):
+    """After its first pass the fork has a real mark, which must not be dragged
+    back down to the inherited floor."""
+    fork = _RT("fork1", 8)
+    fork.inherited_messages = 4
+    views, _ = am.slice_new_messages([fork], {"fork1": 6})
+    assert len(views[0].messages) == 2
+
+
+def test_an_ordinary_task_is_unaffected_by_the_fork_floor(eid):
+    task = _RT("t1", 3)
+    assert getattr(task, "inherited_messages", 0) == 0
+    views, _ = am.slice_new_messages([task], {})
+    assert len(views[0].messages) == 3
+
+
+def test_fork_task_records_the_inherited_count():
+    """The field has to actually be set at the fork site, not just honoured."""
+    from server.models import Message, Task
+    from server.state import AppState
+
+    st = AppState.__new__(AppState)
+    st.tasks, st.agents = {}, {}
+    st._agent_order = []
+    st.save_agent_tasks = lambda *a, **k: None
+
+    from server.models import Agent
+    agent = Agent(name="a", cwd="/tmp")
+    src = Task(agent_id=agent.id, name="src", prompt="p",
+               messages=[Message(role="agent", type="text", content=f"m{i}")
+                         for i in range(4)])
+    st.agents[agent.id] = agent
+    st.tasks[src.id] = src
+    fork = st.fork_task(src.id, "sess-1")
+    assert fork.inherited_messages == 4 == len(fork.messages)

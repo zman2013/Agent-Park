@@ -899,8 +899,9 @@ async def consolidate(
         # history slice: the nightly loop and the 🧠 button are asked to look at
         # the whole record.
         marks = read_consumed_marks(eid) if history_window_only else {}
+        endpoints: dict[str, int] = {}
         if history_window_only:
-            fed = slice_new_messages(tasks, marks)
+            fed, endpoints = slice_new_messages(tasks, marks)
         else:
             fed = tasks
         lesson_signals = extract_lesson_signals(fed)
@@ -939,10 +940,12 @@ async def consolidate(
                 # Merged over the existing marks, not replacing them: a task
                 # drops out of the newest-N window and comes back when it is
                 # resumed, and a pruned mark would replay its whole transcript.
-                marks.update({
-                    getattr(t, "id", ""): len(getattr(t, "messages", []) or [])
-                    for t in tasks if getattr(t, "id", "")
-                })
+                #
+                # `endpoints`, not a fresh len(task.messages): a user resuming one
+                # of these tasks while the LLM calls are in flight appends
+                # messages that were never in either prompt, and recording them
+                # as consumed would skip that run permanently.
+                marks.update(endpoints)
                 write_consumed_marks(eid, marks)
         else:
             logger.warning(
@@ -1151,8 +1154,8 @@ def write_consumed_marks(eid: str, marks: dict[str, int]) -> None:
         logger.exception("%s: failed to write consumed marks", eid)
 
 
-def slice_new_messages(tasks: list, marks: dict[str, int]) -> list:
-    """Return shallow task views holding only messages past their watermark.
+def slice_new_messages(tasks: list, marks: dict[str, int]) -> tuple[list, dict[str, int]]:
+    """Return (views, endpoints): messages past each task's watermark.
 
     A ``Task`` is a *resumable conversation*, but history advances once per
     finished run — so a task resumed across several consolidation windows was
@@ -1161,19 +1164,32 @@ def slice_new_messages(tasks: list, marks: dict[str, int]) -> list:
     were replayed, inflating ``n`` on entries nothing new happened to: the same
     corruption as the history and task-count slices, arriving by the third input.
 
+    *endpoints* is where each task's transcript ended **at snapshot time**, and it
+    is what the caller must persist. Reading ``len(task.messages)`` after the two
+    LLM calls instead would record messages appended during consolidation as
+    consumed even though neither prompt contained them — permanently skipping that
+    run. The window's start and end have to come from the same snapshot.
+
     A view rather than a mutation: ``tasks`` are the live objects from
     ``app_state``, and trimming their ``messages`` would destroy the transcript
     the UI serves.
     """
-    out = []
+    out, endpoints = [], {}
     for t in tasks:
-        msgs = getattr(t, "messages", []) or []
-        start = min(marks.get(getattr(t, "id", ""), 0), len(msgs))
+        tid = getattr(t, "id", "")
+        msgs = list(getattr(t, "messages", []) or [])   # copy: it grows under us
+        if tid:
+            endpoints[tid] = len(msgs)
+        # A fork carries a deep copy of its source's transcript under a *new* id,
+        # so it has no watermark and the default of 0 would re-feed every error
+        # already consolidated under the source. Start past what it inherited.
+        floor = getattr(t, "inherited_messages", 0) or 0
+        start = min(max(marks.get(tid, 0), floor), len(msgs))
         fresh = msgs[start:]
         if not fresh:
             continue
         out.append(_TaskView(t, fresh))
-    return out
+    return out, endpoints
 
 
 class _TaskView:
