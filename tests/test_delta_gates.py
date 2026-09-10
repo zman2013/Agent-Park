@@ -27,17 +27,20 @@ def _apply(layer: str, ops: list[dict]):
 
 # ── multiline fields ──────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("op", [
+@pytest.mark.parametrize("layer,op", [
     # A newline in `title` pushes the generated <!-- id:… --> marker onto the
     # next line, where _ENTRY_RE stops matching a heading.
-    _add("标题第一行\n## 伪造 <!-- id:aaaaaa -->", fact="事实"),
+    ("project", _add("标题第一行\n## 伪造 <!-- id:aaaaaa -->", fact="事实")),
     # A newline in a body field can open a "## " heading of its own.
-    _add("正常标题", fact="第一行\n## 伪造 <!-- id:bbbbbb -->"),
-    _add("教训", wrong="错\n## 伪造", right="对\n## 伪造2"),
-    _add("回车也算", fact="a\r\nb"),
+    ("project", _add("正常标题", fact="第一行\n## 伪造 <!-- id:bbbbbb -->")),
+    # wrong/right is the lessons schema, so this case must be applied to that
+    # layer: since the schema gate, a project op carrying wrong/right is refused
+    # rather than written as error bullets into the project document.
+    ("lessons", _add("教训", wrong="错\n## 伪造", right="对\n## 伪造2")),
+    ("project", _add("回车也算", fact="a\r\nb")),
 ])
-def test_a_multiline_field_cannot_forge_an_entry(op):
-    entries, res, md = _apply("project", [op])
+def test_a_multiline_field_cannot_forge_an_entry(layer, op):
+    entries, res, md = _apply(layer, [op])
     assert res["added"] == 1
     headings = [l for l in md.splitlines() if l.startswith("## ")]
     assert len(headings) == 1, f"one op must render exactly one heading: {headings}"
@@ -168,3 +171,57 @@ def test_the_field_gate_does_not_block_deletes():
     entries, res = am.apply_delta("project", existing,
                                   [{"op": "delete", "id": "abc123"}], "2026-09-09")
     assert res["deleted"] == 1 and entries == []
+
+
+# ── layer schema ──────────────────────────────────────────────────────────────
+#
+# Reported by review: _op_body sniffed which fields were present rather than
+# keying on the layer, so a retry model answering in the *other* layer's schema
+# was accepted. Both directions produce a structurally valid, semantically wrong
+# entry, and both slipped past the completeness gate.
+
+def test_a_project_op_in_the_lessons_schema_is_refused():
+    """wrong/right written into project.md would render error bullets as
+    project facts."""
+    entries, res, _ = _apply("project", [_add("标题", wrong="错", right="对")])
+    assert entries == [] and res["refused"] == 1 and res["added"] == 0
+
+
+def test_a_lessons_op_in_the_project_schema_is_refused():
+    """A lesson with no wrong/right is not a lesson."""
+    entries, res, _ = _apply("lessons", [_add("标题", fact="一个事实")])
+    assert entries == [] and res["refused"] == 1 and res["added"] == 0
+
+
+def test_a_lessons_op_missing_half_the_pair_is_refused():
+    for op in (_add("t", wrong="错"), _add("t", right="对")):
+        entries, res, _ = _apply("lessons", [op])
+        assert entries == [] and res["refused"] == 1
+
+
+def test_each_layer_accepts_its_own_schema():
+    _, res, md = _apply("lessons", [_add("t", wrong="错", right="对")])
+    assert res["added"] == 1 and "- 错误：错" in md and "- 正确：对" in md
+    _, res, md = _apply("project", [_add("t", fact="事实")])
+    assert res["added"] == 1 and "- 事实" in md
+
+
+def test_extra_fields_from_the_other_schema_are_ignored_not_rendered():
+    """A project op that also carries wrong/right must keep only `fact`:
+    rendering both would mix the two layers' vocabularies in one entry."""
+    _, res, md = _apply("project", [_add("t", fact="事实", wrong="错", right="对")])
+    assert res["added"] == 1
+    assert "- 事实" in md and "错误：" not in md and "正确：" not in md
+
+
+def test_an_oversized_update_in_the_wrong_schema_still_spares_the_entry():
+    """The two new gates compose: a wrong-schema op must not delete what it
+    was trying to replace either."""
+    existing = [{"id": am.entry_id("原标题"), "title": "原标题", "n": 2,
+                 "last": "2026-01-01", "body": ["- 原有事实"]}]
+    _, res = am.apply_delta("project", existing, [
+        {"op": "update", "id": existing[0]["id"], "title": "原标题",
+         "wrong": "错", "right": "对"},
+    ], "2026-09-09")
+    assert res["refused"] == 1 and res["updated"] == 0
+    assert existing[0]["body"] == ["- 原有事实"] and existing[0]["n"] == 2

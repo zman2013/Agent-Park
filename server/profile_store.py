@@ -70,15 +70,35 @@ def list_profile(agent_id: str) -> list[dict]:
     return entries
 
 
+class ProfileFull(Exception):
+    """Raised when an append would push profile.md past its layer ceiling.
+
+    Each request is capped at 300 characters, but nothing capped the total, and
+    build_context() injects this file verbatim on every task start — so enough
+    notes would bloat every prompt for that agent and, on adapters that inject
+    via a prompt prefix, eventually hit argv limits. Refusing the append is the
+    honest option: the other layers drop their least-established entries, but
+    this one is the user's own writing and silently discarding a line they typed
+    would be worse than telling them the file is full.
+    """
+
+
 def append_profile(agent_id: str, content: str) -> None:
     from datetime import datetime, timezone
 
-    from server.auto_memory import effective_id, read_layer, write_layer
+    from server.auto_memory import LAYER_LIMITS, effective_id, read_layer, write_layer
 
     eid = effective_id(agent_id)
     rows = _parse(read_layer(eid, "profile"))
     rows.append((content, datetime.now(timezone.utc).strftime("%Y-%m-%d")))
-    write_layer(eid, "profile", _render(rows))
+    rendered = _render(rows)
+    limit = LAYER_LIMITS["profile"]
+    if len(rendered) > limit:
+        raise ProfileFull(
+            f"profile 已达上限（{limit} 字符），当前 {len(rows) - 1} 条。"
+            f"请先删除不再需要的条目。"
+        )
+    write_layer(eid, "profile", rendered)
 
 
 def delete_profile_line(agent_id: str, line_index: int) -> bool:

@@ -1328,7 +1328,13 @@ class AgentRunner:
         except Exception:
             logger.exception("Failed to append history for eid %s", eid)
             return
-        if n and n % auto_memory.consolidate_every() == 0:
+        # `>=`, not `n % every == 0`. The counter is no longer guaranteed to land
+        # on a multiple: a pass that finishes subtracts only the appends it
+        # actually consumed, so a window can start at any remainder. Modulo then
+        # meant a full unconsumed window sat waiting for the count to reach the
+        # *next* multiple — 10 appends stuck at 11 needing 9 more, or forever if
+        # the eid went quiet with daily consolidation off.
+        if n >= auto_memory.consolidate_every():
             self._schedule_consolidate(eid, n)
 
     def _schedule_consolidate(self, eid: str, n: int) -> None:
@@ -1364,6 +1370,23 @@ class AgentRunner:
                 logger.exception("History-triggered consolidation failed for eid %s", eid)
             finally:
                 self._consolidating.discard(eid)
+            # Re-check the persisted counter. Runs that finished during the two
+            # LLM calls bumped it after this pass took its snapshot, and their
+            # own trigger was dropped by the `_consolidating` guard above — so
+            # without this they wait for the next append, or forever if the eid
+            # goes quiet with daily consolidation disabled. Outside the finally
+            # so a crashed pass does not immediately re-enter.
+            try:
+                left = auto_memory.read_history_counter(eid)
+            except Exception:
+                logger.exception("Failed to re-read history counter for eid %s", eid)
+                return
+            if left >= auto_memory.consolidate_every():
+                logger.info(
+                    "eid %s accumulated %d more entries while consolidating, "
+                    "re-arming", eid, left,
+                )
+                self._schedule_consolidate(eid, left)
 
         t = asyncio.create_task(run(), name=f"consolidate-{eid}")
         self._consolidate_tasks.add(t)

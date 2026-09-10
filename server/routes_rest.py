@@ -257,7 +257,7 @@ async def add_memory(agent_id: str, body: MemoryAddBody):
 
     from server.config import automemory_config
     from server.helper_llm import MAX_CONTENT_LENGTH, compress_content
-    from server.profile_store import append_profile
+    from server.profile_store import ProfileFull, append_profile
 
     compressed = await compress_content(body.content, automemory_config()["command"])
 
@@ -270,7 +270,16 @@ async def add_memory(agent_id: str, body: MemoryAddBody):
             },
         )
 
-    append_profile(agent_id, compressed)
+    try:
+        append_profile(agent_id, compressed)
+    except ProfileFull as exc:
+        # 422, same as the per-note ceiling above: the panel already renders
+        # `detail` and echoes `compressed` back into the editor, so the user
+        # keeps what they typed.
+        return JSONResponse(
+            status_code=422,
+            content={"detail": str(exc), "compressed": compressed},
+        )
     # profile.md stores dates only; the full timestamp is echoed back because the
     # panel renders this response directly without re-fetching.
     return {

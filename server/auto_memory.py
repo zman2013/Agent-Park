@@ -114,10 +114,30 @@ LAYER_LIMITS = {
 
 LAYERS = ("profile", "lessons", "project", "history")
 
-# Hard guard on the signal section of a consolidation prompt, independent of the
-# configured character budget. See ``_format_signals`` for why bytes and not
-# characters: MAX_ARG_STRLEN is 131072, and this leaves room for the prompt
-# skeleton and the uncapped existing-entries JSON alongside it.
+# Linux caps a single argv entry at MAX_ARG_STRLEN, and the whole prompt reaches
+# the helper LLM as one. Exceeding it raises E2BIG inside ``_llm_call``, whose
+# except returns "" — which every gate downstream reads as "no usable output",
+# so the failure mode is a silently dead pipeline rather than a crash.
+MAX_ARG_BYTES = 32 * 4096  # 131072, fixed at compile time
+
+# What the rest of the prompt may not exceed once the signal section is sized
+# against it. The signal budget is computed as MAX_ARG_BYTES - (skeleton +
+# existing entries) - this margin, rather than being a fixed number: an earlier
+# fixed 100_000 assumed the skeleton and the existing-entries JSON together fit
+# in 30 KB, but 40 CJK entries at the field ceiling serialize to 40.9 KB, which
+# put the worst case at 142 KB — over the limit, wedging that document for every
+# retry. Measured, not assumed.
+PROMPT_BYTE_MARGIN = 4_000
+
+# Floor on the signal section. A document whose existing entries are so large
+# that nothing is left for signals would consolidate against no input at all,
+# which reads as "the model found nothing" forever. Both layer ceilings
+# (8000/10000 chars) are far below what would trigger this, so it is a guard on
+# arithmetic, not an expected path.
+MIN_SIGNAL_BYTES = 8_000
+
+# Retained as the ceiling on the signal section, now only as an upper bound: the
+# per-call budget takes the smaller of this and what actually remains.
 MAX_SIGNAL_BYTES = 100_000
 
 
@@ -450,7 +470,7 @@ def apply_delta(
             continue
         kind = op.get("op")
         title = _fold(str(op.get("title") or ""))
-        body = _op_body(op)
+        body = _op_body(op, layer)
 
         # Gate 2: meta-narration in any user-visible field.
         if is_meta_narration(title) or any(is_meta_narration(b) for b in body):
@@ -545,22 +565,27 @@ def apply_delta(
     return entries, res
 
 
-def _op_body(op: dict) -> list[str]:
-    """Render an op's content fields into Markdown body lines.
+def _op_body(op: dict, layer: str) -> list[str]:
+    """Render an op's content fields into Markdown body lines for *layer*.
 
     lessons ops carry wrong/right; project ops carry a single fact. Both shapes
     become plain bullets here — Python decides the Markdown, never the model.
     Fields are folded to one line each: see ``_fold``.
+
+    Keyed on *layer*, not on which fields happen to be present. Sniffing the
+    fields let a retry model answering in the other layer's schema through: a
+    project op carrying wrong/right was written as error bullets into the
+    project document, and a lessons op carrying only ``fact`` was accepted as a
+    lesson with no wrong/right at all. Both are structurally valid and
+    semantically wrong, and both bypassed the completeness gate — an op missing
+    its layer's fields now returns [] and is refused.
     """
-    wrong = _fold(str(op.get("wrong") or ""))
-    right = _fold(str(op.get("right") or ""))
-    if wrong or right:
-        lines = []
-        if wrong:
-            lines.append(f"- 错误：{wrong}")
-        if right:
-            lines.append(f"- 正确：{right}")
-        return lines
+    if layer == "lessons":
+        wrong = _fold(str(op.get("wrong") or ""))
+        right = _fold(str(op.get("right") or ""))
+        if not (wrong and right):
+            return []
+        return [f"- 错误：{wrong}", f"- 正确：{right}"]
     fact = _fold(str(op.get("fact") or ""))
     return [f"- {fact}"] if fact else []
 
@@ -688,9 +713,13 @@ async def consolidate_layer(
 
     entries = parse_entries(read_layer(eid, layer))
     max_items = cfg[f"{layer}_max_items"]
-    signal_text = _format_signals(signals, cfg["max_signal_chars"])
+    existing = _existing_for_prompt(layer, entries)
+    signal_text = _format_signals(
+        signals, cfg["max_signal_chars"],
+        signal_byte_budget(layer, existing, max_items),
+    )
     prompt = _PROMPTS[layer].format(
-        existing=_existing_for_prompt(layer, entries),
+        existing=existing,
         signals=signal_text,
         max_items=max_items,
     )
@@ -724,25 +753,39 @@ async def consolidate_layer(
     return res
 
 
-def _format_signals(signals: list[dict], max_chars: int) -> str:
-    """Join signals into prompt text, stopping at *max_chars* or the byte guard.
+def signal_byte_budget(layer: str, existing: str, max_items: int) -> int:
+    """Bytes the signal section may use, given the rest of *layer*'s prompt.
+
+    Computed rather than fixed, because the rest of the prompt is not small on a
+    full document: 40 CJK project entries at the field ceiling serialize to
+    41 KB of ``existing``, so a fixed 100 KB signal guard put the assembled
+    prompt at 142 KB — over MAX_ARG_BYTES, which wedged that document for every
+    retry attempt.
+    """
+    skeleton = _PROMPTS[layer].format(existing=existing, signals="", max_items=max_items)
+    remaining = MAX_ARG_BYTES - len(skeleton.encode("utf-8")) - PROMPT_BYTE_MARGIN
+    return max(MIN_SIGNAL_BYTES, min(MAX_SIGNAL_BYTES, remaining))
+
+
+_SIGNAL_SEP = "\n---\n"
+
+
+def _format_signals(signals: list[dict], max_chars: int,
+                    max_bytes: int = MAX_SIGNAL_BYTES) -> str:
+    """Join signals into prompt text, stopping at *max_chars* or *max_bytes*.
 
     Truncation is logged rather than silent: a run that saw half its input
     should not read like a run that saw all of it.
 
     Two ceilings, because the configured one counts characters while the real
-    constraint counts bytes. The prompt reaches the helper LLM as a single argv
-    entry, and Linux caps one of those at MAX_ARG_STRLEN = 131072 bytes. CJK text
-    is ~3 bytes per character, so a 50000-char budget is 150 KB of Chinese —
-    over the limit. Exceeding it raises E2BIG inside ``_llm_call``, whose except
-    returns "" , which every gate reads as "no usable output": the pipeline would
-    go quietly dead in exactly the shape we spent this whole redesign removing.
+    constraint counts bytes: CJK text is ~3 bytes per character, so a 50000-char
+    budget is 150 KB of Chinese — over MAX_ARG_BYTES on its own. The byte ceiling
+    is deliberately invisible in config; ``max_signal_chars`` keeps its literal
+    meaning so the number stays readable.
 
-    The byte guard is deliberately invisible in config. ``max_signal_chars``
-    keeps its literal meaning so the number stays readable, and the guard only
-    bites on CJK-dense input, where 100 KB still leaves 30 KB of headroom for
-    the prompt skeleton and the existing-entries JSON (neither of which is
-    capped).
+    *max_bytes* is normally ``signal_byte_budget()``, which subtracts the rest of
+    the prompt. The separators ``join`` inserts are counted here too — they are
+    5 bytes each, which is 2 KB across 400 signals.
     """
     parts: list[str] = []
     total = 0
@@ -753,24 +796,26 @@ def _format_signals(signals: list[dict], max_chars: int) -> str:
             if s.get(flag):
                 label += f"[{flag}]"
         piece = f"{label} {s.get('content', '')}"
-        piece_bytes = len(piece.encode("utf-8"))
-        if total_bytes + piece_bytes > MAX_SIGNAL_BYTES:
+        # The separator join() will insert before this piece counts too.
+        sep_bytes = len(_SIGNAL_SEP.encode("utf-8")) if parts else 0
+        piece_bytes = len(piece.encode("utf-8")) + sep_bytes
+        if total_bytes + piece_bytes > max_bytes:
             logger.info(
-                "signal text hit the %d-byte argv guard at %d chars; "
+                "signal text hit the %d-byte argv budget at %d chars; "
                 "used %d of %d signals",
-                MAX_SIGNAL_BYTES, total, i, len(signals),
+                max_bytes, total, i, len(signals),
             )
             break
-        if total + len(piece) > max_chars:
+        if total + len(piece) + (len(_SIGNAL_SEP) if parts else 0) > max_chars:
             logger.info(
                 "signal text hit the %d-char cap; used %d of %d signals",
                 max_chars, i, len(signals),
             )
             break
         parts.append(piece)
-        total += len(piece)
+        total += len(piece) + (len(_SIGNAL_SEP) if len(parts) > 1 else 0)
         total_bytes += piece_bytes
-    return "\n---\n".join(parts)
+    return _SIGNAL_SEP.join(parts)
 
 
 # ── Top-level consolidation ───────────────────────────────────────────────────
@@ -1043,7 +1088,13 @@ _TOOL_ERROR_RE = re.compile(
     r"^\s*(?:\w+Error|\w+Exception)(?::|\s*$)"
     r"|^Traceback \(most recent call last\)"
     r"|^\s*(?:error|ERROR|fatal|FATAL|FAILED)[:\s]"
-    r"|\bexit(?:ed with)? (?:code )?[1-9]"
+    # Capitalized, because the lowercase form is shell source, not a result. The
+    # harness reports a nonzero status as "Exit code N"; `exit 1` in lowercase is
+    # what every bash script in the repo contains, so reading one matched. Of 922
+    # hits for the loose pattern, the ones it found and this does not are all
+    # Read output of *.sh files; this instead finds 2135, the extra 1213 being
+    # real nonzero exits the loose form had no way to see.
+    r"|\bExit code [1-9]|\bexited with (?:code )?[1-9]"
     r"|command not found|No such file or directory"
     r"|Permission denied|is not recognized",
     re.M,
@@ -1128,10 +1179,23 @@ def extract_lesson_signals(tasks: list) -> list[dict]:
                 s["task_failed"] = True
             if high_turns:
                 s["high_turns"] = True
-        # Only keep signals from tasks that actually went wrong somewhere;
-        # a clean run's tool_result noise carries no lesson.
+        # A task that went wrong somewhere keeps everything; a clean one keeps
+        # its tool errors alone.
+        #
+        # The whole-task gate used to discard tool_error from a run that hit a
+        # real failing call, recovered, and finished inside 20 turns — which is
+        # where the reusable lesson usually is (the gerrit non-fast-forward push
+        # that then succeeded after a rebase is exactly this shape). Measured on
+        # 1787 real tasks: 326 tool_error signals were being dropped this way,
+        # against 3614 kept, so the admitted volume is +9% rather than a flood.
+        #
+        # This only became safe once _TOOL_ERROR_RE stopped matching shell source
+        # (see the Exit code branch): the earlier criterion would have admitted
+        # every `Read` of a *.sh file from every successful task.
         if failed or high_turns or any(s["source"] == "user_correction" for s in task_signals):
             signals.extend(task_signals)
+        else:
+            signals.extend(s for s in task_signals if s["source"] == "tool_error")
     return signals
 
 

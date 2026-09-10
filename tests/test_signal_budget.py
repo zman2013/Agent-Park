@@ -35,12 +35,17 @@ def test_the_byte_guard_binds_before_the_char_budget_on_cjk():
     assert len(out) < 50_000, "the byte guard, not the char budget, must cut here"
 
 
-def test_the_guard_leaves_room_for_the_rest_of_the_prompt():
-    """Signals are not the whole prompt: the skeleton and the existing-entries
-    JSON ride along uncapped. The guard has to leave headroom for both."""
-    skeleton = am._PROMPTS["lessons"].format(existing="", signals="", max_items=0)
-    worst = am.MAX_SIGNAL_BYTES + len(skeleton.encode("utf-8")) + 8_000
-    assert worst < MAX_ARG_STRLEN, f"{worst} bytes would overflow a single argv"
+def test_the_module_agrees_with_the_kernel_on_the_argv_limit():
+    """MAX_ARG_BYTES is the only place this number is written down in the module.
+
+    This assertion used to try to prove the *fixed* 100_000 guard left room for
+    the rest of the prompt, using a hand-picked 8_000 for the existing-entries
+    JSON. That estimate was the bug: a full CJK document serializes to 41 KB, so
+    the real worst case was 142 KB. The property is now proved by assembling the
+    prompt (see test_the_worst_case_prompt_fits_a_single_argv) instead of by
+    arithmetic on a guessed constant.
+    """
+    assert am.MAX_ARG_BYTES == MAX_ARG_STRLEN
 
 
 @pytest.mark.parametrize("text", ["x" * 100, "中" * 100, "mixed 混合 text"])
@@ -137,3 +142,58 @@ def test_the_history_window_is_never_the_part_that_gets_cut(tmp_path, monkeypatc
     asyncio.run(am.consolidate(eid, tasks, today="2026-09-09"))
     assert all("刚刚完成的那件事" in p for p in seen), \
         "the history window must reach every layer's prompt"
+
+
+# ── the guard must be sized against the whole argv ────────────────────────────
+#
+# Reported by review and reproduced by measurement: the guard was a fixed
+# 100_000 bytes, on the assumption that the skeleton plus existing-entries JSON
+# fit in the remaining 30 KB. 40 CJK project entries at the field ceiling
+# serialize to 40.9 KB, putting the worst case at 142 KB — over MAX_ARG_BYTES,
+# so _llm_call raised E2BIG and returned "" for every retry, wedging that
+# document permanently.
+
+def _worst_entries(layer: str) -> list[dict]:
+    """max_items entries, every field CJK and at its ceiling."""
+    n = am.max_items_for(layer)
+    body = ([f"- 错误：{'错' * am.FIELD_LIMITS['body']}",
+             f"- 正确：{'对' * am.FIELD_LIMITS['body']}"] if layer == "lessons"
+            else [f"- {'实' * am.FIELD_LIMITS['body']}"])
+    return [{"id": f"{i:06x}", "title": "标" * am.FIELD_LIMITS["title"], "n": 1,
+             "last": "2026-01-01", "body": body} for i in range(n)]
+
+
+@pytest.mark.parametrize("layer", ["lessons", "project"])
+def test_the_worst_case_prompt_fits_a_single_argv(layer):
+    """The property that actually matters: assembled, not just the signal part."""
+    entries = _worst_entries(layer)
+    existing = am._existing_for_prompt(layer, entries)
+    max_items = am.max_items_for(layer)
+    budget = am.signal_byte_budget(layer, existing, max_items)
+    signals = am._format_signals(_signals(4000, "中" * 800), 10**9, budget)
+    prompt = am._PROMPTS[layer].format(existing=existing, signals=signals,
+                                       max_items=max_items)
+    assert len(prompt.encode("utf-8")) <= am.MAX_ARG_BYTES, \
+        f"{len(prompt.encode('utf-8'))} bytes would raise E2BIG in _llm_call"
+
+
+@pytest.mark.parametrize("layer", ["lessons", "project"])
+def test_a_full_document_still_leaves_room_for_signals(layer):
+    """Shrinking the budget must not shrink it to nothing: a document that
+    consolidates against no input reads as 'the model found nothing' forever."""
+    budget = am.signal_byte_budget(
+        layer, am._existing_for_prompt(layer, _worst_entries(layer)),
+        am.max_items_for(layer))
+    assert budget >= am.MIN_SIGNAL_BYTES
+
+
+def test_an_empty_document_gets_the_full_budget():
+    budget = am.signal_byte_budget("project", "（暂无）", 40)
+    assert budget == am.MAX_SIGNAL_BYTES
+
+
+def test_the_join_separators_are_counted():
+    """5 bytes each — 2 KB across 400 signals, which is what pushed the earlier
+    arithmetic over the line it thought it was under."""
+    out = am._format_signals(_signals(400, "x" * 100), 10**9, 20_000)
+    assert len(out.encode("utf-8")) <= 20_000

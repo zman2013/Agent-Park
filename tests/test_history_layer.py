@@ -197,3 +197,23 @@ def test_reset_does_not_go_negative(eid):
     am.append_history(eid, "a", "success", "one")
     am.reset_history_counter(eid, consumed=99)
     assert am.read_history_counter(eid) == 0
+
+
+def test_the_trigger_fires_on_at_least_the_threshold_not_only_on_multiples(eid,
+                                                                          monkeypatch):
+    """Reported by review. Since a pass subtracts only what it consumed, the
+    counter no longer lands on multiples — so `n % every == 0` left a full
+    unconsumed window waiting for the *next* multiple: 10 stuck at 11 needing 9
+    more, or forever if the eid went quiet with daily consolidation off.
+
+    Asserted against the arithmetic rather than through AgentRunner, which needs
+    a live event loop and app_state: the condition is the whole fix.
+    """
+    every = am.consolidate_every()
+    fires = lambda n: n >= every                     # noqa: E731 — the condition itself
+    modulo = lambda n: bool(n) and n % every == 0    # noqa: E731 — what it replaced
+    assert fires(every) and modulo(every), "both agree on an exact window"
+    stuck = every + 1
+    assert fires(stuck), "a full window at a non-multiple remainder must fire"
+    assert not modulo(stuck), "which the old condition did not"
+    assert not fires(every - 1), "a partial window must still not fire"
