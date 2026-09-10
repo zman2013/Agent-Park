@@ -127,16 +127,55 @@ async def _llm_call(command: str, prompt: str, timeout: int = 120) -> str:
             # pipeline into a silent no-op.
             env=_clean_env(),
         )
+    except Exception:
+        logger.exception("LLM call failed to start (command=%s)", command)
+        return ""
+
+    try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         from server.helper_llm import parse_stream_json_result
         result = parse_stream_json_result(stdout.decode("utf-8", errors="replace"))
         return result.strip() if result else ""
     except asyncio.TimeoutError:
         logger.warning("LLM call timed out (command=%s)", command)
+        await _kill(proc, command)
         return ""
+    except asyncio.CancelledError:
+        # Shutdown. Cancelling communicate() does NOT signal the child: the
+        # bounded consolidation drain in AgentRunner.shutdown is 5s while this
+        # timeout is 600s, and run.sh only signals the backend PID — so a helper
+        # still thinking would be orphaned, left running and billing for up to
+        # the full call duration. Kill it, then let the cancellation propagate.
+        logger.info("LLM call cancelled, killing helper (command=%s)", command)
+        await _kill(proc, command)
+        raise
     except Exception:
         logger.exception("LLM call failed (command=%s)", command)
+        await _kill(proc, command)
         return ""
+
+
+async def _kill(proc, command: str) -> None:
+    """Terminate *proc* and reap it, so it cannot outlive this call.
+
+    Reaping matters as much as signalling: an un-awaited child becomes a zombie,
+    and ``run.sh``'s ``is_running`` treats a zombie backend PID as alive.
+    ``asyncio.shield`` because this runs on the cancellation path, where a bare
+    await would be cancelled again before the wait completed.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return                                  # exited between the check and here
+    except Exception:
+        logger.exception("Failed to kill helper LLM (command=%s)", command)
+        return
+    try:
+        await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
+    except Exception:
+        logger.warning("Helper LLM did not reap after kill (command=%s)", command)
 
 
 # ── Write documents ───────────────────────────────────────────────────────────

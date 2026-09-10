@@ -51,9 +51,18 @@ NOTIFY_DRAIN_BASE_SECONDS = 40
 # already past its LLM calls finish writing.
 CONSOLIDATE_DRAIN_SECONDS = 5
 
+# After cancelling, how long to let the kill-and-reap path in _llm_call run.
+# Its own reap wait is 5s, so this must exceed it or shutdown returns while the
+# child is still being collected.
+CONSOLIDATE_KILL_SECONDS = 8
+
 
 def _consolidate_drain_seconds() -> int:
     return CONSOLIDATE_DRAIN_SECONDS
+
+
+def _consolidate_kill_seconds() -> int:
+    return CONSOLIDATE_KILL_SECONDS
 
 
 def _notify_drain_max_seconds() -> int:
@@ -1363,9 +1372,13 @@ class AgentRunner:
 
             consumed_window = False
             try:
-                logger.info("history reached %d entries for eid %s, consolidating", n, eid)
+                tasks = _window_tasks(_eid_tasks(eid), n)
+                logger.info(
+                    "history reached %d entries for eid %s, consolidating %d tasks",
+                    n, eid, len(tasks),
+                )
                 result = await auto_memory.consolidate(
-                    eid, _eid_tasks(eid), history_window_only=True)
+                    eid, tasks, history_window_only=True)
                 # consolidate() clears the window when at least one layer
                 # produced a usable delta, and deliberately keeps it otherwise.
                 consumed_window = len(result["failed_layers"]) < 2
@@ -1796,12 +1809,61 @@ class AgentRunner:
         # losing the window. Bounded by one layer's LLM timeout — we are not
         # obliged to finish, only to not corrupt.
         if self._consolidate_tasks:
-            await asyncio.wait(
-                list(self._consolidate_tasks), timeout=_consolidate_drain_seconds()
+            pending = list(self._consolidate_tasks)
+            _, still_running = await asyncio.wait(
+                pending, timeout=_consolidate_drain_seconds()
             )
+            # asyncio.wait's timeout leaves the unfinished ones pending, and loop
+            # teardown would then drop them without their `except CancelledError`
+            # ever running — which is where _llm_call kills its helper child.
+            # run.sh signals only the backend PID, so an unsignalled glm/cco
+            # would be orphaned and keep running (and billing) for up to its own
+            # 600s timeout. Cancel explicitly and give the kill paths a moment.
+            for t in still_running:
+                t.cancel()
+            if still_running:
+                await asyncio.wait(still_running, timeout=_consolidate_kill_seconds())
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
+
+_TERMINAL_STATUSES = ("success", "failed")
+
+
+def _window_tasks(tasks: list, window: int) -> list:
+    """The *window* newest finished tasks, for a threshold-triggered pass.
+
+    Two filters, both fixing the same class of bug as the history slice:
+
+    Terminal only. ``_eid_tasks`` returns every task the eid owns, including one
+    still running in another member — and ``extract_project_signals`` checks
+    neither status nor ``streaming``, so a half-generated agent message that
+    happens to contain a path or a command keyword would be persisted as project
+    knowledge before that run reached its actual conclusion.
+
+    Newest *window* only. Slicing ``history.md`` alone was not enough: the tasks
+    themselves were still every task ever stored, and both extractors walk their
+    complete message lists. Old tool errors and corrections that fit under the
+    signal cap were therefore re-fed every ten completions, letting the model
+    update the same entries again and inflate ``n`` — the exact retention-ranking
+    corruption the history slice existed to remove.
+
+    The nightly loop and the 🧠 button do not come through here: they select
+    their own task sets (a date, or the last N completed) and are meant to look
+    across the whole record.
+    """
+    # `.value if hasattr` rather than str(): Task.status is a str-Enum, and
+    # str(TaskStatus.success) is "TaskStatus.success", so a str() comparison
+    # matches nothing and this filter would silently drop every real task.
+    # Same idiom as state.py's active-task check, for the same reason.
+    def _status(t) -> str:
+        s = getattr(t, "status", "")
+        return s.value if hasattr(s, "value") else str(s)
+
+    finished = [t for t in tasks if _status(t) in _TERMINAL_STATUSES]
+    finished.sort(key=lambda t: getattr(t, "updated_at", "") or "", reverse=True)
+    return finished[:window] if window > 0 else []
+
 
 def _read_proc_start_time(pid: int) -> int | None:
     """Read /proc/<pid>/stat field 22 (process start time since boot)."""

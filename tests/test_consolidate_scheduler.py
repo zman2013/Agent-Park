@@ -180,3 +180,177 @@ def test_a_crashing_pass_releases_its_reservation(env, monkeypatch):
 
     stub = asyncio.run(go())
     assert stub._consolidating == set()
+
+
+# ── which tasks a threshold pass may see ──────────────────────────────────────
+#
+# Reported by review after the history slice landed: slicing history.md alone was
+# not enough. _eid_tasks returns every task the eid owns, both extractors walk
+# their complete message lists, and the pass runs every ten completions — so old
+# tool errors and corrections that fit under the signal cap were re-fed every
+# cycle, letting the model update the same entries and inflate n. Same corruption
+# the history slice existed to remove, arriving by the other input.
+
+from server.agent_runner import _window_tasks
+
+
+class _T:
+    def __init__(self, tid, status, updated_at, messages=None):
+        self.id, self.name = tid, tid
+        self.status, self.updated_at = status, updated_at
+        self.num_turns, self.messages = 1, messages or []
+
+
+def test_only_the_newest_window_of_tasks_is_fed():
+    tasks = [_T(f"t{i}", "success", f"2026-09-{i + 1:02d}") for i in range(30)]
+    got = _window_tasks(tasks, 10)
+    assert len(got) == 10
+    assert [t.id for t in got] == [f"t{i}" for i in range(29, 19, -1)], \
+        "the newest ten, newest first"
+
+
+def test_in_flight_tasks_are_excluded():
+    """extract_project_signals checks neither status nor streaming, so a
+    half-generated agent message mentioning a path would be persisted as project
+    knowledge before that run reached its conclusion."""
+    tasks = [
+        _T("running", "running", "2026-09-30"),
+        _T("waiting", "waiting", "2026-09-29"),
+        _T("idle", "idle", "2026-09-28"),
+        _T("ok", "success", "2026-09-27"),
+        _T("bad", "failed", "2026-09-26"),
+    ]
+    assert sorted(t.id for t in _window_tasks(tasks, 10)) == ["bad", "ok"]
+
+
+def test_a_task_status_enum_is_matched_by_value():
+    """Task.status is a TaskStatus enum in production, a str in these stubs;
+    both must filter identically or the guard silently passes nothing."""
+    from server.models import TaskStatus
+
+    tasks = [_T("a", TaskStatus.success, "2026-09-02"),
+             _T("b", TaskStatus.running, "2026-09-01")]
+    assert [t.id for t in _window_tasks(tasks, 10)] == ["a"]
+
+
+def test_a_zero_window_feeds_no_tasks():
+    assert _window_tasks([_T("a", "success", "2026-09-01")], 0) == []
+
+
+def test_fewer_tasks_than_the_window_is_fine():
+    tasks = [_T("a", "success", "2026-09-01")]
+    assert len(_window_tasks(tasks, 10)) == 1
+
+
+def test_the_scheduler_passes_a_bounded_task_set(env, monkeypatch):
+    """End to end: the pass must not receive the whole history of tasks."""
+    seen: list[int] = []
+
+    async def fake(command, prompt, timeout=0):
+        seen.append(prompt.count("[tool_error]"))
+        return OK
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+    import server.routes_ws as rw
+    every = am.consolidate_every()
+    # 40 old finished tasks, each carrying one distinct tool error.
+    monkeypatch.setattr(rw, "_eid_tasks", lambda eid: [
+        _T(f"t{i}", "success", f"2026-08-{i % 28 + 1:02d}",
+           [_Msg(f"ValueError: boom {i}")]) for i in range(40)
+    ])
+
+    async def go():
+        stub = _Stub()
+        for i in range(every):
+            am.append_history(EID, "a", "success", f"run {i}")
+        stub._schedule_consolidate(EID, every)
+        await _drain(stub)
+
+    asyncio.run(go())
+    assert seen, "the pass must have run"
+    assert max(seen) <= every, \
+        f"a pass fed {max(seen)} tool errors for a window of {every}"
+
+
+# ── the helper subprocess must not outlive shutdown ───────────────────────────
+#
+# Reported by review: on `bash run.sh restart`, a glm/cco call lasting longer
+# than the 5s drain was still pending when shutdown returned. Loop teardown
+# cancels communicate(), which does NOT signal the child, and run.sh signals only
+# the backend PID — so the helper was orphaned, left running and billing for up
+# to its own 600s timeout.
+
+def test_a_cancelled_llm_call_kills_its_helper(tmp_path):
+    """Drives the real _llm_call against a real long-lived subprocess."""
+    import os
+    import signal
+
+    async def go():
+        # `sleep 600` stands in for a helper still thinking. The command is
+        # resolved by create_subprocess_exec exactly as glm/cco would be.
+        import server.knowledge as k
+        started: list = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def spy(*args, **kwargs):
+            proc = await real_exec("sleep", "600",
+                                   stdout=kwargs.get("stdout"),
+                                   stderr=kwargs.get("stderr"))
+            started.append(proc)
+            return proc
+
+        k.asyncio.create_subprocess_exec = spy
+        try:
+            call = asyncio.ensure_future(k._llm_call("glm", "prompt", timeout=600))
+            for _ in range(100):                 # let the child actually spawn
+                await asyncio.sleep(0.01)
+                if started:
+                    break
+            assert started, "the helper subprocess never started"
+            proc = started[0]
+            assert proc.returncode is None, "child should still be running"
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            return proc
+        finally:
+            k.asyncio.create_subprocess_exec = real_exec
+
+    proc = asyncio.run(go())
+    assert proc.returncode is not None, \
+        "the helper was left running after its call was cancelled"
+    # Reaped, not merely signalled: an un-awaited child becomes a zombie, and
+    # run.sh's is_running treats a zombie backend PID as alive.
+    with pytest.raises(ProcessLookupError):
+        os.kill(proc.pid, 0)
+
+
+def test_a_timed_out_llm_call_also_kills_its_helper():
+    """Same leak by the other exit: the timeout branch returned "" and walked
+    away from the child."""
+    import os
+
+    async def go():
+        import server.knowledge as k
+        started: list = []
+        real_exec = asyncio.create_subprocess_exec
+
+        async def spy(*args, **kwargs):
+            proc = await real_exec("sleep", "600",
+                                   stdout=kwargs.get("stdout"),
+                                   stderr=kwargs.get("stderr"))
+            started.append(proc)
+            return proc
+
+        k.asyncio.create_subprocess_exec = spy
+        try:
+            out = await k._llm_call("glm", "prompt", timeout=1)
+            assert out == "", "a timeout must read as no usable output"
+            return started[0]
+        finally:
+            k.asyncio.create_subprocess_exec = real_exec
+
+    proc = asyncio.run(go())
+    assert proc.returncode is not None
+    with pytest.raises(ProcessLookupError):
+        os.kill(proc.pid, 0)
