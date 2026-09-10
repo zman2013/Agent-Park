@@ -745,10 +745,23 @@ async def consolidate_layer(
         return ConsolidationResult(failed=True)
 
     entries, res = apply_delta(layer, entries, ops, today)
-    # An all-refused batch is not "no changes": nothing was validated, so
-    # writing would persist a truncation as though it were a decision.
-    if res["added"] or res["updated"] or res["deleted"] or res["dropped"]:
+    # An all-refused batch is not "no changes": nothing was validated, so writing
+    # would persist a truncation as though it were a decision.
+    #
+    # `dropped` used to be in this disjunction, which contradicted the sentence
+    # above: truncation is our own gate firing, not an accepted operation. An
+    # already-over-budget document (a lowered item cap, or a hand edit) plus a
+    # delta whose every op was refused would then be written anyway — so a single
+    # `update` with an invented id could delete real entries purely by tripping
+    # the size gate. Truncation now only rides along with an accepted change.
+    accepted = res["added"] or res["updated"] or res["deleted"]
+    if accepted:
         write_layer(eid, layer, render_entries(layer, entries))
+    elif res["dropped"]:
+        logger.warning(
+            "%s/%s: %d entries are over budget but no op was accepted; "
+            "not writing the truncation", eid, layer, res["dropped"],
+        )
     logger.info("%s/%s: %s", eid, layer, res)
     return res
 
@@ -879,8 +892,19 @@ async def consolidate(
         # time — the trigger fired forever and never saw its own window.
         tasks = sorted(tasks, key=lambda t: getattr(t, "updated_at", "") or "",
                        reverse=True)
-        lesson_signals = extract_lesson_signals(tasks)
-        project_signals = extract_project_signals(tasks)
+        # Drop messages already fed to a previous pass. A Task is a resumable
+        # conversation while history advances per finished run, so a task resumed
+        # across several windows would otherwise replay its whole transcript
+        # every time. Only on the triggered path, for the same reason as the
+        # history slice: the nightly loop and the 🧠 button are asked to look at
+        # the whole record.
+        marks = read_consumed_marks(eid) if history_window_only else {}
+        if history_window_only:
+            fed = slice_new_messages(tasks, marks)
+        else:
+            fed = tasks
+        lesson_signals = extract_lesson_signals(fed)
+        project_signals = extract_project_signals(fed)
         history_signals = extract_history_signals(
             eid, consumed if history_window_only else None)
         await progress(
@@ -908,6 +932,18 @@ async def consolidate(
         # shape as the old "timeout returns existing_md" behaviour.
         if any(not r["failed"] for r in results.values()):
             reset_history_counter(eid, consumed)
+            # Advance the per-task watermarks in the same breath, and only here:
+            # a pass where every layer failed keeps both the history window and
+            # these marks, so the retry sees exactly the same input.
+            if history_window_only:
+                # Merged over the existing marks, not replacing them: a task
+                # drops out of the newest-N window and comes back when it is
+                # resumed, and a pruned mark would replay its whole transcript.
+                marks.update({
+                    getattr(t, "id", ""): len(getattr(t, "messages", []) or [])
+                    for t in tasks if getattr(t, "id", "")
+                })
+                write_consumed_marks(eid, marks)
         else:
             logger.warning(
                 "%s: every layer failed, keeping the history window for a retry", eid
@@ -1062,6 +1098,102 @@ def reset_history_counter(eid: str, consumed: int | None = None) -> None:
             logger.exception("%s: failed to reset history counter", eid)
 
 
+# Per-task watermark: how many of a task's messages have already been fed to
+# consolidation. Persisted next to the documents, for the same reason the history
+# counter is — a restart must not replay a window.
+_MARKS_FILE = "consumed_marks.json"
+
+
+def _marks_path(eid: str):
+    return memory_dir(eid) / _MARKS_FILE
+
+
+def read_consumed_marks(eid: str) -> dict[str, int]:
+    p = _marks_path(eid)
+    if not p.exists():
+        return {}
+    try:
+        import json as _json
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        return {str(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+    except Exception:
+        # Same posture as the counter: corrupt state must not wedge consolidation
+        # forever. Losing the marks costs one replayed window, not correctness.
+        logger.warning("%s: unreadable consumed marks, treating as empty", eid)
+        return {}
+
+
+# Cap on the watermark map. Marks are merged rather than pruned to the current
+# window (a task leaves the newest-N window and returns when resumed, and a lost
+# mark replays its whole transcript), so something has to bound the file. Dropping
+# the lowest watermarks first sheds the shortest conversations, which are the
+# cheapest to replay if they ever come back.
+MAX_CONSUMED_MARKS = 500
+
+
+def write_consumed_marks(eid: str, marks: dict[str, int]) -> None:
+    """Persist the watermarks, bounded by ``MAX_CONSUMED_MARKS``."""
+    if len(marks) > MAX_CONSUMED_MARKS:
+        kept = sorted(marks.items(), key=lambda kv: kv[1], reverse=True)
+        kept = kept[:MAX_CONSUMED_MARKS]
+        logger.info(
+            "%s: consumed marks over %d, dropped %d lowest watermarks",
+            eid, MAX_CONSUMED_MARKS, len(marks) - len(kept),
+        )
+        marks = dict(kept)
+    try:
+        import json as _json
+        d = memory_dir(eid)
+        d.mkdir(parents=True, exist_ok=True)
+        _marks_path(eid).write_text(
+            _json.dumps(marks, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.exception("%s: failed to write consumed marks", eid)
+
+
+def slice_new_messages(tasks: list, marks: dict[str, int]) -> list:
+    """Return shallow task views holding only messages past their watermark.
+
+    A ``Task`` is a *resumable conversation*, but history advances once per
+    finished run — so a task resumed across several consolidation windows was
+    returned by the task-window slice each time, and both extractors walked its
+    entire accumulated ``messages``. Errors and corrections from earlier windows
+    were replayed, inflating ``n`` on entries nothing new happened to: the same
+    corruption as the history and task-count slices, arriving by the third input.
+
+    A view rather than a mutation: ``tasks`` are the live objects from
+    ``app_state``, and trimming their ``messages`` would destroy the transcript
+    the UI serves.
+    """
+    out = []
+    for t in tasks:
+        msgs = getattr(t, "messages", []) or []
+        start = min(marks.get(getattr(t, "id", ""), 0), len(msgs))
+        fresh = msgs[start:]
+        if not fresh:
+            continue
+        out.append(_TaskView(t, fresh))
+    return out
+
+
+class _TaskView:
+    """Read-only stand-in exposing one task's *new* messages.
+
+    Only the attributes the two extractors touch. ``__getattr__`` forwards
+    everything else so a future extractor reading another field still works
+    rather than silently seeing nothing.
+    """
+
+    __slots__ = ("_t", "messages")
+
+    def __init__(self, task, messages):
+        self._t = task
+        self.messages = messages
+
+    def __getattr__(self, name):
+        return getattr(self._t, name)
+
+
 def extract_history_signals(eid: str, unconsumed: int | None = None) -> list[dict]:
     """Feed history into extraction as one signal per logged run.
 
@@ -1155,6 +1287,22 @@ def _around(text: str, pos: int, width: int = _ERROR_WINDOW) -> str:
     return text[start:start + width]
 
 
+def status_value(task) -> str:
+    """A task's status as a plain string, whatever shape it arrives in.
+
+    ``Task.status`` is a ``str``-Enum, and ``str(TaskStatus.failed)`` is
+    ``"TaskStatus.failed"`` — so every ``str(task.status) == "failed"``
+    comparison in this codebase was silently always False against real Pydantic
+    tasks while passing against string stubs in tests. Two sites had it: the
+    ``failed`` flag here (real failed tasks never got the ``task_failed`` label,
+    so the prompt never learned which signals came from a run that died) and the
+    🧠 button's recent_n filter in routes_ws (which therefore selected nothing).
+    One helper so the next caller cannot get it wrong a third time.
+    """
+    s = getattr(task, "status", "")
+    return s.value if hasattr(s, "value") else str(s)
+
+
 def extract_lesson_signals(tasks: list) -> list[dict]:
     """Extract fragments that plausibly contain a lesson.
 
@@ -1169,7 +1317,7 @@ def extract_lesson_signals(tasks: list) -> list[dict]:
     """
     signals: list[dict] = []
     for task in tasks:
-        failed = str(getattr(task, "status", "")) == "failed"
+        failed = status_value(task) == "failed"
         high_turns = getattr(task, "num_turns", 0) > 20
         task_signals: list[dict] = []
         for msg in getattr(task, "messages", []) or []:

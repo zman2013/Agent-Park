@@ -275,3 +275,125 @@ def test_a_zero_window_feeds_no_history(eid):
     """A pass triggered with nothing unconsumed must not fall back to the file."""
     am.append_history(eid, "a", "success", "运行")
     assert am.extract_history_signals(eid, 0) == []
+
+
+# ── per-task message watermarks ───────────────────────────────────────────────
+#
+# Reported by review as the third input replaying the same material: a Task is a
+# resumable conversation, but history advances once per finished run. A task
+# resumed across several windows was returned by the task-count slice each time,
+# and both extractors walked its entire accumulated `messages`.
+
+class _M:
+    def __init__(self, content):
+        self.role, self.type, self.content = "agent", "tool_result", content
+
+
+class _RT:
+    """A resumable task whose transcript grows between passes."""
+
+    def __init__(self, tid, n):
+        self.id, self.name, self.status = tid, tid, "failed"
+        self.num_turns, self.updated_at = 1, "2026-09-09T10:00:00"
+        self.messages = [_M(f"ValueError: 第 {i} 条") for i in range(n)]
+
+
+def test_a_resumed_task_does_not_replay_its_earlier_messages(eid, monkeypatch):
+    task = _RT("t1", 3)
+    _stub(monkeypatch, '[{"op":"add","title":"T","fact":"F"}]')
+    am.append_history(eid, "a", "success", "run 1")
+    asyncio.run(am.consolidate(eid, [task], history_window_only=True))
+
+    # Resumed: two more messages land on the same task object.
+    task.messages.append(_M("ValueError: 第 3 条"))
+    task.messages.append(_M("ValueError: 第 4 条"))
+
+    seen: list[str] = []
+
+    async def capture(command, prompt, timeout=0):
+        seen.append(prompt)
+        return '[{"op":"add","title":"T2","fact":"F2"}]'
+
+    monkeypatch.setattr(knowledge, "_llm_call", capture)
+    am.append_history(eid, "a", "success", "run 2")
+    asyncio.run(am.consolidate(eid, [task], history_window_only=True))
+    # The lessons prompt is the one tool_result signals reach; the project
+    # extractor only reads agent *text*, so it never sees these at all.
+    lessons = [p for p in seen if "错误经验提取器" in p]
+    assert lessons, "the lessons layer must have been prompted"
+    for p in lessons:
+        assert "第 4 条" in p, "the new messages must be fed"
+        assert "第 0 条" not in p, "an already-consolidated message must not be re-fed"
+
+
+def test_a_task_with_nothing_new_is_dropped_entirely(eid):
+    task = _RT("t1", 2)
+    marks = {"t1": 2}
+    assert am.slice_new_messages([task], marks) == []
+
+
+def test_the_view_exposes_only_new_messages_but_forwards_other_fields(eid):
+    task = _RT("t1", 5)
+    view = am.slice_new_messages([task], {"t1": 3})[0]
+    assert len(view.messages) == 2
+    assert view.id == "t1" and view.status == "failed", "other fields must forward"
+    assert len(task.messages) == 5, "the live task must not be mutated"
+
+
+def test_a_mark_beyond_the_transcript_does_not_crash(eid):
+    """A task whose messages were trimmed must not raise or resurrect old ones."""
+    assert am.slice_new_messages([_RT("t1", 2)], {"t1": 99}) == []
+
+
+def test_a_failed_pass_does_not_advance_the_marks(eid, monkeypatch):
+    """Same posture as the history window: the retry must see the same input."""
+    task = _RT("t1", 3)
+    am.append_history(eid, "a", "success", "run")
+    _stub(monkeypatch, "分析完成，没有新增。")
+    asyncio.run(am.consolidate(eid, [task], history_window_only=True))
+    assert am.read_consumed_marks(eid) == {}
+
+
+def test_marks_are_merged_not_pruned_to_the_window(eid, monkeypatch):
+    """A task leaves the newest-N window and returns when resumed; a pruned mark
+    would replay its whole transcript."""
+    _stub(monkeypatch, '[{"op":"add","title":"T","fact":"F"}]')
+    am.append_history(eid, "a", "success", "run 1")
+    asyncio.run(am.consolidate(eid, [_RT("old", 4)], history_window_only=True))
+    am.append_history(eid, "a", "success", "run 2")
+    asyncio.run(am.consolidate(eid, [_RT("new", 2)], history_window_only=True))
+    marks = am.read_consumed_marks(eid)
+    assert marks == {"old": 4, "new": 2}
+
+
+def test_marks_are_bounded(eid):
+    am.write_consumed_marks(eid, {f"t{i}": i for i in range(am.MAX_CONSUMED_MARKS + 50)})
+    marks = am.read_consumed_marks(eid)
+    assert len(marks) == am.MAX_CONSUMED_MARKS
+    assert min(marks.values()) == 50, "the lowest watermarks are dropped first"
+
+
+def test_corrupt_marks_do_not_wedge_consolidation(eid):
+    am.write_consumed_marks(eid, {"t1": 1})
+    am._marks_path(eid).write_text("not json", encoding="utf-8")
+    assert am.read_consumed_marks(eid) == {}
+
+
+def test_the_manual_path_still_sees_whole_transcripts(eid, monkeypatch):
+    """The 🧠 button and nightly loop are explicitly asked to look at everything,
+    so they must ignore the marks."""
+    task = _RT("t1", 3)
+    _stub(monkeypatch, '[{"op":"add","title":"T","fact":"F"}]')
+    am.append_history(eid, "a", "success", "run")
+    asyncio.run(am.consolidate(eid, [task], history_window_only=True))
+
+    seen: list[str] = []
+
+    async def capture(command, prompt, timeout=0):
+        seen.append(prompt)
+        return "[]"
+
+    monkeypatch.setattr(knowledge, "_llm_call", capture)
+    asyncio.run(am.consolidate(eid, [task]))          # no history_window_only
+    lessons = [p for p in seen if "错误经验提取器" in p]
+    assert lessons and all("第 0 条" in p for p in lessons)

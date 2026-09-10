@@ -225,3 +225,63 @@ def test_a_recovered_error_is_not_flagged_as_a_failed_task():
     task = _Task("success", 5, [_Msg("agent", "tool_result", "Exit code 2\nboom")])
     sig = am.extract_lesson_signals([task])[0]
     assert "task_failed" not in sig and "high_turns" not in sig
+
+
+# ── status must be read through .value ────────────────────────────────────────
+#
+# Reported by review, and the sharpest lesson in this PR: `Task.status` is a
+# str-Enum, and `str(TaskStatus.failed)` is "TaskStatus.failed", not "failed".
+# So `str(task.status) == "failed"` was always False against real Pydantic tasks
+# while passing against every string stub in this file — the string stubs were
+# *concealing* the regression, not testing it. Real failed tasks therefore never
+# got the `task_failed` label. Two sites had the same bug; the other was the 🧠
+# button's recent_n filter, which selected nothing.
+
+def _real_task(status, content="ValueError: boom", turns=1):
+    from server.models import Message, Task
+
+    return Task(name="t", agent_id="a", prompt="p", status=status, num_turns=turns,
+                messages=[Message(role="agent", type="tool_result", content=content)])
+
+
+def test_a_real_pydantic_failed_task_is_labelled():
+    from server.models import TaskStatus
+
+    signals = am.extract_lesson_signals([_real_task(TaskStatus.failed)])
+    assert len(signals) == 1
+    assert signals[0].get("task_failed") is True, \
+        "str(TaskStatus.failed) != 'failed' — the label was silently never set"
+
+
+def test_a_real_pydantic_successful_task_is_not_labelled():
+    from server.models import TaskStatus
+
+    signals = am.extract_lesson_signals([_real_task(TaskStatus.success)])
+    assert len(signals) == 1                      # kept: recovered tool error
+    assert "task_failed" not in signals[0]
+
+
+@pytest.mark.parametrize("status,expected", [
+    ("failed", "failed"),
+    ("success", "success"),
+])
+def test_status_value_normalizes_both_shapes(status, expected):
+    """Enum and plain string must normalize identically, or a filter written
+    against one shape silently drops everything of the other."""
+    from server.models import TaskStatus
+
+    class _S:
+        pass
+
+    plain, enum_ = _S(), _S()
+    plain.status = status
+    enum_.status = TaskStatus(status)
+    assert am.status_value(plain) == expected
+    assert am.status_value(enum_) == expected
+
+
+def test_status_value_on_a_task_with_no_status():
+    class _S:
+        pass
+
+    assert am.status_value(_S()) == ""

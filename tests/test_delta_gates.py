@@ -225,3 +225,66 @@ def test_an_oversized_update_in_the_wrong_schema_still_spares_the_entry():
     ], "2026-09-09")
     assert res["refused"] == 1 and res["updated"] == 0
     assert existing[0]["body"] == ["- 原有事实"] and existing[0]["n"] == 2
+
+
+# ── truncation is not an accepted change ──────────────────────────────────────
+#
+# Reported by review. The write condition included `dropped`, which contradicted
+# its own comment: truncation is our gate firing, not a validated operation. An
+# already-over-budget document (a lowered item cap, or a hand edit) plus a delta
+# whose every op was refused was written anyway — so one `update` with an invented
+# id could delete real entries purely by tripping the size gate.
+
+def _over_budget(layer: str, n: int) -> list[dict]:
+    return [{"id": f"{i:06x}", "title": f"t{i}", "n": 1, "last": "2026-01-01",
+             "body": ["- x"]} for i in range(n)]
+
+
+def test_an_all_refused_delta_never_writes(tmp_path, monkeypatch):
+    """The destructive case: an invented id must not cost real entries."""
+    import asyncio
+
+    from server import auto_memory, knowledge
+
+    monkeypatch.setattr(auto_memory, "MEMORY_DIR", tmp_path)
+    eid = "__test_refuse__"
+    cap = am.max_items_for("project")
+    over = _over_budget("project", cap + 5)
+    auto_memory.write_layer(eid, "project", am.render_entries("project", over))
+    before = auto_memory.read_layer(eid, "project")
+
+    async def fake(command, prompt, timeout=0):
+        # Syntactically valid, every op refused: an id we never wrote.
+        return '[{"op":"update","id":"ffffff","title":"t","fact":"f"}]'
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+    res = asyncio.run(auto_memory.consolidate_layer(
+        eid, "project", [{"source": "s", "content": "c"}], "2026-09-09"))
+    assert res["refused"] == 1
+    assert res["added"] == res["updated"] == res["deleted"] == 0
+    assert auto_memory.read_layer(eid, "project") == before, \
+        "an over-budget document must not be truncated on a refused delta"
+    assert len(am.parse_entries(auto_memory.read_layer(eid, "project"))) == cap + 5
+
+
+def test_truncation_still_rides_along_with_an_accepted_change(tmp_path, monkeypatch):
+    """The gate must not stop working: one real add on an over-budget document
+    still trims it."""
+    import asyncio
+
+    from server import auto_memory, knowledge
+
+    monkeypatch.setattr(auto_memory, "MEMORY_DIR", tmp_path)
+    eid = "__test_trunc__"
+    cap = am.max_items_for("project")
+    auto_memory.write_layer(eid, "project",
+                            am.render_entries("project", _over_budget("project", cap + 5)))
+
+    async def fake(command, prompt, timeout=0):
+        return '[{"op":"add","title":"崭新条目","fact":"事实"}]'
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+    res = asyncio.run(auto_memory.consolidate_layer(
+        eid, "project", [{"source": "s", "content": "c"}], "2026-09-09"))
+    assert res["added"] == 1 and res["dropped"] > 0
+    assert len(am.parse_entries(auto_memory.read_layer(eid, "project"))) == cap

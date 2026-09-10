@@ -596,9 +596,12 @@ async def _run_generate_summary(agent_id: str, date_range: str) -> None:
             today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             tasks = [t for t in tasks if (t.updated_at or "").startswith(today)]
         else:
-            # recent_n: last N completed tasks
+            # recent_n: last N completed tasks. status_value, not str(): status is
+            # a str-Enum whose str() is "TaskStatus.success", so this filter used
+            # to match nothing and the button consolidated an empty task list.
             n = cfg.get("default_task_count", 5)
-            completed = [t for t in tasks if str(t.status) in ("success", "failed")]
+            from server.auto_memory import status_value
+            completed = [t for t in tasks if status_value(t) in ("success", "failed")]
             completed.sort(key=lambda t: t.updated_at or "", reverse=True)
             tasks = completed[:n]
 

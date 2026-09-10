@@ -1852,15 +1852,9 @@ def _window_tasks(tasks: list, window: int) -> list:
     their own task sets (a date, or the last N completed) and are meant to look
     across the whole record.
     """
-    # `.value if hasattr` rather than str(): Task.status is a str-Enum, and
-    # str(TaskStatus.success) is "TaskStatus.success", so a str() comparison
-    # matches nothing and this filter would silently drop every real task.
-    # Same idiom as state.py's active-task check, for the same reason.
-    def _status(t) -> str:
-        s = getattr(t, "status", "")
-        return s.value if hasattr(s, "value") else str(s)
+    from server.auto_memory import status_value
 
-    finished = [t for t in tasks if _status(t) in _TERMINAL_STATUSES]
+    finished = [t for t in tasks if status_value(t) in _TERMINAL_STATUSES]
     finished.sort(key=lambda t: getattr(t, "updated_at", "") or "", reverse=True)
     return finished[:window] if window > 0 else []
 
