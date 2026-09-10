@@ -892,65 +892,66 @@ async def consolidate(
         # time — the trigger fired forever and never saw its own window.
         tasks = sorted(tasks, key=lambda t: getattr(t, "updated_at", "") or "",
                        reverse=True)
-        # Drop messages already fed to a previous pass. A Task is a resumable
-        # conversation while history advances per finished run, so a task resumed
-        # across several windows would otherwise replay its whole transcript
-        # every time. Only on the triggered path, for the same reason as the
-        # history slice: the nightly loop and the 🧠 button are asked to look at
-        # the whole record.
-        marks = read_consumed_marks(eid) if history_window_only else {}
-        endpoints: dict[str, int] = {}
-        if history_window_only:
-            fed, endpoints = slice_new_messages(tasks, marks)
-        else:
-            fed = tasks
-        lesson_signals = extract_lesson_signals(fed)
-        project_signals = extract_project_signals(fed)
-        history_signals = extract_history_signals(
-            eid, consumed if history_window_only else None)
-        await progress(
-            "extracting",
-            f"提取到 {len(lesson_signals)} 条经验信号，"
-            f"{len(project_signals)} 条项目信号，{len(history_signals)} 条近期行动",
-        )
 
+        # Everything below is per layer, because consolidate_layer succeeds or
+        # fails independently. A shared window meant one layer's success consumed
+        # the other's input: a valid `[]` from lessons plus a transient project
+        # timeout dropped those runs' project signals permanently. Keeping the
+        # shared window pending until both succeeded would be worse — the layer
+        # that already consumed it would be re-fed on the retry, inflating `n`.
+        pending = read_pending(eid)
+        extractors = {"lessons": extract_lesson_signals,
+                      "project": extract_project_signals}
         results: dict[str, ConsolidationResult] = {}
-        # History first, for the same prefix reason: it is the window this run
-        # is consuming and about to mark consumed, so it must not be the part
-        # that gets cut. It is also bounded (history.md is ≤4KB), so it can
-        # never crowd out the task signals in turn.
-        await progress("merging", "巩固 lessons.md...")
-        results["lessons"] = await consolidate_layer(
-            eid, "lessons", history_signals + lesson_signals, today, cfg)
-        await progress("merging", "巩固 project.md...")
-        results["project"] = await consolidate_layer(
-            eid, "project", history_signals + project_signals, today, cfg)
-
-        # Only clear the window if at least one layer actually consumed it.
-        # Resetting unconditionally would discard the window whenever the helper
-        # LLM returned nothing usable — the counter would go back to 0 and those
-        # runs would never be looked at again, which is the same silent-data-loss
-        # shape as the old "timeout returns existing_md" behaviour.
-        if any(not r["failed"] for r in results.values()):
-            reset_history_counter(eid, consumed)
-            # Advance the per-task watermarks in the same breath, and only here:
-            # a pass where every layer failed keeps both the history window and
-            # these marks, so the retry sees exactly the same input.
+        for layer in LLM_LAYERS:
+            # Snapshot per layer: everything appended after this point is not in
+            # this layer's signals, so it must survive the subtraction below.
+            window = pending.get(layer, 0) if history_window_only else None
+            marks = read_consumed_marks(eid, layer) if history_window_only else {}
+            endpoints: dict[str, int] = {}
             if history_window_only:
+                fed, endpoints = slice_new_messages(tasks, marks)
+            else:
+                fed = tasks
+            task_signals = extractors[layer](fed)
+            history_signals = extract_history_signals(eid, window)
+            await progress(
+                "extracting",
+                f"{layer}: {len(task_signals)} 条任务信号，"
+                f"{len(history_signals)} 条近期行动",
+            )
+            await progress("merging", f"巩固 {layer}.md...")
+            # History first, for the same prefix reason: it is the window this
+            # pass is consuming and about to mark consumed, so it must not be the
+            # part that gets cut. It is also bounded (history.md is ≤4KB), so it
+            # can never crowd out the task signals in turn.
+            res = await consolidate_layer(
+                eid, layer, history_signals + task_signals, today, cfg)
+            results[layer] = res
+            if res["failed"]:
+                logger.warning(
+                    "%s/%s: failed, keeping this layer's window for a retry", eid, layer
+                )
+                continue
+            if history_window_only:
+                consume_pending(eid, layer, window or 0)
                 # Merged over the existing marks, not replacing them: a task
                 # drops out of the newest-N window and comes back when it is
                 # resumed, and a pruned mark would replay its whole transcript.
                 #
                 # `endpoints`, not a fresh len(task.messages): a user resuming one
                 # of these tasks while the LLM calls are in flight appends
-                # messages that were never in either prompt, and recording them
-                # as consumed would skip that run permanently.
+                # messages that were never in this prompt, and recording them as
+                # consumed would skip that run permanently.
                 marks.update(endpoints)
-                write_consumed_marks(eid, marks)
-        else:
-            logger.warning(
-                "%s: every layer failed, keeping the history window for a retry", eid
-            )
+                write_consumed_marks(eid, layer, marks)
+
+        # The whole-record callers (nightly loop, 🧠 button) consume the window
+        # once for the pass, not once per layer: subtracting `consumed` inside the
+        # loop would deduct it twice and swallow the mid-flight appends the
+        # subtraction exists to preserve.
+        if not history_window_only and any(not r["failed"] for r in results.values()):
+            reset_history_counter(eid, consumed)
 
     totals = {k: sum(r[k] for r in results.values())
               for k in ("added", "updated", "deleted", "refused", "dropped")}
@@ -1055,64 +1056,133 @@ def _counter_path(eid: str):
 
 
 def read_history_counter(eid: str) -> int:
-    p = _counter_path(eid)
-    if not p.exists():
-        return 0
-    try:
-        return int(p.read_text(encoding="utf-8").strip() or 0)
-    except Exception:
-        # A corrupt counter must not wedge consolidation forever.
-        logger.warning("%s: unreadable history counter, treating as 0", eid)
-        return 0
+    """The largest pending window across the LLM layers.
+
+    The trigger threshold reads this: if either layer still owes this window an
+    attempt, the window is worth a pass.
+    """
+    return max(read_pending(eid).values(), default=0)
 
 
 def _bump_history_counter(eid: str) -> int:
-    n = read_history_counter(eid) + 1
-    d = memory_dir(eid)
-    d.mkdir(parents=True, exist_ok=True)
-    _counter_path(eid).write_text(str(n), encoding="utf-8")
-    return n
+    """Advance every LLM layer's pending count; return the largest.
+
+    Per layer, because a pass can succeed for one and fail for the other. The
+    returned maximum is what the trigger threshold reads: if either layer still
+    owes this window an attempt, the window is worth a pass.
+    """
+    pending = read_pending(eid)
+    for layer in LLM_LAYERS:
+        pending[layer] = pending.get(layer, 0) + 1
+    write_pending(eid, pending)
+    return max(pending.values(), default=0)
+
+
+# The two layers a consolidation pass writes. profile is the user's own file and
+# history is written per-run without an LLM, so neither has a pending window.
+LLM_LAYERS = ("lessons", "project")
+
+
+def read_pending(eid: str) -> dict[str, int]:
+    """Unconsumed history rows per LLM layer.
+
+    One count per layer rather than one shared number, because
+    ``consolidate_layer`` succeeds or fails independently: a valid ``[]`` from
+    lessons alongside a transient project timeout used to clear the shared
+    counter, and those runs' project signals were then never looked at again.
+
+    Keeping the *shared* window pending until both layers succeed would have been
+    the other option, and it is worse: the layer that already consumed it would be
+    re-fed the same rows on the retry, inflating ``n`` — the exact corruption the
+    window slicing exists to prevent.
+    """
+    p = _counter_path(eid)
+    if not p.exists():
+        return {}
+    raw = p.read_text(encoding="utf-8").strip()
+    if not raw:
+        return {}
+    try:
+        import json as _json
+        data = _json.loads(raw)
+        if isinstance(data, dict):
+            return {str(k): int(v) for k, v in data.items() if str(k) in LLM_LAYERS}
+    except Exception:
+        pass
+    try:
+        # Migration: the file used to hold one bare integer for both layers.
+        n = int(raw)
+        return {layer: n for layer in LLM_LAYERS}
+    except Exception:
+        logger.warning("%s: unreadable pending counts, treating as empty", eid)
+        return {}
+
+
+def write_pending(eid: str, pending: dict[str, int]) -> None:
+    p = _counter_path(eid)
+    live = {k: v for k, v in pending.items() if v > 0}
+    if not live:
+        if p.exists():
+            try:
+                p.unlink()
+            except Exception:
+                logger.exception("%s: failed to clear pending counts", eid)
+        return
+    try:
+        import json as _json
+        d = memory_dir(eid)
+        d.mkdir(parents=True, exist_ok=True)
+        p.write_text(_json.dumps(live, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        logger.exception("%s: failed to write pending counts", eid)
+
+
+def consume_pending(eid: str, layer: str, consumed: int) -> None:
+    """Subtract the rows *layer* just processed, leaving mid-flight appends.
+
+    Only the layers that actually produced a usable delta call this, so a failed
+    layer keeps its own window for the next append or the nightly run.
+    """
+    pending = read_pending(eid)
+    if layer not in pending:
+        return
+    pending[layer] = max(0, pending[layer] - consumed)
+    write_pending(eid, pending)
 
 
 def reset_history_counter(eid: str, consumed: int | None = None) -> None:
-    """Mark *consumed* appends as processed, or clear the window entirely.
+    """Clear every layer's window, or subtract *consumed* from each.
 
-    *consumed* is the count snapshotted before consolidation started. Tasks
-    finishing while the two LLM calls are in flight bump the same on-disk
-    counter, and those appends were never in the snapshot — clearing the file
-    unconditionally would swallow them, so with ``daily_enabled`` off or a
-    subsequently quiet eid they would never trigger a pass of their own.
-    Subtracting instead leaves the post-snapshot appends counting toward the
-    next threshold.
+    Kept for the callers that legitimately consume the whole window at once (the
+    nightly loop and the 🧠 button, via ``consolidate``); the per-layer path uses
+    ``consume_pending``. *consumed* leaves appends that arrived after the snapshot
+    counting toward the next threshold.
     """
-    p = _counter_path(eid)
-    if consumed is not None:
-        remaining = max(0, read_history_counter(eid) - consumed)
-        if remaining:
-            try:
-                p.write_text(str(remaining), encoding="utf-8")
-            except Exception:
-                logger.exception("%s: failed to decrement history counter", eid)
-            return
-    if p.exists():
-        try:
-            p.unlink()
-        except Exception:
-            logger.exception("%s: failed to reset history counter", eid)
+    if consumed is None:
+        write_pending(eid, {})
+        return
+    pending = read_pending(eid)
+    for layer in list(pending):
+        pending[layer] = max(0, pending[layer] - consumed)
+    write_pending(eid, pending)
 
 
 # Per-task watermark: how many of a task's messages have already been fed to
-# consolidation. Persisted next to the documents, for the same reason the history
-# counter is — a restart must not replay a window.
-_MARKS_FILE = "consumed_marks.json"
+# consolidation. Persisted next to the documents, for the same reason the pending
+# counts are — a restart must not replay a window.
+#
+# One file per LLM layer, because the layers succeed and fail independently: a
+# transient project timeout must not advance the marks that lessons already
+# consumed, and vice versa.
+_MARKS_FILE = "consumed_marks.{layer}.json"
 
 
-def _marks_path(eid: str):
-    return memory_dir(eid) / _MARKS_FILE
+def _marks_path(eid: str, layer: str):
+    return memory_dir(eid) / _MARKS_FILE.format(layer=layer)
 
 
-def read_consumed_marks(eid: str) -> dict[str, int]:
-    p = _marks_path(eid)
+def read_consumed_marks(eid: str, layer: str) -> dict[str, int]:
+    p = _marks_path(eid, layer)
     if not p.exists():
         return {}
     try:
@@ -1120,9 +1190,10 @@ def read_consumed_marks(eid: str) -> dict[str, int]:
         data = _json.loads(p.read_text(encoding="utf-8"))
         return {str(k): int(v) for k, v in data.items()} if isinstance(data, dict) else {}
     except Exception:
-        # Same posture as the counter: corrupt state must not wedge consolidation
-        # forever. Losing the marks costs one replayed window, not correctness.
-        logger.warning("%s: unreadable consumed marks, treating as empty", eid)
+        # Same posture as the pending counts: corrupt state must not wedge
+        # consolidation forever. Losing the marks costs one replayed window, not
+        # correctness.
+        logger.warning("%s/%s: unreadable consumed marks, treating as empty", eid, layer)
         return {}
 
 
@@ -1134,24 +1205,24 @@ def read_consumed_marks(eid: str) -> dict[str, int]:
 MAX_CONSUMED_MARKS = 500
 
 
-def write_consumed_marks(eid: str, marks: dict[str, int]) -> None:
-    """Persist the watermarks, bounded by ``MAX_CONSUMED_MARKS``."""
+def write_consumed_marks(eid: str, layer: str, marks: dict[str, int]) -> None:
+    """Persist *layer*'s watermarks, bounded by ``MAX_CONSUMED_MARKS``."""
     if len(marks) > MAX_CONSUMED_MARKS:
         kept = sorted(marks.items(), key=lambda kv: kv[1], reverse=True)
         kept = kept[:MAX_CONSUMED_MARKS]
         logger.info(
-            "%s: consumed marks over %d, dropped %d lowest watermarks",
-            eid, MAX_CONSUMED_MARKS, len(marks) - len(kept),
+            "%s/%s: consumed marks over %d, dropped %d lowest watermarks",
+            eid, layer, MAX_CONSUMED_MARKS, len(marks) - len(kept),
         )
         marks = dict(kept)
     try:
         import json as _json
         d = memory_dir(eid)
         d.mkdir(parents=True, exist_ok=True)
-        _marks_path(eid).write_text(
+        _marks_path(eid, layer).write_text(
             _json.dumps(marks, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        logger.exception("%s: failed to write consumed marks", eid)
+        logger.exception("%s/%s: failed to write consumed marks", eid, layer)
 
 
 def slice_new_messages(tasks: list, marks: dict[str, int]) -> tuple[list, dict[str, int]]:

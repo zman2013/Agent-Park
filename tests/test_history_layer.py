@@ -355,7 +355,7 @@ def test_a_failed_pass_does_not_advance_the_marks(eid, monkeypatch):
     am.append_history(eid, "a", "success", "run")
     _stub(monkeypatch, "分析完成，没有新增。")
     asyncio.run(am.consolidate(eid, [task], history_window_only=True))
-    assert am.read_consumed_marks(eid) == {}
+    assert am.read_consumed_marks(eid, "lessons") == {}
 
 
 def test_marks_are_merged_not_pruned_to_the_window(eid, monkeypatch):
@@ -366,21 +366,22 @@ def test_marks_are_merged_not_pruned_to_the_window(eid, monkeypatch):
     asyncio.run(am.consolidate(eid, [_RT("old", 4)], history_window_only=True))
     am.append_history(eid, "a", "success", "run 2")
     asyncio.run(am.consolidate(eid, [_RT("new", 2)], history_window_only=True))
-    marks = am.read_consumed_marks(eid)
+    marks = am.read_consumed_marks(eid, "lessons")
     assert marks == {"old": 4, "new": 2}
 
 
 def test_marks_are_bounded(eid):
-    am.write_consumed_marks(eid, {f"t{i}": i for i in range(am.MAX_CONSUMED_MARKS + 50)})
-    marks = am.read_consumed_marks(eid)
+    am.write_consumed_marks(eid, "lessons",
+                            {f"t{i}": i for i in range(am.MAX_CONSUMED_MARKS + 50)})
+    marks = am.read_consumed_marks(eid, "lessons")
     assert len(marks) == am.MAX_CONSUMED_MARKS
     assert min(marks.values()) == 50, "the lowest watermarks are dropped first"
 
 
 def test_corrupt_marks_do_not_wedge_consolidation(eid):
-    am.write_consumed_marks(eid, {"t1": 1})
-    am._marks_path(eid).write_text("not json", encoding="utf-8")
-    assert am.read_consumed_marks(eid) == {}
+    am.write_consumed_marks(eid, "lessons", {"t1": 1})
+    am._marks_path(eid, "lessons").write_text("not json", encoding="utf-8")
+    assert am.read_consumed_marks(eid, "lessons") == {}
 
 
 def test_the_manual_path_still_sees_whole_transcripts(eid, monkeypatch):
@@ -419,7 +420,7 @@ def test_messages_arriving_during_consolidation_are_not_marked_consumed(eid, mon
     monkeypatch.setattr(knowledge, "_llm_call", resume_mid_flight)
     asyncio.run(am.consolidate(eid, [task], history_window_only=True))
     # Two messages were snapshotted and fed; the later arrivals were not.
-    assert am.read_consumed_marks(eid) == {"t1": 2}
+    assert am.read_consumed_marks(eid, "lessons") == {"t1": 2}
 
     seen: list[str] = []
 
@@ -492,3 +493,116 @@ def test_fork_task_records_the_inherited_count():
     st.tasks[src.id] = src
     fork = st.fork_task(src.id, "sess-1")
     assert fork.inherited_messages == 4 == len(fork.messages)
+
+
+# ── per-layer window consumption ──────────────────────────────────────────────
+#
+# Reported by review. `any(not failed)` cleared the shared counter and advanced
+# every watermark, so one layer's success consumed the other's input: a valid `[]`
+# from lessons plus a transient project timeout dropped those runs' project
+# signals permanently.
+#
+# Keeping the *shared* window pending until both succeeded was the other option
+# and is worse — the layer that already consumed it would be re-fed on the retry,
+# inflating `n`, which is the corruption all this slicing exists to prevent.
+
+def _per_layer(monkeypatch, replies: dict[str, str]):
+    """Reply differently per layer, keyed on each prompt's own preamble."""
+    async def fake(command, prompt, timeout=0):
+        layer = "lessons" if "错误经验提取器" in prompt else "project"
+        return replies[layer]
+
+    monkeypatch.setattr(knowledge, "_llm_call", fake)
+
+
+def test_one_layer_failing_does_not_consume_the_others_window(eid, monkeypatch):
+    for i in range(4):
+        am.append_history(eid, "a", "success", f"run {i}")
+    _per_layer(monkeypatch, {"lessons": "[]", "project": "分析完成，没有新增。"})
+    result = asyncio.run(am.consolidate(eid, [], history_window_only=True))
+    assert result["failed_layers"] == ["project"]
+    pending = am.read_pending(eid)
+    assert pending.get("lessons", 0) == 0, "the successful layer consumed its window"
+    assert pending.get("project") == 4, "the failed layer must keep its own window"
+
+
+def test_the_failed_layer_still_sees_the_window_on_the_next_pass(eid, monkeypatch):
+    """The point of the fix: those signals must not be lost."""
+    am.append_history(eid, "agent / t", "success", "只此一次的那件事")
+    _per_layer(monkeypatch, {"lessons": "[]", "project": "分析完成，没有新增。"})
+    asyncio.run(am.consolidate(eid, [], history_window_only=True))
+
+    seen: list[str] = []
+
+    async def capture(command, prompt, timeout=0):
+        seen.append(prompt)
+        return "[]"
+
+    monkeypatch.setattr(knowledge, "_llm_call", capture)
+    asyncio.run(am.consolidate(eid, [], history_window_only=True))
+    project = [p for p in seen if "项目事实提取器" in p]
+    assert project, "the project layer must be prompted again"
+    assert all("只此一次的那件事" in p for p in project)
+
+
+def test_the_successful_layer_is_not_re_fed_on_the_retry(eid, monkeypatch):
+    """The reason per-layer beats 'keep the shared window until both succeed'."""
+    am.append_history(eid, "agent / t", "success", "只此一次的那件事")
+    _per_layer(monkeypatch, {"lessons": '[{"op":"add","title":"T","fact":"F"}]',
+                            "project": "分析完成，没有新增。"})
+    asyncio.run(am.consolidate(eid, [], history_window_only=True))
+
+    seen: list[str] = []
+
+    async def capture(command, prompt, timeout=0):
+        seen.append(prompt)
+        return "[]"
+
+    monkeypatch.setattr(knowledge, "_llm_call", capture)
+    asyncio.run(am.consolidate(eid, [], history_window_only=True))
+    # lessons consumed its window, so it now has no signals at all and
+    # consolidate_layer short-circuits before calling the LLM. Either way the row
+    # must not reach it again; asserting on "no prompt containing it" covers both
+    # the short-circuit and a hypothetical empty-but-present call.
+    lessons = [p for p in seen if "错误经验提取器" in p]
+    assert all("只此一次的那件事" not in p for p in lessons), \
+        "the layer that already consumed this row must not see it again"
+    # And the failed layer *is* called again, which is the other half of the fix.
+    assert [p for p in seen if "项目事实提取器" in p]
+
+
+def test_marks_advance_per_layer_too(eid, monkeypatch):
+    task = _RT("t1", 3)
+    am.append_history(eid, "a", "success", "run")
+    _per_layer(monkeypatch, {"lessons": "[]", "project": "分析完成，没有新增。"})
+    asyncio.run(am.consolidate(eid, [task], history_window_only=True))
+    assert am.read_consumed_marks(eid, "lessons") == {"t1": 3}
+    assert am.read_consumed_marks(eid, "project") == {}, \
+        "a failed layer must not advance its watermarks"
+
+
+def test_the_trigger_reads_the_largest_pending_window(eid, monkeypatch):
+    """If either layer still owes this window an attempt, it is worth a pass."""
+    for i in range(3):
+        am.append_history(eid, "a", "success", f"run {i}")
+    _per_layer(monkeypatch, {"lessons": "[]", "project": "分析完成，没有新增。"})
+    asyncio.run(am.consolidate(eid, [], history_window_only=True))
+    assert am.read_history_counter(eid) == 3, "max across layers, not the minimum"
+
+
+def test_a_legacy_bare_integer_counter_is_migrated(eid):
+    """The file used to hold one number for both layers; a restart across the
+    upgrade must not lose that window."""
+    am.append_history(eid, "a", "success", "run")
+    am._counter_path(eid).write_text("7", encoding="utf-8")
+    assert am.read_pending(eid) == {"lessons": 7, "project": 7}
+    assert am.read_history_counter(eid) == 7
+
+
+def test_both_layers_succeeding_consumes_both_windows(eid, monkeypatch):
+    for i in range(3):
+        am.append_history(eid, "a", "success", f"run {i}")
+    _stub(monkeypatch, '[{"op":"add","title":"T","fact":"F"}]')
+    asyncio.run(am.consolidate(eid, [], history_window_only=True))
+    assert am.read_pending(eid) == {}
+    assert not am._counter_path(eid).exists(), "a fully consumed window leaves no file"
