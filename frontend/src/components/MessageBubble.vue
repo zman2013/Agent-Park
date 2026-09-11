@@ -16,19 +16,26 @@
       <div v-if="expanded" class="mt-2">
         <div class="prose prose-sm prose-invert max-w-none text-xs" v-html="writeContentRendered"></div>
       </div>
-      <button
-        @click="copyWriteContent"
-        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
-        title="复制文件内容"
-      >
-        复制
-      </button>
-      <button
-        v-if="taskId && taskHasSession && message.cco_uuid"
-        @click="forkAtMessage"
-        class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
-        title="从此处 Fork 新 session"
-      >⑂</button>
+      <div class="absolute top-1 right-2 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+        <span
+          v-if="timestampText"
+          class="text-[11px] font-mono text-gray-500"
+          :title="timestampTitle"
+        >{{ timestampText }}</span>
+        <button
+          v-if="taskId && taskHasSession && message.cco_uuid"
+          @click="forkAtMessage"
+          class="text-gray-500 hover:text-blue-400 transition-colors p-1 text-xs"
+          title="从此处 Fork 新 session"
+        >⑂</button>
+        <button
+          @click="copyWriteContent"
+          class="text-gray-500 hover:text-gray-200 transition-colors p-1 text-xs"
+          title="复制文件内容"
+        >
+          复制
+        </button>
+      </div>
       <div
         v-if="usageBadge"
         class="mt-1 text-[11px] font-mono"
@@ -54,19 +61,26 @@
       <div v-if="expanded" class="mt-2 text-xs">
         <pre class="whitespace-pre-wrap text-gray-400 overflow-x-auto max-h-60 overflow-y-auto">{{ formattedToolInput }}</pre>
       </div>
-      <button
-        @click="copyToolUseContent"
-        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
-        title="复制工具参数"
-      >
-        复制
-      </button>
-      <button
-        v-if="taskId && taskHasSession && message.cco_uuid"
-        @click="forkAtMessage"
-        class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
-        title="从此处 Fork 新 session"
-      >⑂</button>
+      <div class="absolute top-1 right-2 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+        <span
+          v-if="timestampText"
+          class="text-[11px] font-mono text-gray-500"
+          :title="timestampTitle"
+        >{{ timestampText }}</span>
+        <button
+          v-if="taskId && taskHasSession && message.cco_uuid"
+          @click="forkAtMessage"
+          class="text-gray-500 hover:text-blue-400 transition-colors p-1 text-xs"
+          title="从此处 Fork 新 session"
+        >⑂</button>
+        <button
+          @click="copyToolUseContent"
+          class="text-gray-500 hover:text-gray-200 transition-colors p-1 text-xs"
+          title="复制工具参数"
+        >
+          复制
+        </button>
+      </div>
       <div
         v-if="usageBadge"
         class="mt-1 text-[11px] font-mono"
@@ -91,13 +105,20 @@
       <div v-if="expanded" class="mt-2 text-xs">
         <pre class="whitespace-pre-wrap text-gray-400 overflow-x-auto max-h-80 overflow-y-auto">{{ message.content }}</pre>
       </div>
-      <button
-        @click="copyContent"
-        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
-        title="复制结果内容"
-      >
-        复制
-      </button>
+      <div class="absolute top-1 right-2 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+        <span
+          v-if="timestampText"
+          class="text-[11px] font-mono text-gray-500"
+          :title="timestampTitle"
+        >{{ timestampText }}</span>
+        <button
+          @click="copyContent"
+          class="text-gray-500 hover:text-gray-200 transition-colors p-1 text-xs"
+          title="复制结果内容"
+        >
+          复制
+        </button>
+      </div>
     </div>
 
     <!-- Regular text message -->
@@ -144,20 +165,28 @@
         :title="usageTooltip"
       >{{ usageBadge }}</div>
 
-      <button
-        v-if="!message.streaming"
-        @click="copyContent"
-        class="absolute top-1 right-2 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-gray-200 transition-all p-1 text-xs"
-        title="复制"
-      >
-        复制
-      </button>
-      <button
-        v-if="taskId && taskHasSession && message.role === 'agent' && !message.streaming && message.cco_uuid"
-        @click="forkAtMessage"
-        class="absolute top-1 right-10 opacity-0 group-hover:opacity-100 text-gray-500 hover:text-blue-400 transition-all p-1 text-xs"
-        title="从此处 Fork 新 session"
-      >⑂</button>
+      <div class="absolute top-1 right-2 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+        <span
+          v-if="timestampText"
+          class="text-[11px] font-mono"
+          :class="message.role === 'user' ? 'text-gray-300' : 'text-gray-500'"
+          :title="timestampTitle"
+        >{{ timestampText }}</span>
+        <button
+          v-if="taskId && taskHasSession && message.role === 'agent' && !message.streaming && message.cco_uuid"
+          @click="forkAtMessage"
+          class="text-gray-500 hover:text-blue-400 transition-colors p-1 text-xs"
+          title="从此处 Fork 新 session"
+        >⑂</button>
+        <button
+          v-if="!message.streaming"
+          @click="copyContent"
+          class="text-gray-500 hover:text-gray-200 transition-colors p-1 text-xs"
+          title="复制"
+        >
+          复制
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -301,6 +330,24 @@ const contentPreview = computed(() => {
 })
 
 const toolDescription = computed(() => parsedToolInput.value?.description || '')
+
+// Messages persisted before created_at existed have an empty value — render
+// nothing rather than an epoch or "Invalid Date".
+const timestampText = computed(() => {
+  const raw = props.message.created_at
+  if (!raw) return ''
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) return ''
+  return d.toLocaleTimeString('zh-CN', { hour12: false })
+})
+
+const timestampTitle = computed(() => {
+  const raw = props.message.created_at
+  if (!raw) return ''
+  const d = new Date(raw)
+  if (Number.isNaN(d.getTime())) return ''
+  return d.toLocaleString('zh-CN', { hour12: false })
+})
 
 function formatTokens(n) {
   if (!n && n !== 0) return ''

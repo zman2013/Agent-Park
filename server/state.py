@@ -97,6 +97,10 @@ class AppState:
                         # while the user's browser was closed).
                         for msg in tdata.get("messages", []):
                             msg["streaming"] = False
+                            # Pre-existing transcripts have no created_at; leave
+                            # it empty so the UI omits the timestamp rather than
+                            # showing this load time.
+                            msg.setdefault("created_at", "")
                         task = Task(**tdata)
                         # Restore extra metadata as dynamic attributes
                         for k, v in extra.items():
@@ -250,6 +254,7 @@ class AppState:
                 tool_name=m.tool_name,
                 streaming=False,
                 cco_uuid=m.cco_uuid,
+                created_at=m.created_at,
             ))
 
         task = Task(
