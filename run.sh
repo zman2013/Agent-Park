@@ -222,12 +222,12 @@ stop_one() {
 
 do_stop() {
     stop_one "frontend" "$FRONTEND_PID"
-    # backend's shutdown() waits up to 10s for in-flight agent subprocesses to
-    # finalize, then drains pending Feishu notifications. Same-task
-    # notifications coalesce (at most one in flight plus one pending), so that
-    # drain is bounded by NOTIFY_DRAIN_BASE_SECONDS × task_notify.MAX_SERIAL_SENDS
-    # (40 × 2 = 80s in agent_runner.py) — give it enough grace to clear both
-    # before force-killing.
+    # backend's shutdown() bounds ALL of its waits (subprocess SIGTERM/SIGKILL,
+    # notification drain, consolidation drain/cancel) by one shared budget:
+    # SHUTDOWN_TOTAL_BUDGET_SECONDS in agent_runner.py (90s). That budget must stay
+    # below the grace here, or this force-kill lands before the notification and
+    # helper-process cleanup can run (dropping a card / orphaning the glm-cco CLI).
+    # Guarded by test_shutdown_budget_fits_run_sh_backend_grace.
     stop_one "backend"  "$BACKEND_PID" 95
     echo "所有服务已停止"
 }

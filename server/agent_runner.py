@@ -19,6 +19,7 @@ import os
 import pty
 import signal
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,15 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 # under run.sh's force-kill grace for the backend.
 NOTIFY_DRAIN_BASE_SECONDS = 40
 
+# 通知被取消后，留给它 kill-and-reap CLI 子进程的时间。send_feishu_card 的取消分支
+# 走 SIGKILL 再 reap，正常瞬间完成；这个窗口是为"取消一定有机会跑完"而存在的下限。
+#
+# 为什么必须单独留额度：17s（SIGTERM/SIGKILL/cancel）+ 80s（通知 drain）+ 13s
+# （consolidation drain/cancel）= 110s，本来就装不进 90s 总预算，通知 drain 注定被
+# 压缩。被压缩本身可以接受（最坏是丢掉最新那张卡，下次启动没有补发义务），但绝不能连
+# 收尾都没时间跑 —— 那样 feishu-bot CLI 子进程会在后端退出后成为孤儿。
+NOTIFY_KILL_SECONDS = 5
+
 # shutdown()'s drain window for history-triggered consolidations. Deliberately
 # small: the notify drain above can already consume 80s of run.sh's 95s
 # force-kill grace, so there is no room to wait out a consolidation's LLM calls
@@ -57,6 +67,32 @@ CONSOLIDATE_DRAIN_SECONDS = 5
 CONSOLIDATE_KILL_SECONDS = 8
 
 
+# shutdown() 的总预算。run.sh 的 backend stop grace 是 95s（见 do_stop）：超时它就
+# kill -9 后端，届时通知卡的收尾、consolidation 的 kill-and-reap 都不会再跑（前者丢卡，
+# 后者把 glm/cco 子进程留成孤儿）。各阶段若各自独立计时再相加，最坏情况是
+# 10(SIGTERM) + 5(SIGKILL) + 2(cancel) + 80(notify) + 5 + 8(consolidate) = 110s，
+# 已经越过那道线。所以所有等待共享这一个截止时间，而不是逐段累加。
+# 留 5s 余量给 uvicorn 自身的 lifespan/连接收尾。
+SHUTDOWN_TOTAL_BUDGET_SECONDS = 90
+
+# 进程组两阶段各自的上限（仍与总预算取小）。抽成常量+访问器，和下面通知/consolidation
+# 的窗口同一套写法：数字有名字可讲，测试也能压小它们而不必真的等满 10+5 秒。
+SHUTDOWN_SIGTERM_GRACE_SECONDS = 10
+SHUTDOWN_SIGKILL_GRACE_SECONDS = 5
+
+
+def _sigterm_grace_seconds() -> int:
+    return SHUTDOWN_SIGTERM_GRACE_SECONDS
+
+
+def _sigkill_grace_seconds() -> int:
+    return SHUTDOWN_SIGKILL_GRACE_SECONDS
+
+
+def _shutdown_total_budget_seconds() -> int:
+    return SHUTDOWN_TOTAL_BUDGET_SECONDS
+
+
 def _consolidate_drain_seconds() -> int:
     return CONSOLIDATE_DRAIN_SECONDS
 
@@ -69,6 +105,10 @@ def _notify_drain_max_seconds() -> int:
     from server.task_notify import MAX_SERIAL_SENDS
 
     return NOTIFY_DRAIN_BASE_SECONDS * MAX_SERIAL_SENDS
+
+
+def _notify_kill_seconds() -> int:
+    return NOTIFY_KILL_SECONDS
 
 
 class _RunContext:
@@ -571,6 +611,15 @@ class AgentRunner:
         self._pids: dict[str, int] = {}           # task_id -> child pid
         self._master_fds: dict[str, int] = {}     # task_id -> pty master fd
         self._async_procs: dict[str, asyncio.subprocess.Process] = {}  # task_id -> pipe-mode proc
+        # task_id -> leader's /proc start time, read at spawn. Gates every signal
+        # so a recycled pid/pgid cannot absorb a kill aimed at our group.
+        self._proc_starts: dict[str, int | None] = {}
+        # task_ids whose kill_task ended without proof that the group is gone
+        # (闸门因 _GROUP_UNKNOWN 拒发，或组扛过了 SIGKILL)。_cleanup_run_resources
+        # 见到它就保留 subprocess_pid，让下次启动的 restore_orphan_tasks 再试一次。
+        # 只管"这一轮别把 pid 清掉"；跨 resume 的把手另记在任务的 retained_pgids
+        # 元数据里（见 _record_retained_pgid），因为新进程会覆盖 subprocess_pid。
+        self._retain_pid: set[str] = set()
         self._adapters: dict[str, BaseAdapter] = {}  # task_id -> active adapter
         self._session_ids: dict[str, str] = self._load_sessions()
         self._resuming: set[str] = set()          # task_ids being killed for resume
@@ -688,7 +737,7 @@ class AgentRunner:
         # keyed _subprocess_tasks/_pids/_async_procs/_pty_read_transports
         # entries below and making the old run invisible to a task_id-keyed
         # lookup.
-        self._live_runs[run_id] = {}
+        self._live_runs[run_id] = {"task_id": task_id}
 
         t = asyncio.create_task(
             self._run_subprocess(task_id, prompt, run_id),
@@ -881,6 +930,7 @@ class AgentRunner:
         self._pids.pop(task_id, None)
         self._master_fds.pop(task_id, None)
         self._async_procs.pop(task_id, None)
+        self._proc_starts.pop(task_id, None)
         self._adapters.pop(task_id, None)
         self._session_baselines.pop(task_id, None)
         # Note: _run_start_index is intentionally NOT cleared here, for the same
@@ -899,9 +949,14 @@ class AgentRunner:
         # Clear persisted PID — subprocess is gone
         task = app_state.get_task(task_id)
         if task:
-            object.__setattr__(task, "subprocess_pid", None)
-            object.__setattr__(task, "subprocess_start_time", None)
-            app_state.save_agent_tasks(task.agent_id)
+            # 除非 kill_task 没能证明组已消失：那时 pid 元数据是残留后代唯一的把手，
+            # 清掉就等于把可恢复的孤儿换成永久的孤儿。留着最多下次启动多查一次。
+            if task_id in self._retain_pid:
+                self._retain_pid.discard(task_id)
+            else:
+                object.__setattr__(task, "subprocess_pid", None)
+                object.__setattr__(task, "subprocess_start_time", None)
+                app_state.save_agent_tasks(task.agent_id)
 
     async def maybe_dispatch_auto_compact(self, task_id: str, *, success: bool) -> None:
         """Dispatch `/compact` as next input if this turn crossed the auto-compact threshold.
@@ -1026,14 +1081,21 @@ class AgentRunner:
             os.close(slave_fd)
             self._pids[task_id] = pid
             self._master_fds[task_id] = master_fd
+            # 与 pipe 路径一致：身份在 spawn 时读一次并记进 _live_runs，shutdown 的每
+            # 一发信号都按它过闸门。等到 shutdown 时才现读的话，leader 可能已经被回收，
+            # 读到的是复用者的身份 —— 那会把陌生人的组当成我们的登记进信号集合。
+            leader_start = _read_proc_start_time(pid)
             if run_id in self._live_runs:
                 self._live_runs[run_id]["pid"] = pid
+                self._live_runs[run_id]["pid_start"] = leader_start
             # Persist PID to task for orphan recovery
             task = app_state.get_task(task_id)
             if task:
                 object.__setattr__(task, "subprocess_pid", pid)
-                object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pid))
+                object.__setattr__(task, "subprocess_start_time", leader_start)
                 app_state.save_agent_tasks(task.agent_id)
+            # 同 pipe 路径：元数据已换成这个新进程，旧 run 的保留标记不再适用。
+            self._retain_pid.discard(task_id)
 
             logger.info("Spawned %s pid=%d for task %s (pty mode)", args[0], pid, task_id)
 
@@ -1051,6 +1113,12 @@ class AgentRunner:
                     loop.call_soon_threadsafe(wait_future.set_result, rc)
 
             threading.Thread(target=_wait_child, daemon=True).start()
+
+            if run_id in self._live_runs:
+                # PTY 没有 pipe 的 proc 句柄，"这个 pid 还是不是我们自己的子进程"只能
+                # 靠这个 future：未 done 即代表还没 waitpid 回收，号码不会被内核出让。
+                # shutdown 用它决定能不能补读 leader 身份、能不能按自家子进程直投。
+                self._live_runs[run_id]["reaped"] = wait_future
 
             reader = asyncio.StreamReader()
             read_protocol = asyncio.StreamReaderProtocol(reader)
@@ -1131,10 +1199,42 @@ class AgentRunner:
             stderr=asyncio.subprocess.PIPE,
             cwd=agent_cwd or None,
             env=env,
+            # Own process group, so kill_task/shutdown can signal the whole
+            # tree via killpg like the PTY path already does (which gets its
+            # group from os.setsid in the child). Agent commands are wrapper
+            # scripts — `codexgpt` execs `ept codex`, which spawns a node
+            # launcher, which spawns the real binary — and proc.terminate()
+            # only reaches the outermost one. A surviving grandchild keeps
+            # codex's per-thread writer lock held, so the next resume dies
+            # with "thread ... already has an active writer" and the task can
+            # never be continued.
+            start_new_session=True,
         )
         self._async_procs[task_id] = proc
+        # Read once, at spawn, while the pid provably still refers to this child.
+        # Every later signal to this pgid is gated on it (see _killpg_verified) so
+        # a reused number cannot inherit a kill aimed at our group.
+        leader_start = _read_proc_start_time(proc.pid)
+        self._proc_starts[task_id] = leader_start
         if run_id in self._live_runs:
             self._live_runs[run_id]["proc"] = proc
+            # killpg target for shutdown(), which otherwise only has `proc`
+            # and would again leave the grandchildren running.
+            self._live_runs[run_id]["pid"] = proc.pid
+            self._live_runs[run_id]["pid_start"] = leader_start
+
+        # Persist PID for orphan recovery, same as the PTY path. Without this a
+        # pipe-mode subprocess that outlives a server restart is invisible to
+        # restore_orphan_tasks, and its lingering process group keeps holding
+        # the thread writer lock.
+        task = app_state.get_task(task_id)
+        if task:
+            object.__setattr__(task, "subprocess_pid", proc.pid)
+            object.__setattr__(task, "subprocess_start_time", leader_start)
+            app_state.save_agent_tasks(task.agent_id)
+        # 元数据现在描述的是这个新进程，上一轮 kill_task 留下的保留标记对它无效
+        # （resume 时旧 run 的 cleanup 可能因 run_id 不匹配提前返回而没消费掉它）。
+        self._retain_pid.discard(task_id)
 
         logger.info("Spawned %s pid=%d for task %s (pipe mode)", args[0], proc.pid, task_id)
 
@@ -1547,6 +1647,28 @@ class AgentRunner:
 
     # ── kill ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _record_retained_pgid(
+        task_id: str, pgid: int, leader_start: int | None
+    ) -> None:
+        """记下一个"没能证明已消失"的进程组，与 subprocess_pid 分开存。
+
+        subprocess_pid 描述的是"当前这一轮跑的是谁"，resume 会理所当然地覆盖它。
+        但一个扛过 SIGKILL、或身份始终核验不出来的组，可能还握着 codex 的 writer
+        lock；覆盖之后它就没有任何把手了。retained_pgids 是一份 append-only 的
+        (pgid, leader_start) 列表，只由 restore_orphan_tasks 在证明其消失后摘除。
+        """
+        task = app_state.get_task(task_id)
+        if task is None:
+            return
+        retained = list(getattr(task, "retained_pgids", None) or [])
+        entry = [pgid, leader_start]
+        # 同一个组反复 kill 不该堆重复项。身份一起比，被回收的号是不同的条目。
+        if entry not in retained:
+            retained.append(entry)
+            object.__setattr__(task, "retained_pgids", retained)
+            app_state.save_agent_tasks(task.agent_id)
+
     async def kill_task(self, task_id: str) -> None:
         """Terminate subprocess for a task."""
         # Note: _compact_warned is intentionally NOT cleared here. send_input()
@@ -1576,17 +1698,80 @@ class AgentRunner:
                 except ProcessLookupError:
                     pass
 
-        # Pipe mode: kill asyncio subprocess
+        # Pipe mode: kill the whole process group, not just the direct child.
+        # proc.terminate() alone left grandchildren running (see the
+        # start_new_session comment in _run_pipe_mode), and a survivor holding
+        # codex's thread writer lock makes every later resume fail. Signal by
+        # pgid first and fall back to the bare pid if the group is already gone.
         proc = self._async_procs.pop(task_id, None)
-        if proc and proc.returncode is None:
+        leader_start = self._proc_starts.pop(task_id, None)
+        if proc is not None:
+            # Not gated on proc.returncode: the bug being fixed here is exactly
+            # a dead wrapper whose descendants outlived it, and those orphans
+            # stay in the group even after the direct child is reaped. That also
+            # means the pid may already be free, so each delivery is gated on the
+            # leader's recorded start time — otherwise dropping the returncode
+            # guard would let a reused pgid absorb this kill.
+            state = _GROUP_UNKNOWN
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                sent = _killpg_verified(proc.pid, leader_start, sig)
+                if not sent and proc.returncode is None:
+                    # Group unreachable or no longer ours, but our own direct
+                    # child is provably still alive — signal it by handle, which
+                    # cannot be confused by pid reuse.
+                    try:
+                        if sig == signal.SIGTERM:
+                            proc.terminate()
+                        else:
+                            proc.kill()
+                    except ProcessLookupError:
+                        pass
+                if sig == signal.SIGTERM:
+                    await asyncio.sleep(0.5)
+                    # Escalate on the process group, not on proc.returncode: a
+                    # wrapper that exits promptly on SIGTERM says nothing about a
+                    # descendant that ignored it, and that descendant is exactly
+                    # the writer-lock holder this kill exists to remove.
+                    #
+                    # Only _GROUP_GONE stops the escalation. _GROUP_UNKNOWN means
+                    # we could not verify, which is not evidence of death —
+                    # breaking on it would skip SIGKILL on a live descendant.
+                    # _GROUP_FOREIGN means the pgid is someone else's now, so
+                    # there is nothing of ours left to escalate against.
+                    state = _group_state(proc.pid, leader_start)
+                    if state in (_GROUP_GONE, _GROUP_FOREIGN):
+                        break
+                else:
+                    # SIGKILL 也不是同步的：卡在不可中断等待里的成员会让它挂起。
+                    # 和 restore_orphan_tasks 一样先轮询等一小会儿，再下最终判决，
+                    # 否则一个其实马上就会死的组会被误判成"扛过了 SIGKILL"。
+                    for _ in range(10):
+                        state = _group_state(proc.pid, leader_start)
+                        if state in (_GROUP_GONE, _GROUP_FOREIGN):
+                            break
+                        await asyncio.sleep(0.1)
+            # 最终判决：只有 gone/foreign 才算"我们这边已经没有活口"。
+            # _GROUP_OURS 表示组扛过了 SIGKILL，_GROUP_UNKNOWN 表示两次投递都被闸门
+            # 拒绝（/proc 一直读不全），两者都不是死亡证据 —— 而直接子进程可能已经
+            # 因为 handle 版 SIGTERM 退出，pgid 就成了残留后代（codex writer lock 的
+            # 持有者）唯一的把手。标记一下，别让 _cleanup_run_resources 把它清掉。
+            if state not in (_GROUP_GONE, _GROUP_FOREIGN):
+                self._retain_pid.add(task_id)
+                # subprocess_pid 只够撑到本次 cleanup：send_input 默认 kill 完立刻
+                # 起新进程，spawn 会把它覆盖成新 pid，这个也许还活着的旧组就再也
+                # 找不回来了（新 run 若同样卡在 writer lock 上失败，它的 cleanup
+                # 清掉的是新 pid）。所以另存一份带身份的把手，与当前 run 无关。
+                self._record_retained_pgid(task_id, proc.pid, leader_start)
+                logger.error(
+                    "Group pgid=%d (task %s) not verifiably gone after kill_task; "
+                    "retaining pid metadata for startup retry",
+                    proc.pid, task_id,
+                )
+            # Reap the process so it does not linger as a zombie holding the
+            # asyncio transport open.
             try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            await asyncio.sleep(0.5)
-            try:
-                proc.kill()
-            except ProcessLookupError:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, ProcessLookupError):
                 pass
 
         fd = self._master_fds.pop(task_id, None)
@@ -1612,6 +1797,14 @@ class AgentRunner:
         self._compact_warned.discard(task_id)
         self._compact_pending.discard(task_id)
         self._handoff_pending.discard(task_id)
+        # 任务已被删除，没有下一次启动可以重试它的组了。
+        self._retain_pid.discard(task_id)
+        # 同理，retained_pgids 会随任务一起消失，所以在丢掉把手前用掉它：闸门保证
+        # 只有仍属于我们的组会收到信号，被回收的号不会被误杀。不等待确认 —— 这里是
+        # 请求线程，删除路径也没有下一次可以重试了。
+        task = app_state.get_task(task_id)
+        for pgid, leader_start in list(getattr(task, "retained_pgids", None) or []):
+            _killpg_verified(pgid, leader_start, signal.SIGKILL)
         self._run_start_index.pop(task_id, None)
         self._input_locks.pop(task_id, None)
         # Cleared here, not in _cleanup_run_resources: the snapshot must outlive
@@ -1633,7 +1826,22 @@ class AgentRunner:
         """
         cleaned: list[str] = []
         for task in list(app_state.tasks.values()):
-            if task.status.value not in ("running", "waiting"):
+            # Also revisit already-failed tasks that still carry pid metadata.
+            # A group that outlives SIGKILL keeps its pid recorded precisely so a
+            # later startup can retry; without this clause that retry never
+            # happens, since the task was marked failed on the way out and the
+            # status filter alone would skip it forever.
+            #
+            # Restricted to `failed`, not "anything not running": _finish_task
+            # persists a successful status before _cleanup_run_resources clears
+            # and persists the pid, so a crash in that window leaves a genuinely
+            # successful task holding a stale pid. Admitting it here would
+            # rewrite a completed result to failed on the next startup.
+            retry_pid = (
+                task.status == TaskStatus.failed
+                and getattr(task, "subprocess_pid", None) is not None
+            )
+            if task.status.value not in ("running", "waiting") and not retry_pid:
                 continue
             pid = getattr(task, "subprocess_pid", None)
             expected_start_time = getattr(task, "subprocess_start_time", None)
@@ -1658,14 +1866,114 @@ class AgentRunner:
                 or actual_start_time is None
                 or str(actual_start_time) != str(expected_start_time)
             ):
-                logger.warning(
-                    "Orphan task %s pid identity check failed (pid=%d expected_start=%s actual_start=%s); "
-                    "skip signaling and mark failed",
-                    task_id,
-                    pid,
-                    expected_start_time,
-                    actual_start_time,
-                )
+                # The leader is gone, but the group it created can outlive it —
+                # that orphaned-descendant shape is precisely what holds codex's
+                # thread writer lock and makes every later resume fail. The
+                # recorded pid doubles as the pgid (both the PTY path's setsid
+                # child and pipe mode's start_new_session child lead their own
+                # group), so surviving members stay addressable with no leader
+                # to identify. Signal them individually: killpg would need the
+                # group to still exist as such, and we do not trust `pid` here.
+                #
+                # Gated on _pid_is_absent, NOT on actual_start_time being None.
+                # A None start time also covers a transient stat read/parse
+                # failure on a pid that still exists, and a live stranger that
+                # called setsid leads a group whose pgid equals that same pid —
+                # signaling it would kill an unrelated tree.
+                #
+                # ENOENT is only a point-in-time observation, so it is checked
+                # again after enumeration: nothing stops the kernel from handing
+                # this number out in between, and a new leader claiming it would
+                # create a group with this very pgid that _pgroup_member_ids
+                # would happily return. Absent before AND after means no such
+                # window opened. Members carry their start times so the kill
+                # itself is identity-checked too (see _kill_verified).
+                survivors: list[tuple[int, int | None]] = []
+                # "扫不全" 必须传递到下面的无幸存者分支：此处 leader 已缺席，
+                # 那条分支的保留条件全靠 pid 还在，判不出这种情况，元数据会被
+                # 直接清掉，而没被看见的后代及其 writer lock 就永远回收不了。
+                scan_incomplete = False
+                if _pid_is_absent(pid):
+                    survivors, scan_complete = _scan_pgroup(pid)
+                    if not _pid_is_absent(pid):
+                        logger.warning(
+                            "Orphan task %s pid=%d was re-allocated while enumerating its "
+                            "group; skip signaling to avoid killing an unrelated tree",
+                            task_id, pid,
+                        )
+                        survivors = []
+                    elif not scan_complete:
+                        logger.warning(
+                            "Orphan task %s pid=%d group scan was incomplete; skip "
+                            "signaling this round",
+                            task_id, pid,
+                        )
+                        survivors = []
+                        scan_incomplete = True
+                if survivors:
+                    logger.warning(
+                        "Orphan task %s leader pid=%d is gone but %d process(es) remain in "
+                        "its group; signaling them directly",
+                        task_id,
+                        pid,
+                        len(survivors),
+                    )
+                    for member, member_start in survivors:
+                        _kill_verified(member, member_start)
+                    # Re-enumerate rather than assume the kills took: a member
+                    # wedged uninterruptibly keeps SIGKILL pending, and one
+                    # forked after enumeration was never signaled at all. If any
+                    # remain — or if the scan could not see all of /proc — keep
+                    # the pgid, it is the only handle on them.
+                    still, complete = _scan_pgroup(pid)
+                    if still or not complete or not _pid_is_absent(pid):
+                        logger.error(
+                            "Orphan task %s group pgid=%d not provably empty after "
+                            "verified kills (members=%d complete=%s); retaining pid "
+                            "metadata for a later retry",
+                            task_id, pid, len(still), complete,
+                        )
+                        task.status = TaskStatus.failed
+                        app_state.save_agent_tasks(task.agent_id)
+                        cleaned.append(task_id)
+                        continue
+                else:
+                    # No survivors to signal. Distinguish "the pid is genuinely
+                    # gone / re-leased" from "we could not read it": the latter
+                    # may still be our live group, and clearing the pid here
+                    # would strip the failed-task retry of the only handle it
+                    # has, leaving the writer lock held forever.
+                    #
+                    # 三种 "读不出来" 都要保留元数据，它们都不是 "已消失" 的证据：
+                    #   1. 组扫描不完整 —— 空成员列表只代表没看全，不代表组为空；
+                    #   2. pid 还在但当前身份读不出来 —— 可能就是我们的组；
+                    #   3. pid 还在但记录的身份缺失（启动时 _read_proc_start_time
+                    #      瞬时失败，只持久化了 subprocess_pid）—— 缺的是比对基准，
+                    #      不是身份校验失败，同样无权判定这个活着的进程与我们无关。
+                    pid_held = not _pid_is_absent(pid)
+                    if scan_incomplete or (
+                        pid_held
+                        and (actual_start_time is None or expected_start_time is None)
+                    ):
+                        logger.error(
+                            "Orphan task %s pid=%d identity/group could not be verified "
+                            "(scan_incomplete=%s expected_start=%s actual_start=%s); "
+                            "retaining pid metadata for a later retry",
+                            task_id, pid, scan_incomplete,
+                            expected_start_time, actual_start_time,
+                        )
+                        task.status = TaskStatus.failed
+                        app_state.save_agent_tasks(task.agent_id)
+                        cleaned.append(task_id)
+                        continue
+                    logger.warning(
+                        "Orphan task %s pid identity check failed (pid=%d expected_start=%s actual_start=%s); "
+                        "skip signaling and mark failed",
+                        task_id,
+                        pid,
+                        expected_start_time,
+                        actual_start_time,
+                    )
                 task.status = TaskStatus.failed
                 object.__setattr__(task, "subprocess_pid", None)
                 object.__setattr__(task, "subprocess_start_time", None)
@@ -1675,18 +1983,15 @@ class AgentRunner:
 
             # Kill the surviving process — we've lost the PTY fd and
             # cannot recover the I/O channel.
-            try:
-                os.killpg(pid, signal.SIGTERM)
-                logger.info("Sent SIGTERM to orphan pid %d (task %s)", pid, task_id)
-            except ProcessLookupError:
-                pass
-            except Exception:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                except Exception:
-                    pass
+            #
+            # Escalate to SIGKILL before clearing subprocess_pid below: this is
+            # the last moment we hold the group's identity, so a worker that
+            # ignores SIGTERM would otherwise keep codex's writer lock forever
+            # with no metadata left to find it by. Every delivery re-verifies the
+            # leader identity: the check above establishes ownership only at that
+            # instant, and the group can exit and have its pgid re-leased during
+            # the waits below.
+            final_state = _terminate_group_blocking(pid, expected_start_time)
 
             # Also reap zombie children
             try:
@@ -1697,14 +2002,53 @@ class AgentRunner:
                 pass
 
             task.status = TaskStatus.failed
-            object.__setattr__(task, "subprocess_pid", None)
-            object.__setattr__(task, "subprocess_start_time", None)
+            if final_state in (_GROUP_OURS, _GROUP_UNKNOWN):
+                # Keep subprocess_pid/start_time: the group outlived SIGKILL (or
+                # could not be verified at all), so the next startup should get
+                # another chance at it rather than inherit a task marked failed
+                # with no way to find its process. Retaining on UNKNOWN is the
+                # conservative half of that: a stale pid costs one extra check
+                # next boot, a discarded live one costs a permanent writer lock.
+                logger.error(
+                    "Orphan group pgid=%d (task %s) is %s after SIGKILL; retaining pid "
+                    "metadata so a later restart can retry",
+                    pid, task_id, final_state,
+                )
+            else:
+                object.__setattr__(task, "subprocess_pid", None)
+                object.__setattr__(task, "subprocess_start_time", None)
             logger.info(
                 "Orphan task %s (pid=%d) terminated and marked as failed",
                 task_id, pid,
             )
             app_state.save_agent_tasks(task.agent_id)
             cleaned.append(task_id)
+        # 扫一遍 retained_pgids：这些是历次 kill_task 没能证明消失、又被后续 resume
+        # 的新 pid 从 subprocess_pid 里挤掉的旧组。它们与任务当前状态无关（任务可能
+        # 已经成功跑完好几轮了），所以独立成一趟，只按身份核验、按身份收割。
+        for task in list(app_state.tasks.values()):
+            retained = list(getattr(task, "retained_pgids", None) or [])
+            if not retained:
+                continue
+            survivors: list[list] = []
+            for pgid, leader_start in retained:
+                state = _terminate_group_blocking(pgid, leader_start)
+                if state in (_GROUP_GONE, _GROUP_FOREIGN):
+                    logger.info(
+                        "Retained group pgid=%d (task %s) is %s; dropping the handle",
+                        pgid, task.id, state,
+                    )
+                    continue
+                # 仍是 OURS/UNKNOWN：没有死亡证据，把手必须留到下次启动。
+                logger.error(
+                    "Retained group pgid=%d (task %s) is %s after SIGKILL; keeping the "
+                    "handle for a later restart",
+                    pgid, task.id, state,
+                )
+                survivors.append([pgid, leader_start])
+            if survivors != retained:
+                object.__setattr__(task, "retained_pgids", survivors)
+                app_state.save_agent_tasks(task.agent_id)
         # Restore persisted auto-compact opt-outs across all tasks
         for task in app_state.tasks.values():
             if getattr(task, "auto_compact_disabled", False):
@@ -1717,6 +2061,124 @@ class AgentRunner:
     async def shutdown(self) -> None:
         """Graceful shutdown: kill any tracked subprocesses."""
         loop = asyncio.get_event_loop()
+        # 一个统管全局的截止时间，而不是每阶段各自计时后相加：SIGTERM/SIGKILL 两段在
+        # 保留组仍为 OURS/UNKNOWN 时会把 15s 全部用满，后面的通知 drain（最多 80s）与
+        # consolidation drain/cancel（5+8s）再叠上去就超出 run.sh 的 95s grace，届时
+        # 后端被 kill -9，通知卡与 helper 进程的收尾都不会跑。下面每一处等待都按
+        # _budget_left() 收敛，谁先用掉预算谁就压缩后面的窗口。
+        budget_deadline = loop.time() + _shutdown_total_budget_seconds()
+
+        def _budget_left(cap: float, reserve: float = 0.0) -> float:
+            """*cap* 与剩余总预算取小，且不为负（asyncio.wait 不接受负 timeout）。
+
+            *reserve* 是要留给后续阶段的秒数：靠前的等待（尤其能吃掉 80s 的通知
+            drain）不能把预算耗光，否则最后那段 cancel-and-reap 拿到 0s，glm/cco
+            helper 就在后端退出后成了孤儿 —— 那正是这段预算要防的事。
+            """
+            return max(0.0, min(cap, budget_deadline - loop.time() - reserve))
+        # Process groups we have signaled, tracked outside _live_runs so a group
+        # whose entry disappears mid-drain still gets escalated. See the comment
+        # at the .add() below.
+        #
+        # 键是 (pgid, leader_start) 整体，不是裸 pgid：kill_existing=False 的续话可以在
+        # 上一个 run 还在 finalize 时启动，若旧 pid/pgid 已被回收复用，_live_runs 里就同
+        # 时存在两条 pid 相同、pid_start 不同的记录。按裸 pgid 记的话先来的身份占坑，新
+        # run 的投递被闸门正确地判成 foreign 拒发（且每轮又被重新装回旧身份），它的后代
+        # 一个信号都收不到 —— 与第 13 轮 retained 集合改成按身份存是同一个道理。
+        #
+        # 值是 task_id：见下面 _persist_unresolved()，把手要写回哪个任务的元数据全靠它。
+        signaled_pgids: dict[tuple[int, int | None], str | None] = {}
+
+        def _prune_signaled() -> None:
+            """只摘掉拿到确定判决（GONE/FOREIGN）的组。
+
+            UNKNOWN 不是死亡证据（见 _group_state），把它当成消失就等于放走一个可能还
+            活着的后代。留在集合里的组即意味着"还有 OURS/UNKNOWN 要继续等/复检"。
+            """
+            for entry in list(signaled_pgids):
+                if _group_state(*entry) in (_GROUP_GONE, _GROUP_FOREIGN):
+                    signaled_pgids.pop(entry, None)
+
+        # kill_task 判决"没能证明消失"的旧组：后续 resume 已经把 subprocess_pid 换成
+        # 新 pid，它们既不在 _live_runs 里，也不在上面这份 signaled_pgids 里，唯一的
+        # 把手是任务元数据的 retained_pgids。只靠 restore_orphan_tasks 收割意味着
+        # `run.sh stop`（后面不接 start）会在这些组仍握着 codex writer lock 时退出
+        # 后端，所以这里一起 drain，走同一套身份闸门。
+        #
+        # 与 signaled_pgids 分开存：某个旧 pgid 可能已被我们的新 run 复用，混进同一份
+        # 映射会让那条 live run 拿着旧身份去投递（闸门正确地拒发 → 组里的后代反而一个
+        # 信号都收不到）。
+        #
+        # 以 (pgid, leader_start) 整体为元素，而不是 pgid → 身份的映射：同一个号可以在
+        # 元数据里出现多次（旧组尚未被证明消失，号已被后来的 run 复用，两条记录都要留到
+        # 下次启动才复核）。只保留先记下的那个身份会让另一个身份的组永远收不到信号 ——
+        # 前者每轮被判 FOREIGN 剔掉、下一轮又从元数据里被加回来，后者始终进不了集合。
+        # 每个身份各占一条，该不该投递交给闸门按身份逐条判。
+        retained_pgids: set[tuple[int, int | None]] = set()
+
+        def _refresh_retained() -> None:
+            # 每一趟都重扫任务元数据：drain 期间仍可能有 kill_task 落地并记下新把手。
+            for t in list(app_state.tasks.values()):
+                for pgid, leader_start in (getattr(t, "retained_pgids", None) or []):
+                    retained_pgids.add((pgid, leader_start))
+            for entry in list(retained_pgids):
+                if _group_state(*entry) in (_GROUP_GONE, _GROUP_FOREIGN):
+                    # 只有确定的判决才移出这份集合；UNKNOWN 不是死亡证据。
+                    retained_pgids.discard(entry)
+
+        def _signal_retained(sig: int) -> None:
+            _refresh_retained()
+            for pgid, leader_start in list(retained_pgids):
+                _killpg_verified(pgid, leader_start, sig)
+            # 不在这里改写 retained_pgids 元数据：把手的生命周期只有
+            # restore_orphan_tasks 一个 owner（见 _record_retained_pgid），它在下次
+            # 启动时按身份复核后摘除。多留一轮的代价只是下次启动多一次核验。
+
+        def _persist_unresolved() -> None:
+            """把 shutdown 结束时仍未判定消失的组写进任务的 retained_pgids。
+
+            这是刻意打破"只有 restore_orphan_tasks 能写把手"的一处例外，因为不写就没有
+            把手了：signaled_pgids 是 shutdown 的局部变量，随进程一起消失；而这些组的另
+            一份把手 subprocess_pid 会被它们自己那条 run 的 _cleanup_run_resources 清掉
+            —— shutdown 既没有走 kill_task，也就没进 _retain_pid，那条保留逻辑不生效。
+            于是 `run.sh restart` 之后，一个仍握着 codex writer lock 的后代对新后端完全
+            不可见。
+
+            只写 _prune_signaled 之后还剩下的条目，即判决为 OURS/UNKNOWN 的组；拿到
+            GONE/FOREIGN 的已经被摘掉，不会被误记。多记一条活把手的代价只是下次启动多一
+            次按身份的核验（同一身份重复记不会堆项，见 _record_retained_pgid），而
+            restore_orphan_tasks 只在证明其消失后才摘除 —— 永远不会误删活把手。
+            """
+            _prune_signaled()
+            for (pgid, leader_start), task_id in signaled_pgids.items():
+                if task_id is None:
+                    logger.error(
+                        "Group pgid=%d not verifiably gone at shutdown and has no owning "
+                        "task; no handle survives this exit",
+                        pgid,
+                    )
+                    continue
+                logger.error(
+                    "Group pgid=%d (task %s) not verifiably gone at shutdown; persisting "
+                    "the handle so the next startup can retry",
+                    pgid, task_id,
+                )
+                self._record_retained_pgid(task_id, pgid, leader_start)
+
+        def _run_identity(run: dict, pid: int) -> tuple[int, int | None]:
+            """(pgid, leader_start)，spawn 时身份读失败的话补读一次并回写。
+
+            回写是关键：补读只在"子进程尚未被回收"的窗口内有效，而 shutdown 会把这两个
+            阶段的循环各跑很多轮 —— 不缓存的话，等收割线程 done 之后再补读就永远失败，
+            同一个组在 signaled_pgids 里又多出一条 None 身份的条目（闸门永远拒发它，
+            _prune_signaled 也永远摘不掉它，SIGKILL 阶段因此空转到预算耗尽）。
+            """
+            leader_start = run.get("pid_start")
+            if leader_start is None:
+                leader_start = _recapture_leader_start(pid, _run_child_unreaped(run))
+                if leader_start is not None:
+                    run["pid_start"] = leader_start
+            return (pid, leader_start)
 
         def _sigterm_all() -> None:
             # Iterate _live_runs (keyed by run_id, never overwritten by an
@@ -1726,22 +2188,54 @@ class AgentRunner:
             # make that older run's pid/proc invisible here.
             for run in list(self._live_runs.values()):
                 pid = run.get("pid")
+                group_signaled = False
                 if pid is not None:
-                    try:
-                        os.killpg(pid, signal.SIGTERM)
-                    except Exception:
-                        try:
-                            os.kill(pid, signal.SIGTERM)
-                        except Exception:
-                            pass
+                    # Remember the group independently of _live_runs. _on_done
+                    # drops the entry as soon as _run_pipe_mode returns, and it
+                    # returns on stdout EOF — which a SIGTERM-resistant
+                    # descendant can trigger just by closing or redirecting
+                    # stdout while it keeps running. The group would then be
+                    # forgotten before the SIGKILL phase and keep its writer
+                    # lock; group liveness, not entry lifetime, decides when we
+                    # are done with it.
+                    #
+                    # Prefer the identity recorded at spawn (_run_pipe_mode) over
+                    # a read taken now: by this point the leader may already be
+                    # reaped, and reading then would either get None or, worse,
+                    # a new holder's start time — baking the impostor's identity
+                    # into the map as though it were ours.
+                    entry = (pid, run.get("pid_start"))
+                    if entry[1] is None:
+                        # spawn 时那一次 /proc 读失败（PTY 路径尤其没有 proc 句柄可以
+                        # 兜底）。只要子进程还没被回收，号码就还被我们占着，补读到的
+                        # 身份必然是我们那个 leader —— 补上闸门就能重新放行，而不是
+                        # 让整个组从此收不到任何信号。补不到就仍然是 None（闸门继续
+                        # 拒发），下面按自家子进程直投。
+                        entry = _run_identity(run, pid)
+                    signaled_pgids.setdefault(entry, run.get("task_id"))
+                    group_signaled = _killpg_verified(*entry, signal.SIGTERM)
                 proc = run.get("proc")
-                if proc is not None and proc.returncode is None:
+                if proc is not None and proc.returncode is None and (
+                    pid is None or not group_signaled
+                ):
+                    # Normally the killpg above covers pipe-mode runs, reaching
+                    # their grandchildren as proc.terminate() cannot. But if it
+                    # declined (unverifiable identity, or a re-leased pgid), our
+                    # own direct child would otherwise get no signal at all —
+                    # and signaling by handle cannot hit an unrelated process.
                     try:
                         proc.terminate()
                     except ProcessLookupError:
                         pass
+                elif proc is None and pid is not None and not group_signaled:
+                    # PTY 路径的等价兜底。它没有 proc 句柄，闸门拒发后原来只剩关
+                    # transport（那只让读循环收尾，进程组照样活着）—— `run.sh
+                    # stop/restart` 会把这个组永久留在机器上。按 ppid 核过再投，
+                    # 与 handle 版一样不可能打到陌生进程。
+                    _kill_direct_child(pid, signal.SIGTERM)
 
         _sigterm_all()
+        _signal_retained(signal.SIGTERM)
 
         # Let killed runs reach their own finalization (_finish_task, which
         # schedules the completion card) before we snapshot _notify_tasks below.
@@ -1752,12 +2246,33 @@ class AgentRunner:
         # our snapshot. Repeatedly re-snapshotting and SIGTERM'ing any
         # newcomers until the set actually drains (or the overall budget below
         # runs out) keeps such continuations from being silently orphaned.
-        deadline = loop.time() + 10
-        while self._live_runs and loop.time() < deadline:
+        deadline = loop.time() + _budget_left(_sigterm_grace_seconds())
+        # signaled_pgids 也要进循环条件（与下面 SIGKILL 阶段的复检循环对称）：wrapper 收
+        # 到 SIGTERM 后立刻退出、后代把 stdout 关掉但仍在 graceful cleanup 时，_on_done
+        # 会把唯一那条 _live_runs 记录摘掉 —— 组只剩 signaled_pgids 这一份把手（它既不属
+        # 于任何 live run，也不在 retained_pgids 里，那份只装 kill_task 记下的旧组）。
+        # 只看 _live_runs/retained_pgids 的话条件立刻为假，shutdown 直接跳到 SIGKILL，
+        # 说好的 10s graceful 窗口那个后代一秒都没拿到，收尾写一半就被打断。
+        _prune_signaled()
+        while (
+            (self._live_runs or retained_pgids or signaled_pgids)
+            and loop.time() < deadline
+        ):
             _sigterm_all()  # catch pids/procs registered by new continuations
+            _signal_retained(signal.SIGTERM)
+            # 每轮开头复核：拿到 GONE/FOREIGN 的号摘掉，否则一个早就退干净的组会把整个
+            # graceful 窗口耗满（原来靠 _live_runs 变空来收敛）。
+            _prune_signaled()
             tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
             if not tasks:
-                break
+                if not retained_pgids and not signaled_pgids:
+                    break
+                # 保留组/独立跟踪的组没有任何 asyncio task 可以 await（它们本来就不属于哪
+                # 条 live run），但"没东西可等"不等于"可以立刻升级"。按短间隔轮询到
+                # deadline，它们才真正拿到一段 graceful SIGTERM 窗口；否则 _live_runs 一
+                # 空，下面就在同一个事件循环回合里 SIGKILL 了它。
+                await asyncio.sleep(min(0.2, max(0.0, deadline - loop.time())))
+                continue
             # Poll on a short interval rather than waiting the full remaining
             # budget: asyncio.wait's default ALL_COMPLETED means a single
             # still-running task (e.g. a PTY reader blocked on a lingering
@@ -1766,7 +2281,16 @@ class AgentRunner:
             # or SIGTERM'd until the whole budget is already gone.
             await asyncio.wait(tasks, timeout=min(1.0, max(0.0, deadline - loop.time())))
 
-        if self._live_runs:
+        # Anything not provably finished keeps the escalation phase alive.
+        # _GROUP_UNKNOWN counts: it means we could not verify, not that the group
+        # died, and excluding it would skip SIGKILL on a live descendant.
+        # _prune_signaled 只摘掉 GONE/FOREIGN，所以剩下的就是 OURS/UNKNOWN。
+        _prune_signaled()
+        # 保留组同样要能把 SIGKILL 阶段拉起来：SIGTERM 之后它们可能仍是 OURS/UNKNOWN，
+        # 而 _live_runs 与 signaled_pgids 都可能已经空了（这些组本来就不属于任何 live
+        # run）。_refresh_retained 顺便剔掉已有确定判决的条目。
+        _refresh_retained()
+        if self._live_runs or signaled_pgids or retained_pgids:
             # SIGTERM didn't finish the job in time — escalate to SIGKILL
             # and give finalization a second, shorter window. run.sh's
             # stop grace was sized to cover this (see do_stop). Without
@@ -1774,22 +2298,46 @@ class AgentRunner:
             # _finish_task, leaving its task stuck at running with no
             # completion card and no exit.
             def _sigkill_all() -> None:
+                # 先打保留组：它们没有 live run 兜底，_live_runs 空掉后下面的循环就不
+                # 再跑，这里是它们唯一的 SIGKILL 来源。
+                _signal_retained(signal.SIGKILL)
+                # Groups first, so one whose _live_runs entry already went away
+                # (stdout closed by a still-running descendant) is still killed.
+                # Drop only pgids with a definite death/foreign verdict: an
+                # unverifiable one may still be alive, and forgetting it here is
+                # how a live descendant escapes the escalation entirely.
+                _prune_signaled()
+                for entry in list(signaled_pgids):
+                    _killpg_verified(*entry, signal.SIGKILL)
                 for run in list(self._live_runs.values()):
                     pid = run.get("pid")
+                    group_signaled = False
                     if pid is not None:
-                        try:
-                            os.killpg(pid, signal.SIGKILL)
-                        except Exception:
-                            try:
-                                os.kill(pid, signal.SIGKILL)
-                            except Exception:
-                                pass
+                        # Same identity gate as _sigterm_all: a run still in
+                        # finalization keeps its entry here after its group has
+                        # exited, so this delivery is as exposed to pid reuse as
+                        # the tracked-pgid loop above.
+                        entry = (pid, run.get("pid_start"))
+                        if entry[1] is None:
+                            # 同 _sigterm_all：spawn 时读失败不该让这一组永久过不了
+                            # 闸门。子进程未回收 ⇒ 号码还是我们的 ⇒ 补读的身份可用。
+                            entry = _run_identity(run, pid)
+                        signaled_pgids.setdefault(entry, run.get("task_id"))
+                        group_signaled = _killpg_verified(*entry, signal.SIGKILL)
                     proc = run.get("proc")
-                    if proc is not None and proc.returncode is None:
+                    if proc is not None and proc.returncode is None and (
+                        pid is None or not group_signaled
+                    ):
+                        # See _sigterm_all: fall back to the handle whenever the
+                        # group kill did not land, not only when no pid exists.
                         try:
                             proc.kill()
                         except ProcessLookupError:
                             pass
+                    elif proc is None and pid is not None and not group_signaled:
+                        # PTY 路径：闸门拒发时唯一还能落地的一发 SIGKILL。关 transport
+                        # 只是让读循环退出，杀不掉任何进程。
+                        _kill_direct_child(pid, signal.SIGKILL)
                     # SIGKILL to the recorded pid/pgid can't reach a detached
                     # grandchild that still holds the pty slave fd open — that
                     # case only unblocks via the internal 60s lingering-writer
@@ -1807,12 +2355,32 @@ class AgentRunner:
             # kill_existing=False continuation during this escalation window,
             # registering yet another _live_runs entry that a one-shot
             # snapshot+wait would silently miss.
-            kill_deadline = loop.time() + 5
-            while self._live_runs and loop.time() < kill_deadline:
+            kill_deadline = loop.time() + _budget_left(_sigkill_grace_seconds())
+            # Unconditional first pass: the loop below is gated on _live_runs,
+            # which can already be empty here when the only thing left is a
+            # lingering process group (its run entry dropped on stdout EOF).
+            _sigkill_all()
+            # signaled_pgids 也要进循环条件：wrapper 在 SIGTERM 之后退出、_on_done 把
+            # run 移出 _live_runs 时，一个仍活着的后代只剩这一份把手 —— 它既不在
+            # _live_runs 里，也不在 retained_pgids 里（那份只装 kill_task 记下的旧组）。
+            # 只投一发 SIGKILL 就返回，等于不核验组是否真的消失，暂时卡在不可中断等待里
+            # 的成员就活过了 `run.sh stop`。_sigkill_all() 每轮开头已把拿到确定判决
+            # （GONE/FOREIGN）的号摘掉，所以这里非空即意味着还有 OURS/UNKNOWN 要复检。
+            while (
+                (self._live_runs or retained_pgids or signaled_pgids)
+                and loop.time() < kill_deadline
+            ):
                 _sigkill_all()
                 tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
                 if not tasks:
-                    break
+                    if not retained_pgids and not signaled_pgids:
+                        break
+                    # 同 SIGTERM 阶段：保留组没有可 await 的 task，但 SIGKILL 也不是
+                    # 同步的 —— 卡在不可中断等待里的成员要过一会儿才真正消失。轮询到
+                    # kill_deadline 再放手，否则投完信号就返回，run.sh stop 之后那个组
+                    # 可能还握着 codex writer lock 活着。
+                    await asyncio.sleep(min(0.2, max(0.0, kill_deadline - loop.time())))
+                    continue
                 # Same reasoning as the SIGTERM loop above: poll on a short
                 # interval so a continuation registered mid-drain gets
                 # re-snapshotted and SIGKILL'd instead of waiting out this
@@ -1833,8 +2401,13 @@ class AgentRunner:
                         task_obj.cancel()
                 tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
                 if tasks:
-                    await asyncio.wait(tasks, timeout=2)
+                    await asyncio.wait(tasks, timeout=_budget_left(2))
 
+        # 进程组两阶段到此结束。仍未判定消失的组要在这里落盘：signaled_pgids 只活在这个
+        # 函数的栈上，而它们的另一份把手 subprocess_pid 马上就会被各自 run 的
+        # _cleanup_run_resources 清掉（shutdown 没走 kill_task，_retain_pid 那条保留逻辑
+        # 不生效）。放在预算收敛之后、返回之前，等的都等过了，判决是最终的那一次。
+        _persist_unresolved()
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
         # timeout is 30s (wiki_notify.py); this outer wait must exceed that
@@ -1849,9 +2422,33 @@ class AgentRunner:
         # The budget is that constant — not a sampled depth, which could miss a
         # coroutine scheduled but not yet started.
         if self._notify_tasks:
-            await asyncio.wait(
-                list(self._notify_tasks), timeout=_notify_drain_max_seconds()
+            # 只有真有 consolidation 在飞时才为它留额度，否则通知白白少等一截。
+            # 无论如何都要为通知自己的 kill-and-reap 留一段：drain 被压缩时（17s 进程组
+            # + 13s consolidation 之后只剩 60s，装不下 80s）超时的通知不会被 asyncio.wait
+            # 取消，事件循环 teardown 会把它静默丢弃 —— 它的 except CancelledError 才是
+            # 杀掉 feishu-bot CLI 子进程的地方，不跑就留下孤儿（run.sh 只 signal 后端 PID）。
+            reserve = _notify_kill_seconds() + (
+                _consolidate_drain_seconds() + _consolidate_kill_seconds()
+                if self._consolidate_tasks else 0
             )
+            pending_notify = list(self._notify_tasks)
+            _, still_sending = await asyncio.wait(
+                pending_notify,
+                timeout=_budget_left(_notify_drain_max_seconds(), reserve),
+            )
+            # 与下面 consolidation 同一套处理：显式取消 + 给收尾一小段时间，而不是把没跑
+            # 完的通知留给 teardown。丢卡是可接受的降级，漏下 CLI 子进程不是。
+            for t in still_sending:
+                t.cancel()
+            if still_sending:
+                await asyncio.wait(
+                    still_sending,
+                    timeout=_budget_left(
+                        _notify_kill_seconds(),
+                        _consolidate_drain_seconds() + _consolidate_kill_seconds()
+                        if self._consolidate_tasks else 0,
+                    ),
+                )
 
         # History-triggered consolidations write layer documents, so cancelling
         # one mid-flight is worse than waiting: os.replace makes the write itself
@@ -1862,7 +2459,10 @@ class AgentRunner:
         if self._consolidate_tasks:
             pending = list(self._consolidate_tasks)
             _, still_running = await asyncio.wait(
-                pending, timeout=_consolidate_drain_seconds()
+                pending,
+                timeout=_budget_left(
+                    _consolidate_drain_seconds(), _consolidate_kill_seconds()
+                ),
             )
             # asyncio.wait's timeout leaves the unfinished ones pending, and loop
             # teardown would then drop them without their `except CancelledError`
@@ -1873,7 +2473,9 @@ class AgentRunner:
             for t in still_running:
                 t.cancel()
             if still_running:
-                await asyncio.wait(still_running, timeout=_consolidate_kill_seconds())
+                await asyncio.wait(
+                    still_running, timeout=_budget_left(_consolidate_kill_seconds())
+                )
 
 
 # ── helpers ─────────────────────────────────────────────────────────────
@@ -1910,16 +2512,330 @@ def _window_tasks(tasks: list, window: int) -> list:
     return finished[:window] if window > 0 else []
 
 
+def _stat_fields_after_comm(stat_text: str) -> list[str]:
+    """/proc/<pid>/stat 里 comm 之后的字段（state 起算，即原第 3 字段起）。
+
+    comm 是括号包起来的进程名，本身可以含空格和括号，所以整行 split() 会让它后面
+    所有字段整体错位 —— 取到的"start time"其实是别的字段（进程名带一个空格时通常
+    读成 0）。这种被污染的身份还会撞车：另一个同样带空格名字的进程复用了 pid/pgid
+    后算出同一个假值，_group_state 就会把陌生人的组认成我们的并放行 killpg。
+    唯一可靠的切法是从最后一个 ')' 之后开始。没有 ')' 说明这行不是合法 stat，返回
+    空列表，让调用方按"读取失败"处理而不是按错位字段下判决。
+    """
+    _, sep, tail = stat_text.rpartition(")")
+    if not sep:
+        return []
+    return tail.split()
+
+
 def _read_proc_start_time(pid: int) -> int | None:
     """Read /proc/<pid>/stat field 22 (process start time since boot)."""
     try:
         stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        parts = stat_text.split()
-        if len(parts) < 22:
+        fields = _stat_fields_after_comm(stat_text)
+        if len(fields) < 20:
             return None
-        return int(parts[21])
+        return int(fields[19])
     except Exception:
         return None
+
+
+def _read_ppid(pid: int) -> int | None:
+    """Read /proc/<pid>/stat field 4 (parent pid)."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = _stat_fields_after_comm(stat_text)
+        if len(fields) < 2:
+            return None
+        return int(fields[1])
+    except Exception:
+        return None
+
+
+def _recapture_leader_start(pid: int, unreaped: bool) -> int | None:
+    """spawn 时身份读失败后补读一次，仅限 *pid* 仍是我们没回收的子进程时。
+
+    身份闸门存在的前提是"号码可能已经被出让给别人"，而一个还没被 waitpid 收割的子
+    进程会以 zombie 形式一直占着这个号 —— 内核不会重新分配它。所以在 *unreaped* 为真
+    的窗口里补读到的 starttime 仍然是我们那个 leader 的，可以当基准用。spawn 那一次
+    读失败（EIO/ENOMEM 之类的瞬时失败）不该让这一整组从此过不了闸门：PTY 路径没有
+    proc 句柄可以兜底，那等于 `run.sh stop/restart` 永久漏掉这个组。
+
+    额外核一次 ppid == 我们自己：万一 unreaped 的判断本身滞后（收割线程刚从 waitpid
+    返回、标记还没写回），此时号码若已被重新出让，读到的身份不会被当成我们的放行。
+    """
+    if not unreaped:
+        return None
+    if _read_ppid(pid) != os.getpid():
+        return None
+    return _read_proc_start_time(pid)
+
+
+def _run_child_unreaped(run: dict) -> bool:
+    """*run* 的直接子进程是否还没被我们 waitpid 回收。
+
+    未回收的子进程即使已经退出也以 zombie 形式占着 pid，内核不会把这个号重新出让给
+    别人 —— 这是"补读身份/按 pid 兜底不会打到复用者"的唯一依据。pipe 用 returncode
+    （asyncio 收割之后才置值），PTY 用收割线程那个 future。两者都取不到就当"不能确定"
+    处理，不补读也不兜底。
+    """
+    proc = run.get("proc")
+    if proc is not None:
+        return proc.returncode is None
+    reaped = run.get("reaped")
+    if reaped is not None:
+        return not reaped.done()
+    return False
+
+
+def _kill_direct_child(pid: int, sig: int) -> bool:
+    """向仍是我们自家子进程的 *pid* 投递 *sig*；否则不发。
+
+    PTY 路径在闸门拒发时的兜底：它没有 pipe 那样的 proc 句柄，killpg 一旦被拒
+    （身份读不出来，或号码已被出让），直接子进程就一个信号都收不到，仅关掉
+    transport 只是让读循环收尾，进程组照样活着。
+
+    投递前现读一次 ppid：收割线程可能刚从 waitpid 返回而 future 标记还没写回，那个
+    窗口里号码已经可以被重新出让。父进程是自己就排除了误伤陌生进程 —— 与
+    _killpg_verified 同样是"按身份而非裸 pid 投递"。
+    """
+    if _read_ppid(pid) != os.getpid():
+        return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
+
+def _pid_is_absent(pid: int) -> bool:
+    """True only when /proc has no entry for *pid* at all.
+
+    Distinct from `_read_proc_start_time(pid) is None`, which also covers a
+    transient read/parse failure on a pid that very much still exists. Callers
+    that signal a process group derived from *pid* must use this: treating an
+    unreadable stat as proof of absence would let them kill a live, recycled
+    stranger's group. ENOENT on the directory itself is the only safe evidence.
+    """
+    try:
+        os.stat(f"/proc/{pid}")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _scan_pgroup(pgid: int) -> tuple[list[tuple[int, int | None]], bool]:
+    """(members, complete) for process group *pgid*.
+
+    `complete` is False when the scan could not see all of /proc — the directory
+    listing failed, or a candidate's stat was unreadable for a reason other than
+    the process having exited. An empty member list is then "we don't know",
+    not "the group is empty": collapsing the two lets a transient read failure
+    look like proof of death, which is how callers stop escalating or discard the
+    only handle on a live writer-lock holder.
+    """
+    members: list[tuple[int, int | None]] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return members, False
+    complete = True
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            stat_text = Path(f"/proc/{name}/stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Exited between listdir and read — a real observation, not a gap.
+            continue
+        except (OSError, ValueError):
+            complete = False
+            continue
+        # state, ppid, pgrp, ..., starttime follow the parenthesised comm, which
+        # can itself contain spaces and parens — split on the last ')'.
+        fields = _stat_fields_after_comm(stat_text)
+        if len(fields) < 20:
+            complete = False
+            continue
+        if fields[0] in ("Z", "X", "x"):
+            continue
+        try:
+            if int(fields[2]) == pgid:
+                members.append((int(name), int(fields[19])))
+        except ValueError:
+            complete = False
+            continue
+    return members, complete
+
+
+def _pgroup_member_ids(pgid: int) -> list[tuple[int, int | None]]:
+    """Live (non-zombie) members of process group *pgid* as (pid, starttime).
+
+    Returns identities, not bare pids: a pid is only a stable handle for as long
+    as the process lives, and every caller here signals *after* observing. The
+    start-time field pins which process a number referred to at enumeration
+    time, so a number reused in between is detectable rather than silently
+    inheriting a kill aimed at its predecessor.
+    """
+    return _scan_pgroup(pgid)[0]
+
+
+"""Verdicts from _group_state. "Don't signal" and "it's gone" are different
+facts, and conflating them is how a SIGTERM-resistant descendant survives while
+its only recovery metadata is discarded."""
+_GROUP_OURS = "ours"          # ours and alive → safe to signal
+_GROUP_GONE = "gone"          # provably no live members → done with it
+_GROUP_FOREIGN = "foreign"    # pid re-leased → must not signal, not ours
+_GROUP_UNKNOWN = "unknown"    # cannot verify → must not signal, may still live
+
+
+def _group_state(pgid: int, leader_start: int | None) -> str:
+    """Classify process group *pgid* against the leader's recorded start time.
+
+    A leader that exited leaves its group addressable by the same pgid, so the
+    leader's absence is not disqualifying — that orphaned-descendant shape is the
+    whole point of this module's cleanup. But if some *other* live process now
+    holds that pid, the number has been re-leased and signaling it would hit an
+    unrelated tree.
+
+    Returns _GROUP_UNKNOWN rather than _GROUP_GONE when identity cannot be
+    established: callers must neither signal it nor treat it as disappeared.
+    """
+    current = _read_proc_start_time(pgid)
+    leader_absent = _pid_is_absent(pgid)
+    if current is not None and leader_start is not None and current != leader_start:
+        return _GROUP_FOREIGN
+    if current is None and not leader_absent:
+        # Unreadable is not absent: something holds this pid but we cannot tell
+        # whether it is ours. Not signalable, and not evidence of death either.
+        return _GROUP_UNKNOWN
+    if leader_start is None and not leader_absent:
+        # No baseline to compare against while the pid is held.
+        return _GROUP_UNKNOWN
+    members, complete = _scan_pgroup(pgid)
+    if not complete:
+        # An incomplete /proc scan cannot prove the group is empty.
+        return _GROUP_UNKNOWN
+    # 扫完再核一次 leader 身份。上面的检查只在那一瞬成立，而 _scan_pgroup 要走一遍
+    # /proc（几百毫秒量级）：这期间 leader 可能退出、pid 被回收并重新分配给一个新的
+    # session leader，扫出来的成员就是它的组而不是我们的。之前只对"进来时就已缺席"
+    # 的 leader 补检了重分配，活着的 leader 走不到那个分支 —— 判成 _GROUP_OURS 后
+    # _killpg_verified 就会向陌生人的组投信号。
+    after = _read_proc_start_time(pgid)
+    after_absent = _pid_is_absent(pgid)
+    if after is not None and leader_start is not None and after != leader_start:
+        # 号码在扫描期间被重新出让给了别人。
+        return _GROUP_FOREIGN
+    if leader_absent and not after_absent:
+        # The number was free when we checked and is held now: it was re-leased
+        # during enumeration, so a new session leader may own this pgid and the
+        # members we just collected could be its, not ours. Absence is only ever
+        # a point-in-time fact, which is why it is rechecked after the scan.
+        return _GROUP_FOREIGN
+    if after is None and not after_absent:
+        # 扫描后读不出身份：既不能确认成员属于我们，也不是死亡证据。
+        return _GROUP_UNKNOWN
+    return _GROUP_OURS if members else _GROUP_GONE
+
+
+def _group_is_still(pgid: int, leader_start: int | None) -> bool:
+    """True only when the group is verifiably ours and alive (safe to signal).
+
+    Deliberately NOT a liveness test — see _group_state. Callers asking "is it
+    gone?" must compare against _GROUP_GONE instead.
+    """
+    return _group_state(pgid, leader_start) == _GROUP_OURS
+
+
+def _terminate_group_blocking(pgid: int, leader_start: int | None) -> str:
+    """SIGTERM → wait → SIGKILL → wait on group *pgid*; return the final verdict.
+
+    Blocking on purpose: the only caller context is startup, before the event
+    loop serves traffic, and the whole point is to not release the pgid until we
+    know what happened to it. Every delivery re-verifies the leader identity via
+    _killpg_verified, and only a definite verdict (_GROUP_GONE / _GROUP_FOREIGN)
+    ends a wait early — _GROUP_UNKNOWN may still resolve on a later read.
+    """
+    if _killpg_verified(pgid, leader_start, signal.SIGTERM):
+        logger.info("Sent SIGTERM to orphan group pgid=%d", pgid)
+    for _ in range(10):
+        if _group_state(pgid, leader_start) in (_GROUP_GONE, _GROUP_FOREIGN):
+            break
+        time.sleep(0.1)
+    if _group_is_still(pgid, leader_start):
+        logger.warning("Orphan group pgid=%d survived SIGTERM; escalating to SIGKILL", pgid)
+        _killpg_verified(pgid, leader_start, signal.SIGKILL)
+        # SIGKILL is not synchronous either: a member wedged in an
+        # uninterruptible wait keeps it pending and stays alive. Confirm before
+        # any caller releases the metadata — this pgid is the only handle on the
+        # lock holder, so dropping it while the group lives trades a recoverable
+        # orphan for a permanent one.
+        for _ in range(10):
+            if _group_state(pgid, leader_start) in (_GROUP_GONE, _GROUP_FOREIGN):
+                break
+            time.sleep(0.1)
+    return _group_state(pgid, leader_start)
+
+
+def _killpg_verified(pgid: int, leader_start: int | None, sig: int) -> bool:
+    """Signal process group *pgid*, but only while it is still ours.
+
+    Every killpg in this module goes through here. Checking once and then
+    signaling later is not enough: each of SIGTERM, the post-wait escalation and
+    each poll of shutdown's drain is a separate delivery, and the pgid can be
+    re-leased between any two of them. Returns whether the signal was sent.
+    """
+    if not _group_is_still(pgid, leader_start):
+        return False
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except Exception:
+        return False
+
+
+def _kill_verified(member: int, start_time: int | None) -> None:
+    """SIGTERM+SIGKILL *member*, but only while it is still the same process.
+
+    Re-reads the start time immediately before each signal: between enumeration
+    and delivery the kernel is free to hand this number to something unrelated,
+    and killing by bare pid at that point is how orphan cleanup turns into
+    collateral damage.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if _read_proc_start_time(member) != start_time:
+            return
+        try:
+            os.kill(member, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        except Exception:
+            return
+
+
+def _pgroup_members(pgid: int) -> list[int]:
+    """Live (non-zombie) pids in process group *pgid*.
+
+    kill(-pgid, 0) is not a substitute: it succeeds as long as the group still
+    holds a zombie, and it says nothing about *which* processes remain — orphan
+    recovery needs the members themselves once the group leader is gone.
+    """
+    return [pid for pid, _start in _pgroup_member_ids(pgid)]
+
+
+def _pgroup_alive(pgid: int) -> bool:
+    """True while any non-zombie process remains in process group *pgid*.
+
+    The direct child's returncode is not a substitute: a wrapper that exits
+    promptly on SIGTERM says nothing about a descendant that ignored it, and
+    that descendant is exactly the writer-lock holder we need gone.
+    """
+    return bool(_pgroup_members(pgid))
+
 
 def _clean_env(task_id: str = "") -> dict[str, str]:
     """Return a copy of os.environ with virtualenv and Claude Code session

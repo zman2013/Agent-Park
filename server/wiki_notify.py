@@ -272,6 +272,21 @@ async def send_feishu_card(
             proc.kill()
             await proc.wait()
             return [] if capture_ids else False
+        except asyncio.CancelledError:
+            # Shutdown 的通知 drain 超时后会显式取消我们（见 AgentRunner.shutdown）。
+            # 取消 communicate() 并不会给子进程发任何信号，而 run.sh 只 signal 后端
+            # PID —— 不在这里杀掉并回收，feishu-bot CLI 就在后端退出后成了孤儿（还可能
+            # 变成 zombie，run.sh 的 is_running 会把 zombie 当成活着）。
+            # asyncio.shield 是因为这本就在取消路径上：裸 await 会被再次取消，reap 收不回来。
+            logger.info("Feishu notification cancelled, killing CLI child")
+            try:
+                proc.kill()
+                await asyncio.shield(asyncio.wait_for(proc.wait(), timeout=5))
+            except ProcessLookupError:
+                pass
+            except Exception:
+                logger.warning("Feishu CLI child did not reap after kill")
+            raise
         if proc.returncode == 0:
             logger.info("Feishu notification sent successfully")
             if capture_ids:
