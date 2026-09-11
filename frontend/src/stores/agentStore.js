@@ -287,11 +287,15 @@ export const useAgentStore = defineStore('agent', () => {
     }
   }
 
-  function markMessageDone(taskId, messageId) {
+  function markMessageDone(taskId, messageId, content) {
     const task = tasks.value[taskId]
     if (!task) return
     const msg = task.messages.find(m => m.id === messageId)
     if (msg) {
+      // Adapters that only learn a bubble's final text on completion (codex
+      // sub-agent calls, whose status changes as the call resolves) send it
+      // here. Deltas cannot express it: the text is revised, not extended.
+      if (content !== undefined && content !== null) msg.content = content
       msg.streaming = false
     }
   }

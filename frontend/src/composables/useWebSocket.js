@@ -200,7 +200,7 @@ export function useWebSocket() {
 
       case 'message_done':
         flushPendingChunks()
-        store.markMessageDone(data.task_id, data.message_id)
+        store.markMessageDone(data.task_id, data.message_id, data.content)
         break
 
       case 'message_usage':

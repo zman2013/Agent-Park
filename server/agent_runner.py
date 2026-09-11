@@ -151,14 +151,20 @@ class _RunContext:
             "delta": text,
         })
 
-    async def close_message(self, message_id: str) -> None:
+    async def close_message(self, message_id: str, content: str | None = None) -> None:
         from server.routes_ws import broadcast
 
-        await broadcast({
+        payload = {
             "type": "message_done",
             "task_id": self.task_id,
             "message_id": message_id,
-        })
+        }
+        # Replacement, for adapters whose bubble text is only final on close.
+        # A delta cannot express it when the text is revised rather than
+        # extended — a codex sub-agent's status goes running -> completed.
+        if content is not None:
+            payload["content"] = content
+        await broadcast(payload)
 
     async def send_system_notice(self, content: str) -> None:
         from server.routes_ws import broadcast

@@ -26,6 +26,8 @@ class FakeCtx:
         self.closed: list[str] = []
         # (message_id, delta) — what a live client would actually receive.
         self.deltas: list[tuple[str, str]] = []
+        # message_id -> replacement text sent with message_done.
+        self.finalized: dict[str, str] = {}
         # message_id -> the Message object handed out, to check final state.
         self.messages: dict[str, Message] = {}
 
@@ -41,18 +43,22 @@ class FakeCtx:
     async def append_delta(self, message_id, text):
         self.deltas.append((message_id, text))
 
-    def client_view(self, message_id, opening):
-        """Replay what a live client holds: opening content plus its deltas.
-
-        The frontend applies message_chunk by appending the delta and
-        message_done by clearing `streaming` only — it never re-reads content
-        from the server. So this, not msg.content, is what the user sees
-        without reloading the task.
-        """
-        return opening + "".join(d for mid, d in self.deltas if mid == message_id)
-
-    async def close_message(self, message_id):
+    async def close_message(self, message_id, content=None):
         self.closed.append(message_id)
+        if content is not None:
+            self.finalized[message_id] = content
+
+    def client_view(self, message_id, opening):
+        """Replay what a live client holds for this bubble.
+
+        The frontend appends message_chunk deltas and, on message_done,
+        replaces content when the payload carries it. It never re-reads from
+        the server, so this — not msg.content — is what the user sees without
+        reloading the task.
+        """
+        if message_id in self.finalized:
+            return self.finalized[message_id]
+        return opening + "".join(d for mid, d in self.deltas if mid == message_id)
 
     async def save_session(self, session_id):
         pass
@@ -282,12 +288,73 @@ def test_concurrent_sub_agents_get_distinct_labels():
     assert CodexAdapter._short_tid(a) != CodexAdapter._short_tid(b)
 
 
-def test_reordered_thread_ids_still_append_cleanly():
+def test_changing_status_replaces_instead_of_duplicating():
+    """A blocking `wait` starts `running` and ends `completed`.
+
+    The finalized text is a revision, not an extension, so appending it as a
+    delta left the bubble with two `agents:` sections carrying contradictory
+    statuses — the stale one still visible above the final one.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+
+    async def drive():
+        await adapter.handle_chunk(
+            {"type": "item.started",
+             "item": _collab("item_0", "wait", tids=[tid],
+                             states={tid: {"status": "running", "message": None}})}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "wait", tids=[tid],
+                             states={tid: {"status": "completed", "message": "done"}})}, ctx)
+
+    _run(drive())
+    msg_id = next(iter(ctx.messages))
+    seen = ctx.client_view(msg_id, ctx.created[0][2])
+    assert seen.count("agents:") == 1, seen
+    assert "running" not in seen, seen
+    assert seen == ctx.messages[msg_id].content
+
+
+def test_repeated_wait_polling_does_not_replay_shown_replies():
+    """Agents finishing at different times means `wait` is called repeatedly.
+
+    Each later agents_states still carries threads that completed during an
+    earlier wait, so treating every wait as fresh printed A, then A and B.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    a = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+    b = "01a08e82-5133-7520-8a88-4dd599ecc862"
+
+    async def drive():
+        await adapter.handle_chunk(
+            {"type": "item.started", "item": _collab("item_0", "wait", tids=[a, b])}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "wait", tids=[a, b],
+                             states={a: {"status": "completed", "message": "reply-A"}})}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.started", "item": _collab("item_1", "wait", tids=[b])}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_1", "wait", tids=[a, b],
+                             states={a: {"status": "completed", "message": "reply-A"},
+                                     b: {"status": "completed", "message": "reply-B"}})}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert replies == [f"[{CodexAdapter._short_tid(a)} completed]\nreply-A",
+                       f"[{CodexAdapter._short_tid(b)} completed]\nreply-B"], replies
+
+
+def test_reordered_thread_ids_render_stably():
     """`receiver_thread_ids` order is not stable between started and completed.
 
     A real `wait` over two agents listed them in one order on item.started and
-    the reverse on item.completed. Without a stable ordering the append-only
-    diff failed and the bubble ended up with two `agents:` lines.
+    the reverse on item.completed. Sorting keeps the bubble from reshuffling
+    as the call resolves.
     """
     adapter = CodexAdapter()
     ctx = FakeCtx()
