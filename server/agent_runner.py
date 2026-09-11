@@ -58,6 +58,19 @@ CONSOLIDATE_DRAIN_SECONDS = 5
 CONSOLIDATE_KILL_SECONDS = 8
 
 
+# shutdown() 的总预算。run.sh 的 backend stop grace 是 95s（见 do_stop）：超时它就
+# kill -9 后端，届时通知卡的收尾、consolidation 的 kill-and-reap 都不会再跑（前者丢卡，
+# 后者把 glm/cco 子进程留成孤儿）。各阶段若各自独立计时再相加，最坏情况是
+# 10(SIGTERM) + 5(SIGKILL) + 2(cancel) + 80(notify) + 5 + 8(consolidate) = 110s，
+# 已经越过那道线。所以所有等待共享这一个截止时间，而不是逐段累加。
+# 留 5s 余量给 uvicorn 自身的 lifespan/连接收尾。
+SHUTDOWN_TOTAL_BUDGET_SECONDS = 90
+
+
+def _shutdown_total_budget_seconds() -> int:
+    return SHUTDOWN_TOTAL_BUDGET_SECONDS
+
+
 def _consolidate_drain_seconds() -> int:
     return CONSOLIDATE_DRAIN_SECONDS
 
@@ -2011,6 +2024,21 @@ class AgentRunner:
     async def shutdown(self) -> None:
         """Graceful shutdown: kill any tracked subprocesses."""
         loop = asyncio.get_event_loop()
+        # 一个统管全局的截止时间，而不是每阶段各自计时后相加：SIGTERM/SIGKILL 两段在
+        # 保留组仍为 OURS/UNKNOWN 时会把 15s 全部用满，后面的通知 drain（最多 80s）与
+        # consolidation drain/cancel（5+8s）再叠上去就超出 run.sh 的 95s grace，届时
+        # 后端被 kill -9，通知卡与 helper 进程的收尾都不会跑。下面每一处等待都按
+        # _budget_left() 收敛，谁先用掉预算谁就压缩后面的窗口。
+        budget_deadline = loop.time() + _shutdown_total_budget_seconds()
+
+        def _budget_left(cap: float, reserve: float = 0.0) -> float:
+            """*cap* 与剩余总预算取小，且不为负（asyncio.wait 不接受负 timeout）。
+
+            *reserve* 是要留给后续阶段的秒数：靠前的等待（尤其能吃掉 80s 的通知
+            drain）不能把预算耗光，否则最后那段 cancel-and-reap 拿到 0s，glm/cco
+            helper 就在后端退出后成了孤儿 —— 那正是这段预算要防的事。
+            """
+            return max(0.0, min(cap, budget_deadline - loop.time() - reserve))
         # Process groups we have signaled, tracked outside _live_runs so a group
         # whose entry disappears mid-drain still gets escalated. See the comment
         # at the .add() below. Keyed by pgid, valued by the leader's start time so
@@ -2110,7 +2138,7 @@ class AgentRunner:
         # our snapshot. Repeatedly re-snapshotting and SIGTERM'ing any
         # newcomers until the set actually drains (or the overall budget below
         # runs out) keeps such continuations from being silently orphaned.
-        deadline = loop.time() + 10
+        deadline = loop.time() + _budget_left(10)
         while (self._live_runs or retained_pgids) and loop.time() < deadline:
             _sigterm_all()  # catch pids/procs registered by new continuations
             _signal_retained(signal.SIGTERM)
@@ -2208,16 +2236,25 @@ class AgentRunner:
             # kill_existing=False continuation during this escalation window,
             # registering yet another _live_runs entry that a one-shot
             # snapshot+wait would silently miss.
-            kill_deadline = loop.time() + 5
+            kill_deadline = loop.time() + _budget_left(5)
             # Unconditional first pass: the loop below is gated on _live_runs,
             # which can already be empty here when the only thing left is a
             # lingering process group (its run entry dropped on stdout EOF).
             _sigkill_all()
-            while (self._live_runs or retained_pgids) and loop.time() < kill_deadline:
+            # signaled_pgids 也要进循环条件：wrapper 在 SIGTERM 之后退出、_on_done 把
+            # run 移出 _live_runs 时，一个仍活着的后代只剩这一份把手 —— 它既不在
+            # _live_runs 里，也不在 retained_pgids 里（那份只装 kill_task 记下的旧组）。
+            # 只投一发 SIGKILL 就返回，等于不核验组是否真的消失，暂时卡在不可中断等待里
+            # 的成员就活过了 `run.sh stop`。_sigkill_all() 每轮开头已把拿到确定判决
+            # （GONE/FOREIGN）的号摘掉，所以这里非空即意味着还有 OURS/UNKNOWN 要复检。
+            while (
+                (self._live_runs or retained_pgids or signaled_pgids)
+                and loop.time() < kill_deadline
+            ):
                 _sigkill_all()
                 tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
                 if not tasks:
-                    if not retained_pgids:
+                    if not retained_pgids and not signaled_pgids:
                         break
                     # 同 SIGTERM 阶段：保留组没有可 await 的 task，但 SIGKILL 也不是
                     # 同步的 —— 卡在不可中断等待里的成员要过一会儿才真正消失。轮询到
@@ -2245,7 +2282,7 @@ class AgentRunner:
                         task_obj.cancel()
                 tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
                 if tasks:
-                    await asyncio.wait(tasks, timeout=2)
+                    await asyncio.wait(tasks, timeout=_budget_left(2))
 
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
@@ -2261,8 +2298,14 @@ class AgentRunner:
         # The budget is that constant — not a sampled depth, which could miss a
         # coroutine scheduled but not yet started.
         if self._notify_tasks:
+            # 只有真有 consolidation 在飞时才为它留额度，否则通知白白少等一截。
+            reserve = (
+                _consolidate_drain_seconds() + _consolidate_kill_seconds()
+                if self._consolidate_tasks else 0
+            )
             await asyncio.wait(
-                list(self._notify_tasks), timeout=_notify_drain_max_seconds()
+                list(self._notify_tasks),
+                timeout=_budget_left(_notify_drain_max_seconds(), reserve),
             )
 
         # History-triggered consolidations write layer documents, so cancelling
@@ -2274,7 +2317,10 @@ class AgentRunner:
         if self._consolidate_tasks:
             pending = list(self._consolidate_tasks)
             _, still_running = await asyncio.wait(
-                pending, timeout=_consolidate_drain_seconds()
+                pending,
+                timeout=_budget_left(
+                    _consolidate_drain_seconds(), _consolidate_kill_seconds()
+                ),
             )
             # asyncio.wait's timeout leaves the unfinished ones pending, and loop
             # teardown would then drop them without their `except CancelledError`
@@ -2285,7 +2331,9 @@ class AgentRunner:
             for t in still_running:
                 t.cancel()
             if still_running:
-                await asyncio.wait(still_running, timeout=_consolidate_kill_seconds())
+                await asyncio.wait(
+                    still_running, timeout=_budget_left(_consolidate_kill_seconds())
+                )
 
 
 # ── helpers ─────────────────────────────────────────────────────────────

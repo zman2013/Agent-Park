@@ -1331,3 +1331,130 @@ async def _check_shutdown_rechecks_retained_after_sigkill(monkeypatch, tmp_path)
 
 def test_shutdown_rechecks_retained_after_sigkill(monkeypatch, tmp_path):
     asyncio.run(_check_shutdown_rechecks_retained_after_sigkill(monkeypatch, tmp_path))
+
+
+async def _check_shutdown_rechecks_signaled_after_sigkill(monkeypatch, tmp_path):
+    """独立跟踪的组（signaled_pgids）在 SIGKILL 之后同样要复检。
+
+    wrapper 收到 SIGTERM 后退出、_on_done 随即把 run 移出 _live_runs，而一个后代还活着：
+    此时那个组既不在 _live_runs 里，也不在 retained_pgids 里（后者只装 kill_task 记下的
+    旧组），唯一的把手就是 signaled_pgids。若 SIGKILL 阶段的复检循环只看
+    _live_runs/retained_pgids，投完一发 SIGKILL 就返回 —— 暂时卡在不可中断等待里的成员
+    就活过了 `run.sh stop`，codex writer lock 照旧泄漏。
+
+    这里用一个只有 pid、没有 task/proc 的 live run（wrapper 已退出、entry 尚在的形状）
+    喂进 signaled_pgids，然后让判决连续几轮报 UNKNOWN 模拟 SIGKILL 尚未落地。
+    """
+    pgid, leader_start = 515151, 777
+    monkeypatch.setattr(app_state, "tasks", {})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    verdicts = {"n": 0}
+
+    def fake_state(_pgid, _start):
+        verdicts["n"] += 1
+        # 前几轮 SIGKILL 还没落地：组仍是 UNKNOWN，不能当成消失。
+        return (
+            agent_runner_mod._GROUP_UNKNOWN if verdicts["n"] <= 4
+            else agent_runner_mod._GROUP_GONE
+        )
+
+    attempts = []
+    monkeypatch.setattr(agent_runner_mod, "_group_state", fake_state)
+    monkeypatch.setattr(
+        agent_runner_mod,
+        "_killpg_verified",
+        lambda p, s, sig: attempts.append((p, sig)) or False,
+    )
+    runner = AgentRunner()
+    # 只有 pid：没有 task 可 await，也没有 proc/transport —— 正是 _on_done 把 entry
+    # 摘掉前后那一瞬的形状。SIGTERM 首发把它登记进 signaled_pgids。
+    runner._live_runs["run-signaled"] = {"pid": pgid, "pid_start": leader_start}
+
+    async def _drop_entry():
+        # SIGTERM 之后 wrapper 退出，_on_done 移除 entry；组只剩 signaled_pgids 这一份
+        # 把手。用一个独立协程做，避免依赖 shutdown 内部的调用次序。
+        await asyncio.sleep(0.05)
+        runner._live_runs.pop("run-signaled", None)
+
+    dropper = asyncio.ensure_future(_drop_entry())
+    try:
+        await runner.shutdown()
+        kills = [a for a in attempts if a == (pgid, signal.SIGKILL)]
+        assert len(kills) >= 2, (
+            "SIGKILL 只投了一发就返回，独立跟踪的组在 escalation 阶段没有被复检"
+        )
+        assert verdicts["n"] > 4, "shutdown 没有等到该组出现确定判决"
+    finally:
+        dropper.cancel()
+        runner._live_runs.clear()
+
+
+def test_shutdown_rechecks_signaled_groups_after_sigkill(monkeypatch, tmp_path):
+    asyncio.run(_check_shutdown_rechecks_signaled_after_sigkill(monkeypatch, tmp_path))
+
+
+async def _check_shutdown_stays_within_its_total_budget(monkeypatch):
+    """所有等待共享一个总预算，不能各阶段独立计时再相加。
+
+    原来 SIGTERM(10) + SIGKILL(5) + cancel(2) + 通知 drain(80) + consolidation
+    drain/cancel(5+8) 是逐段累加的，最坏 110s > run.sh 给 backend 的 95s grace ——
+    超时后端被 kill -9，通知卡的收尾与 helper 进程的 kill-and-reap 都不会跑（丢卡 +
+    孤儿 glm/cco）。这里把总预算压到 20s，喂进永不结束的通知与 consolidation 任务：
+    shutdown 必须在预算内返回，而不是把 80+5+8 各等满。
+    """
+    budget = 20
+    monkeypatch.setattr(
+        agent_runner_mod, "_shutdown_total_budget_seconds", lambda: budget
+    )
+    runner = AgentRunner()
+    assert not runner._live_runs
+    hung = [
+        asyncio.ensure_future(asyncio.sleep(600)),
+        asyncio.ensure_future(asyncio.sleep(600)),
+    ]
+    runner._notify_tasks.add(hung[0])
+    runner._consolidate_tasks.add(hung[1])
+    loop = asyncio.get_event_loop()
+    started = loop.time()
+    try:
+        await runner.shutdown()
+        elapsed = loop.time() - started
+        assert elapsed <= budget + 3, (
+            f"shutdown 用了 {elapsed:.1f}s，超出总预算 {budget}s —— 各阶段仍在独立累加，"
+            "run.sh 的 95s grace 会被越过"
+        )
+        # 反向：也不能因为收敛预算就把每个窗口压成 0，drain 本来的意义就没了。
+        assert elapsed >= 3, (
+            f"shutdown 只用了 {elapsed:.1f}s，通知/consolidation 根本没拿到 drain 窗口"
+        )
+        # consolidation 超时后必须被显式 cancel（其 except CancelledError 才是 kill
+        # helper 子进程的地方），不能留给事件循环 teardown 静默丢弃。
+        assert hung[1].cancelled() or hung[1].done(), (
+            "未完成的 consolidation 没被显式取消，helper 会成为孤儿"
+        )
+    finally:
+        for t in hung:
+            t.cancel()
+        await asyncio.gather(*hung, return_exceptions=True)
+
+
+def test_shutdown_stays_within_its_total_budget(monkeypatch):
+    asyncio.run(_check_shutdown_stays_within_its_total_budget(monkeypatch))
+
+
+def test_shutdown_budget_fits_run_sh_backend_grace():
+    """总预算必须真的小于 run.sh 里 backend 的 stop grace。
+
+    两个数字分居两个文件，改了一边忘了另一边就等于没有这道闸门：预算若涨过 grace，
+    `bash run.sh stop` 依旧会在 shutdown 收尾前 kill -9 后端。
+    """
+    import re
+
+    run_sh = (Path(__file__).resolve().parent.parent / "run.sh").read_text()
+    m = re.search(r'stop_one\s+"backend"\s+"\$BACKEND_PID"\s+(\d+)', run_sh)
+    assert m, "run.sh 里找不到 backend 的 stop grace，闸门失效"
+    grace = int(m.group(1))
+    budget = agent_runner_mod._shutdown_total_budget_seconds()
+    assert budget < grace, (
+        f"shutdown 总预算 {budget}s 不小于 run.sh 的 backend grace {grace}s"
+    )
