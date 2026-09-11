@@ -863,7 +863,10 @@ async def _check_shutdown_drops_a_recycled_pgid(monkeypatch, tmp_path):
     # so shutdown() reaches the SIGKILL phase, where the recycled pgid would be
     # killed if it were still tracked by bare number.
     victim_pgid, victim_worker, victim_leader = _live_group_with_stubborn_worker()
-    runner._live_runs["run-victim"] = {"pid": victim_pgid}
+    # 带上 spawn 时读到的身份 —— 两条 spawn 路径都是这么记的（真实值，此刻还没打桩）。
+    runner._live_runs["run-victim"] = {
+        "pid": victim_pgid, "pid_start": _read_proc_start_time(victim_pgid),
+    }
 
     # Report a different start time for the first group's leader from now on.
     # Everything else about /proc stays truthful, so its group still reads alive
@@ -1754,3 +1757,106 @@ def test_group_state_revalidates_a_live_leader_after_the_scan(monkeypatch):
             except ProcessLookupError:
                 pass
         leader.wait(timeout=10)
+
+
+def _pty_shaped_run(pgid):
+    """一条 PTY 形状的 _live_runs 记录：没有 proc 句柄，只有收割 future。
+
+    _run_pty_mode 用 os.fork + 一条 waitpid 线程，没有 asyncio 的 proc 对象 —— 闸门
+    拒发时 pipe 路径那套 proc.terminate()/kill() 兜底在这里根本不存在。pid_start=None
+    复现的是 spawn 时那一次 /proc 读瞬时失败（EIO/ENOMEM 之类）。
+    """
+    return {
+        "pid": pgid,
+        "pid_start": None,
+        # 未 done ⇒ 子进程还没被我们 waitpid 回收 ⇒ 这个号还被我们占着。
+        "reaped": asyncio.get_event_loop().create_future(),
+        "task_id": None,
+    }
+
+
+async def _check_pty_shutdown_recaptures_a_missing_leader_identity(monkeypatch):
+    """spawn 时身份读失败的 PTY 组，shutdown 必须补读身份后照常杀掉。
+
+    上一轮给 PTY 路径加了"spawn 时读一次 leader_start"，但那一次读可能瞬时失败并记成
+    None：此后 _killpg_verified 每一发都被闸门拒发，而 PTY 记录没有 proc 句柄可以兜底
+    —— 关 transport 只让读循环收尾，进程组照样活着。于是 `run.sh stop/restart` 永久漏
+    掉这个组（它还握着 codex writer lock），下次启动也只会"保留"而不是杀掉它。
+
+    子进程未被回收期间内核不会重新出让这个号，所以此时补读到的 starttime 必然就是我们
+    那个 leader 的 —— 补上之后闸门重新放行，而不是退回按裸 pgid 投递。
+    """
+    monkeypatch.setattr(app_state, "tasks", {})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    # SIGTERM 窗口不用等：worker 装了 SIG_IGN，本来就得靠 SIGKILL 阶段。
+    monkeypatch.setattr(agent_runner_mod, "_sigterm_grace_seconds", lambda: 0)
+    monkeypatch.setattr(agent_runner_mod, "_sigkill_grace_seconds", lambda: 2)
+
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    runner = AgentRunner()
+    runner._live_runs["run-pty"] = _pty_shaped_run(pgid)
+    try:
+        await runner.shutdown()
+        await asyncio.sleep(0.5)
+        assert not _alive(worker), (
+            "spawn 时身份读失败让整个 PTY 组永久过不了闸门，SIGKILL 一发都没落地"
+        )
+    finally:
+        runner._live_runs.clear()
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+
+
+def test_pty_shutdown_recaptures_a_missing_leader_identity(monkeypatch):
+    asyncio.run(
+        _check_pty_shutdown_recaptures_a_missing_leader_identity(monkeypatch)
+    )
+
+
+async def _check_pty_shutdown_falls_back_to_the_direct_child(monkeypatch):
+    """补读也失败时，PTY 路径至少要把自家那个直接子进程 signal 掉。
+
+    /proc 一直读不出身份 ⇒ _group_state 恒为 UNKNOWN ⇒ 闸门拒发（这是对的，UNKNOWN
+    不许投递）。pipe 路径此时还有 proc.terminate()/kill() 兜底，PTY 路径原来什么都没有
+    —— 连我们自己 fork 出来的那个直接子进程都收不到信号，`run.sh stop` 之后它继续跑。
+
+    兜底投递前现读一次 ppid 确认父进程是自己，所以它和 handle 版一样不可能打到被回收
+    复用的陌生进程 —— 不是退回按裸 pid 投递。
+    """
+    monkeypatch.setattr(app_state, "tasks", {})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    monkeypatch.setattr(agent_runner_mod, "_sigterm_grace_seconds", lambda: 0)
+    monkeypatch.setattr(agent_runner_mod, "_sigkill_grace_seconds", lambda: 2)
+
+    # leader 本身对 SIGTERM/SIGKILL 都是默认处理，它就是被兜底的那个直接子进程。
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    leader_id = _identity(pgid)
+    real = _real_pid_is_absent
+    # 目录还在但 stat 读不出来：既不是缺席也不是身份不符，正是 UNKNOWN 那一格。
+    # 兜底路径读的是 ppid（独立函数、独立字段），所以不打它。
+    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", lambda p: real(p))
+    runner = AgentRunner()
+    runner._live_runs["run-pty"] = _pty_shaped_run(pgid)
+    try:
+        await runner.shutdown()
+        await asyncio.sleep(0.5)
+        assert not _alive_as(pgid, leader_id), (
+            "身份无法核验时 PTY 的直接子进程一个信号都没收到"
+        )
+    finally:
+        runner._live_runs.clear()
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+
+
+def test_pty_shutdown_falls_back_to_the_direct_child(monkeypatch):
+    asyncio.run(_check_pty_shutdown_falls_back_to_the_direct_child(monkeypatch))

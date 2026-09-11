@@ -1114,6 +1114,12 @@ class AgentRunner:
 
             threading.Thread(target=_wait_child, daemon=True).start()
 
+            if run_id in self._live_runs:
+                # PTY 没有 pipe 的 proc 句柄，"这个 pid 还是不是我们自己的子进程"只能
+                # 靠这个 future：未 done 即代表还没 waitpid 回收，号码不会被内核出让。
+                # shutdown 用它决定能不能补读 leader 身份、能不能按自家子进程直投。
+                self._live_runs[run_id]["reaped"] = wait_future
+
             reader = asyncio.StreamReader()
             read_protocol = asyncio.StreamReaderProtocol(reader)
             read_transport, _ = await loop.connect_read_pipe(
@@ -2159,6 +2165,21 @@ class AgentRunner:
                 )
                 self._record_retained_pgid(task_id, pgid, leader_start)
 
+        def _run_identity(run: dict, pid: int) -> tuple[int, int | None]:
+            """(pgid, leader_start)，spawn 时身份读失败的话补读一次并回写。
+
+            回写是关键：补读只在"子进程尚未被回收"的窗口内有效，而 shutdown 会把这两个
+            阶段的循环各跑很多轮 —— 不缓存的话，等收割线程 done 之后再补读就永远失败，
+            同一个组在 signaled_pgids 里又多出一条 None 身份的条目（闸门永远拒发它，
+            _prune_signaled 也永远摘不掉它，SIGKILL 阶段因此空转到预算耗尽）。
+            """
+            leader_start = run.get("pid_start")
+            if leader_start is None:
+                leader_start = _recapture_leader_start(pid, _run_child_unreaped(run))
+                if leader_start is not None:
+                    run["pid_start"] = leader_start
+            return (pid, leader_start)
+
         def _sigterm_all() -> None:
             # Iterate _live_runs (keyed by run_id, never overwritten by an
             # unrelated run) rather than the task_id-keyed _pids/_async_procs
@@ -2183,7 +2204,14 @@ class AgentRunner:
                     # reaped, and reading then would either get None or, worse,
                     # a new holder's start time — baking the impostor's identity
                     # into the map as though it were ours.
-                    entry = (pid, run.get("pid_start", _read_proc_start_time(pid)))
+                    entry = (pid, run.get("pid_start"))
+                    if entry[1] is None:
+                        # spawn 时那一次 /proc 读失败（PTY 路径尤其没有 proc 句柄可以
+                        # 兜底）。只要子进程还没被回收，号码就还被我们占着，补读到的
+                        # 身份必然是我们那个 leader —— 补上闸门就能重新放行，而不是
+                        # 让整个组从此收不到任何信号。补不到就仍然是 None（闸门继续
+                        # 拒发），下面按自家子进程直投。
+                        entry = _run_identity(run, pid)
                     signaled_pgids.setdefault(entry, run.get("task_id"))
                     group_signaled = _killpg_verified(*entry, signal.SIGTERM)
                 proc = run.get("proc")
@@ -2199,6 +2227,12 @@ class AgentRunner:
                         proc.terminate()
                     except ProcessLookupError:
                         pass
+                elif proc is None and pid is not None and not group_signaled:
+                    # PTY 路径的等价兜底。它没有 proc 句柄，闸门拒发后原来只剩关
+                    # transport（那只让读循环收尾，进程组照样活着）—— `run.sh
+                    # stop/restart` 会把这个组永久留在机器上。按 ppid 核过再投，
+                    # 与 handle 版一样不可能打到陌生进程。
+                    _kill_direct_child(pid, signal.SIGTERM)
 
         _sigterm_all()
         _signal_retained(signal.SIGTERM)
@@ -2283,9 +2317,11 @@ class AgentRunner:
                         # finalization keeps its entry here after its group has
                         # exited, so this delivery is as exposed to pid reuse as
                         # the tracked-pgid loop above.
-                        entry = (
-                            pid, run.get("pid_start", _read_proc_start_time(pid))
-                        )
+                        entry = (pid, run.get("pid_start"))
+                        if entry[1] is None:
+                            # 同 _sigterm_all：spawn 时读失败不该让这一组永久过不了
+                            # 闸门。子进程未回收 ⇒ 号码还是我们的 ⇒ 补读的身份可用。
+                            entry = _run_identity(run, pid)
                         signaled_pgids.setdefault(entry, run.get("task_id"))
                         group_signaled = _killpg_verified(*entry, signal.SIGKILL)
                     proc = run.get("proc")
@@ -2298,6 +2334,10 @@ class AgentRunner:
                             proc.kill()
                         except ProcessLookupError:
                             pass
+                    elif proc is None and pid is not None and not group_signaled:
+                        # PTY 路径：闸门拒发时唯一还能落地的一发 SIGKILL。关 transport
+                        # 只是让读循环退出，杀不掉任何进程。
+                        _kill_direct_child(pid, signal.SIGKILL)
                     # SIGKILL to the recorded pid/pgid can't reach a detached
                     # grandchild that still holds the pty slave fd open — that
                     # case only unblocks via the internal 60s lingering-writer
@@ -2498,6 +2538,75 @@ def _read_proc_start_time(pid: int) -> int | None:
         return int(fields[19])
     except Exception:
         return None
+
+
+def _read_ppid(pid: int) -> int | None:
+    """Read /proc/<pid>/stat field 4 (parent pid)."""
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = _stat_fields_after_comm(stat_text)
+        if len(fields) < 2:
+            return None
+        return int(fields[1])
+    except Exception:
+        return None
+
+
+def _recapture_leader_start(pid: int, unreaped: bool) -> int | None:
+    """spawn 时身份读失败后补读一次，仅限 *pid* 仍是我们没回收的子进程时。
+
+    身份闸门存在的前提是"号码可能已经被出让给别人"，而一个还没被 waitpid 收割的子
+    进程会以 zombie 形式一直占着这个号 —— 内核不会重新分配它。所以在 *unreaped* 为真
+    的窗口里补读到的 starttime 仍然是我们那个 leader 的，可以当基准用。spawn 那一次
+    读失败（EIO/ENOMEM 之类的瞬时失败）不该让这一整组从此过不了闸门：PTY 路径没有
+    proc 句柄可以兜底，那等于 `run.sh stop/restart` 永久漏掉这个组。
+
+    额外核一次 ppid == 我们自己：万一 unreaped 的判断本身滞后（收割线程刚从 waitpid
+    返回、标记还没写回），此时号码若已被重新出让，读到的身份不会被当成我们的放行。
+    """
+    if not unreaped:
+        return None
+    if _read_ppid(pid) != os.getpid():
+        return None
+    return _read_proc_start_time(pid)
+
+
+def _run_child_unreaped(run: dict) -> bool:
+    """*run* 的直接子进程是否还没被我们 waitpid 回收。
+
+    未回收的子进程即使已经退出也以 zombie 形式占着 pid，内核不会把这个号重新出让给
+    别人 —— 这是"补读身份/按 pid 兜底不会打到复用者"的唯一依据。pipe 用 returncode
+    （asyncio 收割之后才置值），PTY 用收割线程那个 future。两者都取不到就当"不能确定"
+    处理，不补读也不兜底。
+    """
+    proc = run.get("proc")
+    if proc is not None:
+        return proc.returncode is None
+    reaped = run.get("reaped")
+    if reaped is not None:
+        return not reaped.done()
+    return False
+
+
+def _kill_direct_child(pid: int, sig: int) -> bool:
+    """向仍是我们自家子进程的 *pid* 投递 *sig*；否则不发。
+
+    PTY 路径在闸门拒发时的兜底：它没有 pipe 那样的 proc 句柄，killpg 一旦被拒
+    （身份读不出来，或号码已被出让），直接子进程就一个信号都收不到，仅关掉
+    transport 只是让读循环收尾，进程组照样活着。
+
+    投递前现读一次 ppid：收割线程可能刚从 waitpid 返回而 future 标记还没写回，那个
+    窗口里号码已经可以被重新出让。父进程是自己就排除了误伤陌生进程 —— 与
+    _killpg_verified 同样是"按身份而非裸 pid 投递"。
+    """
+    if _read_ppid(pid) != os.getpid():
+        return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+
 
 def _pid_is_absent(pid: int) -> bool:
     """True only when /proc has no entry for *pid* at all.
