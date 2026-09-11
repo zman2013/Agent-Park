@@ -257,6 +257,15 @@ class CodexAdapter(BaseAdapter):
             if not isinstance(state, dict):
                 continue
             if state.get("status") in _PENDING_STATUSES:
+                # Back to pending means this thread will answer again, so
+                # whatever it says next is a new reply even if the text
+                # repeats. This is what covers resume_agent, which carries no
+                # prompt to trigger the reset above: a resumed agent returning
+                # its previous text would otherwise be read as an echo and its
+                # tool call would render with no result. Keyed on the observed
+                # state transition rather than on the verb, so an
+                # interrupt/resume pair spelled any other way is covered too.
+                self._shown_replies.pop(tid, None)
                 continue
             text = (state.get("message") or "").strip()
             if not text or self._shown_replies.get(tid) == text:

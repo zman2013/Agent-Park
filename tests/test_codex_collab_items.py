@@ -353,6 +353,39 @@ def test_repeated_wait_polling_does_not_replay_shown_replies():
                        f"[{CodexAdapter._short_tid(b)} completed]\nreply-B"], replies
 
 
+def test_resumed_agent_repeating_its_answer_is_shown_again():
+    """resume_agent carries no prompt, so the prompt-based reset misses it.
+
+    A resumed agent that legitimately returns its previous text would be read
+    as an echo and its tool call would render with no result. The signal used
+    instead is the observed state transition: a thread back at pending_init
+    will answer again.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+    label = CodexAdapter._short_tid(tid)
+
+    async def drive():
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "wait", tids=[tid],
+                             states={tid: {"status": "completed", "message": "alpha"}})}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_1", "resume_agent", tids=[tid],
+                             states={tid: {"status": "pending_init", "message": "alpha"}})}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_2", "wait", tids=[tid],
+                             states={tid: {"status": "completed", "message": "alpha"}})}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert replies == [f"[{label} completed]\nalpha",
+                       f"[{label} completed]\nalpha"], replies
+
+
 @pytest.mark.parametrize("status", [
     "completed", "interrupted", "errored", "not_found", "shutdown",
     "some_future_status",
