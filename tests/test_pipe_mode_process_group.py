@@ -308,21 +308,35 @@ def _live_group_with_graceful_worker(marker, delay=0.6):
     """A live setsid leader whose worker exits on SIGTERM, but not instantly.
 
     The worker takes *delay* seconds to shut down cleanly and touches *marker* on
-    its way out; a SIGKILL arriving inside that window leaves no marker. That is
+    its way out; a SIGTERM arriving inside that window leaves no marker. That is
     the observable difference between "shutdown gave the group a graceful TERM
     interval" and "shutdown escalated in the same loop turn".
 
     SIG_IGN is installed at handler entry so the repeated SIGTERMs of shutdown's
     drain cannot re-enter the handler. Returns (pgid, worker_pid, leader_popen).
+
+    Readiness is a handshake FROM THE WORKER, not the leader's pid print: on a
+    scheduler where the parent resumes right after Popen, the pid line can be
+    printed before the worker has reached signal.signal(). shutdown() would then
+    deliver SIGTERM under the default disposition, the worker would die instantly
+    without touching *marker*, and the test would fail on timing alone. The worker
+    writes a ready file as its LAST step before sleeping, so waiting for that file
+    proves the handler is installed.
     """
+    ready = Path(str(marker) + ".worker-ready")
     worker_src = (
-        "import signal,sys,time\n"
+        "import os,signal,sys,time\n"
         "def _bye(*_):\n"
         "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         f"    time.sleep({delay})\n"
         f"    open({str(marker)!r}, 'w').close()\n"
         "    sys.exit(0)\n"
         "signal.signal(signal.SIGTERM, _bye)\n"
+        # Handler installed — only now announce readiness. os.replace so the
+        # parent can never observe a half-created file.
+        f"tmp = {str(ready)!r} + '.tmp'\n"
+        "open(tmp, 'w').close()\n"
+        f"os.replace(tmp, {str(ready)!r})\n"
         "time.sleep(300)\n"
     )
     leader = subprocess.Popen(
@@ -339,6 +353,11 @@ def _live_group_with_graceful_worker(marker, delay=0.6):
         start_new_session=True,
     )
     pgid, worker = (int(x) for x in leader.stdout.readline().split())
+    for _ in range(100):
+        if ready.exists():
+            break
+        time.sleep(0.05)
+    assert ready.exists(), "worker never installed its SIGTERM handler"
     assert _alive(pgid) and _alive(worker)
     assert os.getpgid(worker) == pgid
     return pgid, worker, leader
@@ -1344,10 +1363,15 @@ async def _check_shutdown_rechecks_signaled_after_sigkill(monkeypatch, tmp_path)
 
     这里用一个只有 pid、没有 task/proc 的 live run（wrapper 已退出、entry 尚在的形状）
     喂进 signaled_pgids，然后让判决连续几轮报 UNKNOWN 模拟 SIGKILL 尚未落地。
+
+    SIGTERM 的 graceful 窗口压到 0：那一段现在同样会为 signaled_pgids 轮询（这是本轮另一
+    条修复），不压小的话组会在 graceful 阶段就等到确定判决，SIGKILL 阶段反而无事可做，
+    这个断言就测不到它本来要守的东西了。
     """
     pgid, leader_start = 515151, 777
     monkeypatch.setattr(app_state, "tasks", {})
     monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    monkeypatch.setattr(agent_runner_mod, "_sigterm_grace_seconds", lambda: 0)
     verdicts = {"n": 0}
 
     def fake_state(_pgid, _start):
@@ -1391,6 +1415,110 @@ async def _check_shutdown_rechecks_signaled_after_sigkill(monkeypatch, tmp_path)
 
 def test_shutdown_rechecks_signaled_groups_after_sigkill(monkeypatch, tmp_path):
     asyncio.run(_check_shutdown_rechecks_signaled_after_sigkill(monkeypatch, tmp_path))
+
+
+async def _check_sigterm_grace_covers_signaled_only_groups(monkeypatch, tmp_path):
+    """SIGTERM 的 graceful 窗口也要把 signaled_pgids 算进去。
+
+    wrapper 收到 SIGTERM 立刻退出、后代关掉 stdout 但仍在 graceful cleanup：_on_done
+    把唯一那条 _live_runs 记录摘掉，组就只剩 signaled_pgids 这一份把手（不属于任何 live
+    run，也不在 retained_pgids 里 —— 那份只装 kill_task 记下的旧组）。循环条件若只看
+    _live_runs/retained_pgids，此刻立即为假，shutdown 直接跳到 SIGKILL —— 承诺的 10s
+    graceful 窗口那个后代一秒都没拿到，收尾写一半就被打断。
+
+    worker 装好 handler 后要 3s 才干净退出并留下 marker；marker 存在即证明它拿到了
+    graceful 窗口，不存在就说明 SIGKILL 在同一个事件循环回合里就落下来了。
+
+    delay 特意远大于 0.6s：_group_state 每次都要扫一遍 /proc（约 0.3s），坏实现在
+    "break → prune → escalate" 这一路上会白捡几百毫秒的间隔，短 delay 会被这点偶然
+    余量盖住，测试就成了空守卫。
+    """
+    marker = tmp_path / "worker-exited-cleanly"
+    pgid, worker, leader = _live_group_with_graceful_worker(marker, delay=3.0)
+    worker_id = _identity(worker)
+    monkeypatch.setattr(app_state, "tasks", {})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    runner = AgentRunner()
+    # 只有 pid：没有 task 可 await，也没有 proc/transport —— _on_done 摘掉 entry 前后
+    # 那一瞬的形状。SIGTERM 首发把它登记进 signaled_pgids。
+    runner._live_runs["run-signaled"] = {
+        "pid": pgid, "pid_start": _read_proc_start_time(pgid),
+    }
+
+    async def _drop_entry():
+        # wrapper 退出、_on_done 移除 entry：组只剩 signaled_pgids 这一份把手。
+        await asyncio.sleep(0.05)
+        runner._live_runs.pop("run-signaled", None)
+
+    dropper = asyncio.ensure_future(_drop_entry())
+    try:
+        await runner.shutdown()
+        assert marker.exists(), (
+            "_live_runs 一空 SIGTERM 窗口就结束了，独立跟踪的组没拿到 graceful 间隔"
+        )
+        assert not _alive_as(worker, worker_id), (
+            "shutdown 返回时该组还活着，说明投递之后没有任何等待/复检"
+        )
+    finally:
+        dropper.cancel()
+        runner._live_runs.clear()
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+
+
+def test_sigterm_grace_covers_signaled_only_groups(monkeypatch, tmp_path):
+    asyncio.run(_check_sigterm_grace_covers_signaled_only_groups(monkeypatch, tmp_path))
+
+
+async def _check_unfinished_notifications_are_cancelled(monkeypatch):
+    """通知 drain 超时后必须显式取消，不能留给事件循环 teardown 静默丢弃。
+
+    进程组两阶段吃满 17s、consolidation 还占着 13s 时，通知 drain 只剩约 60s，装不下
+    80s 的最坏情况 —— 也就是说"外层等待先超时"是常态而非边角。asyncio.wait 的 timeout
+    并不取消 pending 任务，于是 send_feishu_card 的 except CancelledError（杀掉并回收
+    feishu-bot CLI 子进程的地方）永远不跑：run.sh 只 signal 后端 PID，那个 CLI 就在后端
+    退出后成了孤儿。丢掉最新那张卡是可接受的降级，漏下子进程不是。
+    """
+    budget = 6
+    monkeypatch.setattr(
+        agent_runner_mod, "_shutdown_total_budget_seconds", lambda: budget
+    )
+    runner = AgentRunner()
+    assert not runner._live_runs
+    reaped = {"done": False}
+
+    async def _hung_notify():
+        try:
+            await asyncio.sleep(600)
+        except asyncio.CancelledError:
+            # send_feishu_card 的取消分支就长这样：kill 之后 await 一个 shielded 的 reap
+            # 再抛出。收尾需要真正的 await 回合，所以取消之后必须还剩时间给它跑完 ——
+            # 那正是 reserve 存在的理由。shield 是因为这本就在取消路径上。
+            await asyncio.shield(asyncio.sleep(0.3))
+            reaped["done"] = True
+            raise
+
+    notify = asyncio.ensure_future(_hung_notify())
+    runner._notify_tasks.add(notify)
+    try:
+        await runner.shutdown()
+        assert notify.cancelled() or notify.done(), (
+            "未完成的通知没被显式取消，feishu-bot CLI 子进程会成为孤儿"
+        )
+        assert reaped["done"], (
+            "通知的取消分支没跑完 —— 取消之后没有留出 kill-and-reap 的时间"
+        )
+    finally:
+        notify.cancel()
+        await asyncio.gather(notify, return_exceptions=True)
+
+
+def test_unfinished_notifications_are_cancelled_and_reaped(monkeypatch):
+    asyncio.run(_check_unfinished_notifications_are_cancelled(monkeypatch))
 
 
 async def _check_shutdown_stays_within_its_total_budget(monkeypatch):

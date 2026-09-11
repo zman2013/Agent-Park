@@ -42,6 +42,15 @@ SESSIONS_FILE = DATA_DIR / "sessions.json"
 # under run.sh's force-kill grace for the backend.
 NOTIFY_DRAIN_BASE_SECONDS = 40
 
+# 通知被取消后，留给它 kill-and-reap CLI 子进程的时间。send_feishu_card 的取消分支
+# 走 SIGKILL 再 reap，正常瞬间完成；这个窗口是为"取消一定有机会跑完"而存在的下限。
+#
+# 为什么必须单独留额度：17s（SIGTERM/SIGKILL/cancel）+ 80s（通知 drain）+ 13s
+# （consolidation drain/cancel）= 110s，本来就装不进 90s 总预算，通知 drain 注定被
+# 压缩。被压缩本身可以接受（最坏是丢掉最新那张卡，下次启动没有补发义务），但绝不能连
+# 收尾都没时间跑 —— 那样 feishu-bot CLI 子进程会在后端退出后成为孤儿。
+NOTIFY_KILL_SECONDS = 5
+
 # shutdown()'s drain window for history-triggered consolidations. Deliberately
 # small: the notify drain above can already consume 80s of run.sh's 95s
 # force-kill grace, so there is no room to wait out a consolidation's LLM calls
@@ -66,6 +75,19 @@ CONSOLIDATE_KILL_SECONDS = 8
 # 留 5s 余量给 uvicorn 自身的 lifespan/连接收尾。
 SHUTDOWN_TOTAL_BUDGET_SECONDS = 90
 
+# 进程组两阶段各自的上限（仍与总预算取小）。抽成常量+访问器，和下面通知/consolidation
+# 的窗口同一套写法：数字有名字可讲，测试也能压小它们而不必真的等满 10+5 秒。
+SHUTDOWN_SIGTERM_GRACE_SECONDS = 10
+SHUTDOWN_SIGKILL_GRACE_SECONDS = 5
+
+
+def _sigterm_grace_seconds() -> int:
+    return SHUTDOWN_SIGTERM_GRACE_SECONDS
+
+
+def _sigkill_grace_seconds() -> int:
+    return SHUTDOWN_SIGKILL_GRACE_SECONDS
+
 
 def _shutdown_total_budget_seconds() -> int:
     return SHUTDOWN_TOTAL_BUDGET_SECONDS
@@ -83,6 +105,10 @@ def _notify_drain_max_seconds() -> int:
     from server.task_notify import MAX_SERIAL_SENDS
 
     return NOTIFY_DRAIN_BASE_SECONDS * MAX_SERIAL_SENDS
+
+
+def _notify_kill_seconds() -> int:
+    return NOTIFY_KILL_SECONDS
 
 
 class _RunContext:
@@ -2046,6 +2072,17 @@ class AgentRunner:
         # bare number retained across it could name an unrelated group by the
         # time the SIGKILL phase reads it.
         signaled_pgids: dict[int, int | None] = {}
+
+        def _prune_signaled() -> None:
+            """只摘掉拿到确定判决（GONE/FOREIGN）的号。
+
+            UNKNOWN 不是死亡证据（见 _group_state），把它当成消失就等于放走一个可能还
+            活着的后代。留在集合里的号即意味着"还有 OURS/UNKNOWN 要继续等/复检"。
+            """
+            for pgid, leader_start in list(signaled_pgids.items()):
+                if _group_state(pgid, leader_start) in (_GROUP_GONE, _GROUP_FOREIGN):
+                    signaled_pgids.pop(pgid, None)
+
         # kill_task 判决"没能证明消失"的旧组：后续 resume 已经把 subprocess_pid 换成
         # 新 pid，它们既不在 _live_runs 里，也不在上面这份 signaled_pgids 里，唯一的
         # 把手是任务元数据的 retained_pgids。只靠 restore_orphan_tasks 收割意味着
@@ -2138,18 +2175,31 @@ class AgentRunner:
         # our snapshot. Repeatedly re-snapshotting and SIGTERM'ing any
         # newcomers until the set actually drains (or the overall budget below
         # runs out) keeps such continuations from being silently orphaned.
-        deadline = loop.time() + _budget_left(10)
-        while (self._live_runs or retained_pgids) and loop.time() < deadline:
+        deadline = loop.time() + _budget_left(_sigterm_grace_seconds())
+        # signaled_pgids 也要进循环条件（与下面 SIGKILL 阶段的复检循环对称）：wrapper 收
+        # 到 SIGTERM 后立刻退出、后代把 stdout 关掉但仍在 graceful cleanup 时，_on_done
+        # 会把唯一那条 _live_runs 记录摘掉 —— 组只剩 signaled_pgids 这一份把手（它既不属
+        # 于任何 live run，也不在 retained_pgids 里，那份只装 kill_task 记下的旧组）。
+        # 只看 _live_runs/retained_pgids 的话条件立刻为假，shutdown 直接跳到 SIGKILL，
+        # 说好的 10s graceful 窗口那个后代一秒都没拿到，收尾写一半就被打断。
+        _prune_signaled()
+        while (
+            (self._live_runs or retained_pgids or signaled_pgids)
+            and loop.time() < deadline
+        ):
             _sigterm_all()  # catch pids/procs registered by new continuations
             _signal_retained(signal.SIGTERM)
+            # 每轮开头复核：拿到 GONE/FOREIGN 的号摘掉，否则一个早就退干净的组会把整个
+            # graceful 窗口耗满（原来靠 _live_runs 变空来收敛）。
+            _prune_signaled()
             tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
             if not tasks:
-                if not retained_pgids:
+                if not retained_pgids and not signaled_pgids:
                     break
-                # 保留组没有任何 asyncio task 可以 await（它们本来就不属于哪个 live
-                # run），但"没东西可等"不等于"可以立刻升级"。按短间隔轮询到 deadline，
-                # 保留组才真正拿到一段 graceful SIGTERM 窗口；否则 _live_runs 一空，
-                # 下面就在同一个事件循环回合里 SIGKILL 了它。
+                # 保留组/独立跟踪的组没有任何 asyncio task 可以 await（它们本来就不属于哪
+                # 条 live run），但"没东西可等"不等于"可以立刻升级"。按短间隔轮询到
+                # deadline，它们才真正拿到一段 graceful SIGTERM 窗口；否则 _live_runs 一
+                # 空，下面就在同一个事件循环回合里 SIGKILL 了它。
                 await asyncio.sleep(min(0.2, max(0.0, deadline - loop.time())))
                 continue
             # Poll on a short interval rather than waiting the full remaining
@@ -2163,15 +2213,13 @@ class AgentRunner:
         # Anything not provably finished keeps the escalation phase alive.
         # _GROUP_UNKNOWN counts: it means we could not verify, not that the group
         # died, and excluding it would skip SIGKILL on a live descendant.
-        lingering_pgids = {
-            p for p, start in signaled_pgids.items()
-            if _group_state(p, start) in (_GROUP_OURS, _GROUP_UNKNOWN)
-        }
+        # _prune_signaled 只摘掉 GONE/FOREIGN，所以剩下的就是 OURS/UNKNOWN。
+        _prune_signaled()
         # 保留组同样要能把 SIGKILL 阶段拉起来：SIGTERM 之后它们可能仍是 OURS/UNKNOWN，
         # 而 _live_runs 与 signaled_pgids 都可能已经空了（这些组本来就不属于任何 live
         # run）。_refresh_retained 顺便剔掉已有确定判决的条目。
         _refresh_retained()
-        if self._live_runs or lingering_pgids or retained_pgids:
+        if self._live_runs or signaled_pgids or retained_pgids:
             # SIGTERM didn't finish the job in time — escalate to SIGKILL
             # and give finalization a second, shorter window. run.sh's
             # stop grace was sized to cover this (see do_stop). Without
@@ -2187,12 +2235,8 @@ class AgentRunner:
                 # Drop only pgids with a definite death/foreign verdict: an
                 # unverifiable one may still be alive, and forgetting it here is
                 # how a live descendant escapes the escalation entirely.
+                _prune_signaled()
                 for pgid, leader_start in list(signaled_pgids.items()):
-                    if _group_state(pgid, leader_start) in (
-                        _GROUP_GONE, _GROUP_FOREIGN
-                    ):
-                        signaled_pgids.pop(pgid, None)
-                        continue
                     _killpg_verified(pgid, leader_start, signal.SIGKILL)
                 for run in list(self._live_runs.values()):
                     pid = run.get("pid")
@@ -2236,7 +2280,7 @@ class AgentRunner:
             # kill_existing=False continuation during this escalation window,
             # registering yet another _live_runs entry that a one-shot
             # snapshot+wait would silently miss.
-            kill_deadline = loop.time() + _budget_left(5)
+            kill_deadline = loop.time() + _budget_left(_sigkill_grace_seconds())
             # Unconditional first pass: the loop below is gated on _live_runs,
             # which can already be empty here when the only thing left is a
             # lingering process group (its run entry dropped on stdout EOF).
@@ -2299,14 +2343,32 @@ class AgentRunner:
         # coroutine scheduled but not yet started.
         if self._notify_tasks:
             # 只有真有 consolidation 在飞时才为它留额度，否则通知白白少等一截。
-            reserve = (
+            # 无论如何都要为通知自己的 kill-and-reap 留一段：drain 被压缩时（17s 进程组
+            # + 13s consolidation 之后只剩 60s，装不下 80s）超时的通知不会被 asyncio.wait
+            # 取消，事件循环 teardown 会把它静默丢弃 —— 它的 except CancelledError 才是
+            # 杀掉 feishu-bot CLI 子进程的地方，不跑就留下孤儿（run.sh 只 signal 后端 PID）。
+            reserve = _notify_kill_seconds() + (
                 _consolidate_drain_seconds() + _consolidate_kill_seconds()
                 if self._consolidate_tasks else 0
             )
-            await asyncio.wait(
-                list(self._notify_tasks),
+            pending_notify = list(self._notify_tasks)
+            _, still_sending = await asyncio.wait(
+                pending_notify,
                 timeout=_budget_left(_notify_drain_max_seconds(), reserve),
             )
+            # 与下面 consolidation 同一套处理：显式取消 + 给收尾一小段时间，而不是把没跑
+            # 完的通知留给 teardown。丢卡是可接受的降级，漏下 CLI 子进程不是。
+            for t in still_sending:
+                t.cancel()
+            if still_sending:
+                await asyncio.wait(
+                    still_sending,
+                    timeout=_budget_left(
+                        _notify_kill_seconds(),
+                        _consolidate_drain_seconds() + _consolidate_kill_seconds()
+                        if self._consolidate_tasks else 0,
+                    ),
+                )
 
         # History-triggered consolidations write layer documents, so cancelling
         # one mid-flight is worse than waiting: os.replace makes the write itself
