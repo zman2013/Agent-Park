@@ -578,6 +578,8 @@ class AgentRunner:
         # task_ids whose kill_task ended without proof that the group is gone
         # (闸门因 _GROUP_UNKNOWN 拒发，或组扛过了 SIGKILL)。_cleanup_run_resources
         # 见到它就保留 subprocess_pid，让下次启动的 restore_orphan_tasks 再试一次。
+        # 只管"这一轮别把 pid 清掉"；跨 resume 的把手另记在任务的 retained_pgids
+        # 元数据里（见 _record_retained_pgid），因为新进程会覆盖 subprocess_pid。
         self._retain_pid: set[str] = set()
         self._adapters: dict[str, BaseAdapter] = {}  # task_id -> active adapter
         self._session_ids: dict[str, str] = self._load_sessions()
@@ -1595,6 +1597,28 @@ class AgentRunner:
 
     # ── kill ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _record_retained_pgid(
+        task_id: str, pgid: int, leader_start: int | None
+    ) -> None:
+        """记下一个"没能证明已消失"的进程组，与 subprocess_pid 分开存。
+
+        subprocess_pid 描述的是"当前这一轮跑的是谁"，resume 会理所当然地覆盖它。
+        但一个扛过 SIGKILL、或身份始终核验不出来的组，可能还握着 codex 的 writer
+        lock；覆盖之后它就没有任何把手了。retained_pgids 是一份 append-only 的
+        (pgid, leader_start) 列表，只由 restore_orphan_tasks 在证明其消失后摘除。
+        """
+        task = app_state.get_task(task_id)
+        if task is None:
+            return
+        retained = list(getattr(task, "retained_pgids", None) or [])
+        entry = [pgid, leader_start]
+        # 同一个组反复 kill 不该堆重复项。身份一起比，被回收的号是不同的条目。
+        if entry not in retained:
+            retained.append(entry)
+            object.__setattr__(task, "retained_pgids", retained)
+            app_state.save_agent_tasks(task.agent_id)
+
     async def kill_task(self, task_id: str) -> None:
         """Terminate subprocess for a task."""
         # Note: _compact_warned is intentionally NOT cleared here. send_input()
@@ -1683,6 +1707,11 @@ class AgentRunner:
             # 持有者）唯一的把手。标记一下，别让 _cleanup_run_resources 把它清掉。
             if state not in (_GROUP_GONE, _GROUP_FOREIGN):
                 self._retain_pid.add(task_id)
+                # subprocess_pid 只够撑到本次 cleanup：send_input 默认 kill 完立刻
+                # 起新进程，spawn 会把它覆盖成新 pid，这个也许还活着的旧组就再也
+                # 找不回来了（新 run 若同样卡在 writer lock 上失败，它的 cleanup
+                # 清掉的是新 pid）。所以另存一份带身份的把手，与当前 run 无关。
+                self._record_retained_pgid(task_id, proc.pid, leader_start)
                 logger.error(
                     "Group pgid=%d (task %s) not verifiably gone after kill_task; "
                     "retaining pid metadata for startup retry",
@@ -1720,6 +1749,12 @@ class AgentRunner:
         self._handoff_pending.discard(task_id)
         # 任务已被删除，没有下一次启动可以重试它的组了。
         self._retain_pid.discard(task_id)
+        # 同理，retained_pgids 会随任务一起消失，所以在丢掉把手前用掉它：闸门保证
+        # 只有仍属于我们的组会收到信号，被回收的号不会被误杀。不等待确认 —— 这里是
+        # 请求线程，删除路径也没有下一次可以重试了。
+        task = app_state.get_task(task_id)
+        for pgid, leader_start in list(getattr(task, "retained_pgids", None) or []):
+            _killpg_verified(pgid, leader_start, signal.SIGKILL)
         self._run_start_index.pop(task_id, None)
         self._input_locks.pop(task_id, None)
         # Cleared here, not in _cleanup_run_resources: the snapshot must outlive
@@ -1906,36 +1941,7 @@ class AgentRunner:
             # leader identity: the check above establishes ownership only at that
             # instant, and the group can exit and have its pgid re-leased during
             # the waits below.
-            if _killpg_verified(pid, expected_start_time, signal.SIGTERM):
-                logger.info("Sent SIGTERM to orphan pid %d (task %s)", pid, task_id)
-
-            # Synchronous sleep: this runs at startup before the event loop
-            # serves traffic, and the whole point is to not release the pgid
-            # until we know the group is gone. Bounded and short. Stop early only
-            # on a definite verdict — _GROUP_UNKNOWN may resolve on a later read.
-            for _ in range(10):
-                if _group_state(pid, expected_start_time) in (
-                    _GROUP_GONE, _GROUP_FOREIGN
-                ):
-                    break
-                time.sleep(0.1)
-            if _group_is_still(pid, expected_start_time):
-                logger.warning(
-                    "Orphan group pgid=%d (task %s) survived SIGTERM; escalating to SIGKILL",
-                    pid, task_id,
-                )
-                _killpg_verified(pid, expected_start_time, signal.SIGKILL)
-                # SIGKILL is not synchronous either: a member wedged in an
-                # uninterruptible wait keeps it pending and stays alive. Confirm
-                # before releasing the metadata below — this pgid is the only
-                # handle on the lock holder, so clearing it while the group lives
-                # trades a recoverable orphan for a permanent one.
-                for _ in range(10):
-                    if _group_state(pid, expected_start_time) in (
-                        _GROUP_GONE, _GROUP_FOREIGN
-                    ):
-                        break
-                    time.sleep(0.1)
+            final_state = _terminate_group_blocking(pid, expected_start_time)
 
             # Also reap zombie children
             try:
@@ -1946,7 +1952,6 @@ class AgentRunner:
                 pass
 
             task.status = TaskStatus.failed
-            final_state = _group_state(pid, expected_start_time)
             if final_state in (_GROUP_OURS, _GROUP_UNKNOWN):
                 # Keep subprocess_pid/start_time: the group outlived SIGKILL (or
                 # could not be verified at all), so the next startup should get
@@ -1968,6 +1973,32 @@ class AgentRunner:
             )
             app_state.save_agent_tasks(task.agent_id)
             cleaned.append(task_id)
+        # 扫一遍 retained_pgids：这些是历次 kill_task 没能证明消失、又被后续 resume
+        # 的新 pid 从 subprocess_pid 里挤掉的旧组。它们与任务当前状态无关（任务可能
+        # 已经成功跑完好几轮了），所以独立成一趟，只按身份核验、按身份收割。
+        for task in list(app_state.tasks.values()):
+            retained = list(getattr(task, "retained_pgids", None) or [])
+            if not retained:
+                continue
+            survivors: list[list] = []
+            for pgid, leader_start in retained:
+                state = _terminate_group_blocking(pgid, leader_start)
+                if state in (_GROUP_GONE, _GROUP_FOREIGN):
+                    logger.info(
+                        "Retained group pgid=%d (task %s) is %s; dropping the handle",
+                        pgid, task.id, state,
+                    )
+                    continue
+                # 仍是 OURS/UNKNOWN：没有死亡证据，把手必须留到下次启动。
+                logger.error(
+                    "Retained group pgid=%d (task %s) is %s after SIGKILL; keeping the "
+                    "handle for a later restart",
+                    pgid, task.id, state,
+                )
+                survivors.append([pgid, leader_start])
+            if survivors != retained:
+                object.__setattr__(task, "retained_pgids", survivors)
+                app_state.save_agent_tasks(task.agent_id)
         # Restore persisted auto-compact opt-outs across all tasks
         for task in app_state.tasks.values():
             if getattr(task, "auto_compact_disabled", False):
@@ -2371,6 +2402,36 @@ def _group_is_still(pgid: int, leader_start: int | None) -> bool:
     gone?" must compare against _GROUP_GONE instead.
     """
     return _group_state(pgid, leader_start) == _GROUP_OURS
+
+
+def _terminate_group_blocking(pgid: int, leader_start: int | None) -> str:
+    """SIGTERM → wait → SIGKILL → wait on group *pgid*; return the final verdict.
+
+    Blocking on purpose: the only caller context is startup, before the event
+    loop serves traffic, and the whole point is to not release the pgid until we
+    know what happened to it. Every delivery re-verifies the leader identity via
+    _killpg_verified, and only a definite verdict (_GROUP_GONE / _GROUP_FOREIGN)
+    ends a wait early — _GROUP_UNKNOWN may still resolve on a later read.
+    """
+    if _killpg_verified(pgid, leader_start, signal.SIGTERM):
+        logger.info("Sent SIGTERM to orphan group pgid=%d", pgid)
+    for _ in range(10):
+        if _group_state(pgid, leader_start) in (_GROUP_GONE, _GROUP_FOREIGN):
+            break
+        time.sleep(0.1)
+    if _group_is_still(pgid, leader_start):
+        logger.warning("Orphan group pgid=%d survived SIGTERM; escalating to SIGKILL", pgid)
+        _killpg_verified(pgid, leader_start, signal.SIGKILL)
+        # SIGKILL is not synchronous either: a member wedged in an
+        # uninterruptible wait keeps it pending and stays alive. Confirm before
+        # any caller releases the metadata — this pgid is the only handle on the
+        # lock holder, so dropping it while the group lives trades a recoverable
+        # orphan for a permanent one.
+        for _ in range(10):
+            if _group_state(pgid, leader_start) in (_GROUP_GONE, _GROUP_FOREIGN):
+                break
+            time.sleep(0.1)
+    return _group_state(pgid, leader_start)
 
 
 def _killpg_verified(pgid: int, leader_start: int | None, sig: int) -> bool:

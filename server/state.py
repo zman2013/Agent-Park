@@ -18,7 +18,7 @@ TASKS_DIR = DATA_DIR / "tasks"
 
 # Extra fields that are valid in task data but not in the Task model,
 # stored as metadata so they round-trip through JSON correctly.
-_VALID_TASK_META_KEYS = ("subprocess_pid", "subprocess_start_time", "auto_compact_disabled", "plan_mode")
+_VALID_TASK_META_KEYS = ("subprocess_pid", "subprocess_start_time", "retained_pgids", "auto_compact_disabled", "plan_mode")
 
 
 def _stable_agent_id(name: str) -> str:
@@ -142,6 +142,11 @@ class AppState:
             start_time = getattr(task, "subprocess_start_time", None)
             if start_time is not None:
                 dump["subprocess_start_time"] = start_time
+            # 未能证明已消失的旧进程组，与 subprocess_pid 分开存：后者会被 resume
+            # 起的新进程覆盖，而这些组可能还握着 writer lock，需要跨重启回收。
+            retained = getattr(task, "retained_pgids", None)
+            if retained:
+                dump["retained_pgids"] = retained
             if getattr(task, "auto_compact_disabled", False):
                 dump["auto_compact_disabled"] = True
             if getattr(task, "plan_mode", False):

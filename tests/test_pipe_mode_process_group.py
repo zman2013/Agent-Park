@@ -27,6 +27,10 @@ from server.agent_runner import AgentRunner, _pgroup_members, _read_proc_start_t
 from server.models import Agent, Task, TaskStatus
 from server.state import app_state
 
+# 真实探针的引用，供需要"先打桩再恢复"的测试用（monkeypatch.undo 会连
+# save_agent_tasks 的桩一起撤掉，那会写进真实 data/ 目录）。
+_real_pid_is_absent = agent_runner_mod._pid_is_absent
+
 
 def _descendants(pid):
     """Every transitive child of *pid*, read from ps rather than /proc walks."""
@@ -1014,3 +1018,72 @@ async def _check_cleanup_clears_pid_when_group_is_gone(monkeypatch, tmp_path):
 
 def test_cleanup_clears_pid_when_group_is_provably_gone(monkeypatch, tmp_path):
     asyncio.run(_check_cleanup_clears_pid_when_group_is_gone(monkeypatch, tmp_path))
+
+
+async def _check_retained_pgid_survives_resume(monkeypatch, tmp_path):
+    """resume 覆盖 subprocess_pid 后，旧组仍要有把手。
+
+    kill_task 因组仍为 UNKNOWN/OURS 保留了旧 pid，但 send_input 默认立刻起新进程，
+    spawn 会把 subprocess_pid 改写成新 pid —— 若那是唯一的把手，也许还握着 writer
+    lock 的旧组就永远回收不了（新 run 若同样失败，它的 cleanup 清掉的是新 pid）。
+    retained_pgids 与 subprocess_pid 分开存，所以覆盖之后仍在，且启动时能被收割。
+    """
+    runner, task, proc, reader = await _spawn(
+        monkeypatch, tmp_path, wrapper=_stubborn_wrapper
+    )
+    old_pgid = proc.pid
+    old_start = _read_proc_start_time(old_pgid)
+    stubborn = [p for p in _descendants(old_pgid) if _alive(p)]
+    assert stubborn, "fixture spawned no SIGTERM-ignoring child"
+    stubborn_ids = [(p, _read_proc_start_time(p)) for p in stubborn]
+    runner._run_ids[task.id] = "run-killtest"
+    # /proc 读不出身份：_group_state 一路 UNKNOWN，闸门两次投递都拒发。两个探针都要
+    # 打，理由见 _check_cleanup_retains_pid_when_group_unverifiable。
+    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", lambda _p: False)
+    try:
+        await runner.kill_task(task.id)
+        assert [old_pgid] == [
+            p for p, _s in (getattr(task, "retained_pgids", None) or [])
+        ], "unverifiable group was not recorded outside subprocess_pid"
+        # resume 起的新进程会覆盖 subprocess_pid（两条 spawn 路径都这么做），并清掉
+        # _retain_pid —— 元数据从此描述的是新进程。
+        object.__setattr__(task, "subprocess_pid", 999999)
+        object.__setattr__(task, "subprocess_start_time", 1)
+        runner._retain_pid.discard(task.id)
+        assert [old_pgid] == [
+            p for p, _s in (getattr(task, "retained_pgids", None) or [])
+        ], "retained handle was lost when resume overwrote subprocess_pid"
+    finally:
+        # 恢复真实探针，否则下面的收割和断言都读不出身份。
+        monkeypatch.setattr(
+            agent_runner_mod, "_read_proc_start_time", _read_proc_start_time
+        )
+        monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", _real_pid_is_absent)
+    try:
+        # 把手确实能用：restore_orphan_tasks 为 retained_pgids 单独扫一趟。记录的
+        # 身份必须是真的，否则闸门（正确地）拒发。
+        object.__setattr__(task, "retained_pgids", [[old_pgid, old_start]])
+        object.__setattr__(task, "subprocess_pid", None)
+        object.__setattr__(task, "subprocess_start_time", None)
+        task.status = TaskStatus.success  # 与任务当前状态无关，扫描不该漏掉它
+        monkeypatch.setattr(app_state, "tasks", {task.id: task})
+        runner.restore_orphan_tasks()
+        for pid_, ident in stubborn_ids:
+            assert not _alive_as(pid_, ident), (
+                "retained group survived the startup sweep"
+            )
+        assert not (getattr(task, "retained_pgids", None) or []), (
+            "handle kept even though the group is provably gone"
+        )
+    finally:
+        for p in [old_pgid] + stubborn:
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        reader.cancel()
+
+
+def test_retained_pgid_survives_resume_overwriting_the_pid(monkeypatch, tmp_path):
+    asyncio.run(_check_retained_pgid_survives_resume(monkeypatch, tmp_path))
