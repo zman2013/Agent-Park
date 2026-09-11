@@ -29,6 +29,10 @@ def _task_with_open_bubbles(task_id):
     return task
 
 
+async def _noop_async(*a, **k):
+    pass
+
+
 def _runner(monkeypatch, sent):
     """A runner with outward-facing side effects stubbed out.
 
@@ -112,8 +116,14 @@ def test_terminal_reentry_does_not_sweep(monkeypatch):
     assert [p for p in sent if p.get("type") == "message_done"] == []
 
 
-def test_resume_kill_does_not_sweep(monkeypatch):
-    """send_input kills the old process; that failure must not touch bubbles."""
+def test_resume_kill_leaves_the_sweep_to_send_input(monkeypatch):
+    """The dying run's _finish_task must not sweep; send_input does it.
+
+    _resuming exists to keep the dying subprocess from overwriting the task
+    status, so this path returns early. Cleanup happens in send_input()
+    instead — see test_send_input_closes_the_superseded_runs_bubbles — where
+    every open bubble provably belongs to the run being replaced.
+    """
     task = _task_with_open_bubbles("t-resume")
     sent = []
     runner = _runner(monkeypatch, sent)
@@ -122,3 +132,28 @@ def test_resume_kill_does_not_sweep(monkeypatch):
 
     assert task.messages[0].streaming is True
     assert sent == []
+
+
+def test_send_input_closes_the_superseded_runs_bubbles(monkeypatch):
+    """Resuming must not leave the replaced run's bubble streaming forever.
+
+    The dying run's _finish_task takes the _resuming early return, so if
+    send_input did not sweep, the old bubble stayed open in the UI and in the
+    saved transcript until some later run happened to finish.
+    """
+    task = _task_with_open_bubbles("t-supersede")
+    sent = []
+    runner = _runner(monkeypatch, sent)
+    # Look like a live run so send_input takes the kill+resume path.
+    runner._subprocess_tasks["t-supersede"] = object()
+    started = []
+    monkeypatch.setattr(runner, "kill_task", _noop_async)
+    monkeypatch.setattr(runner, "_start_subprocess",
+                        lambda *a, **k: started.append(a))
+
+    asyncio.run(runner.send_input("t-supersede", "继续"))
+
+    assert task.messages[0].streaming is False
+    done = [p["message_id"] for p in sent if p.get("type") == "message_done"]
+    assert done == [task.messages[0].id], done
+    assert started, "the replacement run should still start"
