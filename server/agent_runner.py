@@ -1766,6 +1766,10 @@ class AgentRunner:
                 # window opened. Members carry their start times so the kill
                 # itself is identity-checked too (see _kill_verified).
                 survivors: list[tuple[int, int | None]] = []
+                # "扫不全" 必须传递到下面的无幸存者分支：此处 leader 已缺席，
+                # 那条分支的保留条件全靠 pid 还在，判不出这种情况，元数据会被
+                # 直接清掉，而没被看见的后代及其 writer lock 就永远回收不了。
+                scan_incomplete = False
                 if _pid_is_absent(pid):
                     survivors, scan_complete = _scan_pgroup(pid)
                     if not _pid_is_absent(pid):
@@ -1782,6 +1786,7 @@ class AgentRunner:
                             task_id, pid,
                         )
                         survivors = []
+                        scan_incomplete = True
                 if survivors:
                     logger.warning(
                         "Orphan task %s leader pid=%d is gone but %d process(es) remain in "
@@ -1815,11 +1820,24 @@ class AgentRunner:
                     # may still be our live group, and clearing the pid here
                     # would strip the failed-task retry of the only handle it
                     # has, leaving the writer lock held forever.
-                    if not _pid_is_absent(pid) and actual_start_time is None:
+                    #
+                    # 三种 "读不出来" 都要保留元数据，它们都不是 "已消失" 的证据：
+                    #   1. 组扫描不完整 —— 空成员列表只代表没看全，不代表组为空；
+                    #   2. pid 还在但当前身份读不出来 —— 可能就是我们的组；
+                    #   3. pid 还在但记录的身份缺失（启动时 _read_proc_start_time
+                    #      瞬时失败，只持久化了 subprocess_pid）—— 缺的是比对基准，
+                    #      不是身份校验失败，同样无权判定这个活着的进程与我们无关。
+                    pid_held = not _pid_is_absent(pid)
+                    if scan_incomplete or (
+                        pid_held
+                        and (actual_start_time is None or expected_start_time is None)
+                    ):
                         logger.error(
-                            "Orphan task %s pid=%d exists but its identity is unreadable; "
+                            "Orphan task %s pid=%d identity/group could not be verified "
+                            "(scan_incomplete=%s expected_start=%s actual_start=%s); "
                             "retaining pid metadata for a later retry",
-                            task_id, pid,
+                            task_id, pid, scan_incomplete,
+                            expected_start_time, actual_start_time,
                         )
                         task.status = TaskStatus.failed
                         app_state.save_agent_tasks(task.agent_id)
