@@ -28,7 +28,14 @@ class ChunkContext(Protocol):
 
     async def append_delta(self, message_id: str, text: str) -> None: ...
 
-    async def close_message(self, message_id: str) -> None: ...
+    async def close_message(self, message_id: str, content: str | None = None) -> None:
+        """Close a streaming message, optionally replacing its final text.
+
+        Pass *content* when the bubble's text is only known to be final on
+        close and is a revision rather than an extension of what was streamed
+        — a delta cannot express that.
+        """
+        ...
 
     async def send_system_notice(self, content: str) -> None: ...
 

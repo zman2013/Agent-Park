@@ -151,14 +151,20 @@ class _RunContext:
             "delta": text,
         })
 
-    async def close_message(self, message_id: str) -> None:
+    async def close_message(self, message_id: str, content: str | None = None) -> None:
         from server.routes_ws import broadcast
 
-        await broadcast({
+        payload = {
             "type": "message_done",
             "task_id": self.task_id,
             "message_id": message_id,
-        })
+        }
+        # Replacement, for adapters whose bubble text is only final on close.
+        # A delta cannot express it when the text is revised rather than
+        # extended — a codex sub-agent's status goes running -> completed.
+        if content is not None:
+            payload["content"] = content
+        await broadcast(payload)
 
     async def send_system_notice(self, content: str) -> None:
         from server.routes_ws import broadcast
@@ -1297,6 +1303,14 @@ class AgentRunner:
         if task and not was_terminal and not compact_will_continue:
             history_args = self._prepare_history(task_id, task, status)
 
+        # Close any bubble the subprocess left open. A run that dies between
+        # item.started and item.completed (crash, EOF, nonzero exit) otherwise
+        # leaves streaming=True forever: this path never closed messages, and
+        # only the explicit WS stop path swept them. Before save_agent_tasks
+        # below, so the persisted transcript is clean too.
+        if task and not was_terminal:
+            await self._close_open_bubbles(task_id)
+
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
             app_state.save_agent_tasks(task.agent_id)
@@ -1304,6 +1318,33 @@ class AgentRunner:
             self._schedule_notify(*notify_args)
         if history_args:
             self._record_history(*history_args)
+
+    async def _close_open_bubbles(self, task_id: str) -> None:
+        """Mark every streaming message of *task_id* done and tell clients.
+
+        Collected and marked synchronously before the first broadcast: a
+        user_message is allowed while a task is running, so send_input() can
+        append a new streaming message to this same list while we are suspended
+        on a broadcast, and iterating the live list would then close a bubble
+        belonging to the replacement run whose subprocess is still producing
+        output.
+        """
+        from server.routes_ws import broadcast
+
+        task = app_state.get_task(task_id)
+        if not task:
+            return
+        stale = []
+        for msg in task.messages:
+            if msg.streaming:
+                msg.streaming = False
+                stale.append(msg.id)
+        for message_id in stale:
+            await broadcast({
+                "type": "message_done",
+                "task_id": task_id,
+                "message_id": message_id,
+            })
 
     def _prepare_history(self, task_id: str, task: Task,
                          status: TaskStatus) -> tuple[str, str, str, str] | None:
@@ -1492,6 +1533,14 @@ class AgentRunner:
                 self._resuming.add(task_id)
             # Kill current process if still running
             await self.kill_task(task_id)
+            # Close whatever the superseded run left open. Its _finish_task
+            # takes the _resuming early return — which exists to protect the
+            # task *status*, not to skip cleanup — so without this the old
+            # bubble stays streaming=True in the UI and in the saved transcript
+            # until some later run happens to finish. Done here, before the
+            # replacement starts, so every open bubble provably belongs to the
+            # run being replaced.
+            await self._close_open_bubbles(task_id)
 
         # Start a new subprocess resuming the session
         self._start_subprocess(task_id, user_input, cancel_existing=kill_existing)
