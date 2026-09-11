@@ -349,6 +349,68 @@ def test_repeated_wait_polling_does_not_replay_shown_replies():
                        f"[{CodexAdapter._short_tid(b)} completed]\nreply-B"], replies
 
 
+def test_prompting_one_agent_does_not_replay_another():
+    """Only the addressed threads' marks reset on a prompt-bearing call.
+
+    agents_states echoes every live thread, so clearing by that set replayed
+    an unrelated agent's already-shown answer next to the real new reply.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    a = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+    b = "01a08e82-5133-7520-8a88-4dd599ecc862"
+
+    async def drive():
+        # Both answers surface on one wait.
+        await adapter.handle_chunk(
+            {"type": "item.started", "item": _collab("item_0", "wait", tids=[a, b])}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "wait", tids=[a, b],
+                             states={a: {"status": "completed", "message": "ans-A"},
+                                     b: {"status": "completed", "message": "ans-B"}})}, ctx)
+        # Then only A is prompted again; B's state is merely echoed.
+        await adapter.handle_chunk(
+            {"type": "item.started",
+             "item": _collab("item_1", "send_input", tids=[a], prompt="再确认")}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_1", "send_input", tids=[a], prompt="再确认",
+                             states={a: {"status": "completed", "message": "ans-A2"},
+                                     b: {"status": "completed", "message": "ans-B"}})}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert "ans-B" not in replies[-1], replies[-1]
+    assert replies[-1] == f"[{CodexAdapter._short_tid(a)} completed]\nans-A2"
+
+
+def test_spawn_then_wait_shows_the_first_reply_once():
+    """spawn_agent carries a prompt but no receiver ids yet on item.started."""
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+
+    async def drive():
+        await adapter.handle_chunk(
+            {"type": "item.started",
+             "item": _collab("item_0", "spawn_agent", prompt="干活")}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "spawn_agent", tids=[tid], prompt="干活",
+                             states={tid: {"status": "pending_init", "message": None}})}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.started", "item": _collab("item_1", "wait", tids=[tid])}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_1", "wait", tids=[tid],
+                             states={tid: {"status": "completed", "message": "first"}})}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert replies == [f"[{CodexAdapter._short_tid(tid)} completed]\nfirst"], replies
+
+
 def test_reordered_thread_ids_render_stably():
     """`receiver_thread_ids` order is not stable between started and completed.
 

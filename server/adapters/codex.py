@@ -236,9 +236,12 @@ class CodexAdapter(BaseAdapter):
             return
         states = item.get("agents_states") or {}
         if item.get("prompt"):
-            # A new prompt was sent: whatever these threads say next is a new
-            # answer even if the text repeats.
-            for tid in states:
+            # A new prompt was sent: whatever those threads say next is a new
+            # answer even if the text repeats. Only the threads actually
+            # addressed — agents_states echoes every live thread, so clearing
+            # by that would replay an unrelated agent's last answer alongside
+            # the real new reply.
+            for tid in item.get("receiver_thread_ids") or []:
                 self._shown_replies.pop(tid, None)
         replies = []
         for tid in sorted(states, key=self._short_tid):
