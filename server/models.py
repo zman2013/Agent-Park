@@ -40,6 +40,10 @@ class Message(BaseModel):
     # CCo native message uuid (from stream-json assistant chunk).
     # Used with --resume-session-at to fork from this message.
     cco_uuid: str = ""
+    # When this message was created. Messages persisted before this field
+    # existed are backfilled with "" on load rather than with the restart
+    # time, so the UI shows nothing instead of a fabricated moment.
+    created_at: str = Field(default_factory=_utcnow)
 
 
 class Task(BaseModel):
