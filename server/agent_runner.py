@@ -572,6 +572,9 @@ class AgentRunner:
         self._pids: dict[str, int] = {}           # task_id -> child pid
         self._master_fds: dict[str, int] = {}     # task_id -> pty master fd
         self._async_procs: dict[str, asyncio.subprocess.Process] = {}  # task_id -> pipe-mode proc
+        # task_id -> leader's /proc start time, read at spawn. Gates every signal
+        # so a recycled pid/pgid cannot absorb a kill aimed at our group.
+        self._proc_starts: dict[str, int | None] = {}
         self._adapters: dict[str, BaseAdapter] = {}  # task_id -> active adapter
         self._session_ids: dict[str, str] = self._load_sessions()
         self._resuming: set[str] = set()          # task_ids being killed for resume
@@ -882,6 +885,7 @@ class AgentRunner:
         self._pids.pop(task_id, None)
         self._master_fds.pop(task_id, None)
         self._async_procs.pop(task_id, None)
+        self._proc_starts.pop(task_id, None)
         self._adapters.pop(task_id, None)
         self._session_baselines.pop(task_id, None)
         # Note: _run_start_index is intentionally NOT cleared here, for the same
@@ -1144,11 +1148,17 @@ class AgentRunner:
             start_new_session=True,
         )
         self._async_procs[task_id] = proc
+        # Read once, at spawn, while the pid provably still refers to this child.
+        # Every later signal to this pgid is gated on it (see _killpg_verified) so
+        # a reused number cannot inherit a kill aimed at our group.
+        leader_start = _read_proc_start_time(proc.pid)
+        self._proc_starts[task_id] = leader_start
         if run_id in self._live_runs:
             self._live_runs[run_id]["proc"] = proc
             # killpg target for shutdown(), which otherwise only has `proc`
             # and would again leave the grandchildren running.
             self._live_runs[run_id]["pid"] = proc.pid
+            self._live_runs[run_id]["pid_start"] = leader_start
 
         # Persist PID for orphan recovery, same as the PTY path. Without this a
         # pipe-mode subprocess that outlives a server restart is invisible to
@@ -1157,7 +1167,7 @@ class AgentRunner:
         task = app_state.get_task(task_id)
         if task:
             object.__setattr__(task, "subprocess_pid", proc.pid)
-            object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(proc.pid))
+            object.__setattr__(task, "subprocess_start_time", leader_start)
             app_state.save_agent_tasks(task.agent_id)
 
         logger.info("Spawned %s pid=%d for task %s (pipe mode)", args[0], proc.pid, task_id)
@@ -1606,16 +1616,20 @@ class AgentRunner:
         # codex's thread writer lock makes every later resume fail. Signal by
         # pgid first and fall back to the bare pid if the group is already gone.
         proc = self._async_procs.pop(task_id, None)
+        leader_start = self._proc_starts.pop(task_id, None)
         if proc is not None:
             # Not gated on proc.returncode: the bug being fixed here is exactly
             # a dead wrapper whose descendants outlived it, and those orphans
-            # stay in the group even after the direct child is reaped.
+            # stay in the group even after the direct child is reaped. That also
+            # means the pid may already be free, so each delivery is gated on the
+            # leader's recorded start time — otherwise dropping the returncode
+            # guard would let a reused pgid absorb this kill.
             for sig in (signal.SIGTERM, signal.SIGKILL):
-                try:
-                    os.killpg(proc.pid, sig)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                except Exception:
+                sent = _killpg_verified(proc.pid, leader_start, sig)
+                if not sent and proc.returncode is None:
+                    # Group unreachable or no longer ours, but our own direct
+                    # child is provably still alive — signal it by handle, which
+                    # cannot be confused by pid reuse.
                     try:
                         if sig == signal.SIGTERM:
                             proc.terminate()
@@ -1629,7 +1643,7 @@ class AgentRunner:
                     # wrapper that exits promptly on SIGTERM says nothing about a
                     # descendant that ignored it, and that descendant is exactly
                     # the writer-lock holder this kill exists to remove.
-                    if not _pgroup_alive(proc.pid):
+                    if not _group_is_still(proc.pid, leader_start):
                         break
             # Reap the process so it does not linger as a zombie holding the
             # asyncio transport open.
@@ -1682,7 +1696,16 @@ class AgentRunner:
         """
         cleaned: list[str] = []
         for task in list(app_state.tasks.values()):
-            if task.status.value not in ("running", "waiting"):
+            # Also revisit already-failed tasks that still carry pid metadata.
+            # A group that outlives SIGKILL keeps its pid recorded precisely so a
+            # later startup can retry; without this clause that retry never
+            # happens, since the task was marked failed on the way out and the
+            # status filter alone would skip it forever.
+            retry_pid = (
+                task.status.value not in ("running", "waiting")
+                and getattr(task, "subprocess_pid", None) is not None
+            )
+            if task.status.value not in ("running", "waiting") and not retry_pid:
                 continue
             pid = getattr(task, "subprocess_pid", None)
             expected_start_time = getattr(task, "subprocess_start_time", None)
@@ -1749,6 +1772,21 @@ class AgentRunner:
                     )
                     for member, member_start in survivors:
                         _kill_verified(member, member_start)
+                    # Re-enumerate rather than assume the kills took: a member
+                    # wedged uninterruptibly keeps SIGKILL pending, and one
+                    # forked after enumeration was never signaled at all. If any
+                    # remain, keep the pgid — it is the only handle on them.
+                    still = _pgroup_member_ids(pid) if _pid_is_absent(pid) else []
+                    if still:
+                        logger.error(
+                            "Orphan task %s group pgid=%d still has %d member(s) after "
+                            "verified kills; retaining pid metadata for a later retry",
+                            task_id, pid, len(still),
+                        )
+                        task.status = TaskStatus.failed
+                        app_state.save_agent_tasks(task.agent_id)
+                        cleaned.append(task_id)
+                        continue
                 else:
                     logger.warning(
                         "Orphan task %s pid identity check failed (pid=%d expected_start=%s actual_start=%s); "
@@ -1771,46 +1809,33 @@ class AgentRunner:
             # Escalate to SIGKILL before clearing subprocess_pid below: this is
             # the last moment we hold the group's identity, so a worker that
             # ignores SIGTERM would otherwise keep codex's writer lock forever
-            # with no metadata left to find it by. Identity was just verified
-            # against the recorded start time, so killpg on this pgid is safe.
-            try:
-                os.killpg(pid, signal.SIGTERM)
+            # with no metadata left to find it by. Every delivery re-verifies the
+            # leader identity: the check above establishes ownership only at that
+            # instant, and the group can exit and have its pgid re-leased during
+            # the waits below.
+            if _killpg_verified(pid, expected_start_time, signal.SIGTERM):
                 logger.info("Sent SIGTERM to orphan pid %d (task %s)", pid, task_id)
-            except ProcessLookupError:
-                pass
-            except Exception:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-                except Exception:
-                    pass
 
             # Synchronous sleep: this runs at startup before the event loop
             # serves traffic, and the whole point is to not release the pgid
             # until we know the group is gone. Bounded and short.
             for _ in range(10):
-                if not _pgroup_alive(pid):
+                if not _group_is_still(pid, expected_start_time):
                     break
                 time.sleep(0.1)
-            if _pgroup_alive(pid):
+            if _group_is_still(pid, expected_start_time):
                 logger.warning(
                     "Orphan group pgid=%d (task %s) survived SIGTERM; escalating to SIGKILL",
                     pid, task_id,
                 )
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except Exception:
-                    pass
+                _killpg_verified(pid, expected_start_time, signal.SIGKILL)
                 # SIGKILL is not synchronous either: a member wedged in an
                 # uninterruptible wait keeps it pending and stays alive. Confirm
                 # before releasing the metadata below — this pgid is the only
                 # handle on the lock holder, so clearing it while the group lives
                 # trades a recoverable orphan for a permanent one.
                 for _ in range(10):
-                    if not _pgroup_alive(pid):
+                    if not _group_is_still(pid, expected_start_time):
                         break
                     time.sleep(0.1)
 
@@ -1861,19 +1886,6 @@ class AgentRunner:
         # time the SIGKILL phase reads it.
         signaled_pgids: dict[int, int | None] = {}
 
-        def _still_ours(pgid: int, leader_start: int | None) -> bool:
-            """True while this pgid still names the group we signaled.
-
-            A leader that exited leaves its group addressable by the same pgid,
-            so absence of the leader is not disqualifying on its own — but if
-            some *other* live process now holds that pid, the number has been
-            re-leased and must not be signaled.
-            """
-            current = _read_proc_start_time(pgid)
-            if current is not None and current != leader_start:
-                return False
-            return _pgroup_alive(pgid)
-
         def _sigterm_all() -> None:
             # Iterate _live_runs (keyed by run_id, never overwritten by an
             # unrelated run) rather than the task_id-keyed _pids/_async_procs
@@ -1889,16 +1901,19 @@ class AgentRunner:
                     # descendant can trigger just by closing or redirecting
                     # stdout while it keeps running. The group would then be
                     # forgotten before the SIGKILL phase and keep its writer
-                    # lock; _pgroup_alive, not entry lifetime, decides when we
+                    # lock; group liveness, not entry lifetime, decides when we
                     # are done with it.
-                    signaled_pgids.setdefault(pid, _read_proc_start_time(pid))
-                    try:
-                        os.killpg(pid, signal.SIGTERM)
-                    except Exception:
-                        try:
-                            os.kill(pid, signal.SIGTERM)
-                        except Exception:
-                            pass
+                    #
+                    # Prefer the identity recorded at spawn (_run_pipe_mode) over
+                    # a read taken now: by this point the leader may already be
+                    # reaped, and reading then would either get None or, worse,
+                    # a new holder's start time — baking the impostor's identity
+                    # into the map as though it were ours.
+                    if pid not in signaled_pgids:
+                        signaled_pgids[pid] = run.get(
+                            "pid_start", _read_proc_start_time(pid)
+                        )
+                    _killpg_verified(pid, signaled_pgids[pid], signal.SIGTERM)
                 proc = run.get("proc")
                 if proc is not None and proc.returncode is None and pid is None:
                     # Only when no pid was recorded: pipe-mode runs now register
@@ -1935,7 +1950,7 @@ class AgentRunner:
             await asyncio.wait(tasks, timeout=min(1.0, max(0.0, deadline - loop.time())))
 
         lingering_pgids = {
-            p for p, start in signaled_pgids.items() if _still_ours(p, start)
+            p for p, start in signaled_pgids.items() if _group_is_still(p, start)
         }
         if self._live_runs or lingering_pgids:
             # SIGTERM didn't finish the job in time — escalate to SIGKILL
@@ -1951,24 +1966,22 @@ class AgentRunner:
                 # number through the drain is what lets a recycled pgid absorb
                 # this SIGKILL.
                 for pgid, leader_start in list(signaled_pgids.items()):
-                    if not _still_ours(pgid, leader_start):
+                    if not _group_is_still(pgid, leader_start):
                         signaled_pgids.pop(pgid, None)
                         continue
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except Exception:
-                        pass
+                    _killpg_verified(pgid, leader_start, signal.SIGKILL)
                 for run in list(self._live_runs.values()):
                     pid = run.get("pid")
                     if pid is not None:
-                        signaled_pgids.setdefault(pid, _read_proc_start_time(pid))
-                        try:
-                            os.killpg(pid, signal.SIGKILL)
-                        except Exception:
-                            try:
-                                os.kill(pid, signal.SIGKILL)
-                            except Exception:
-                                pass
+                        # Same identity gate as _sigterm_all: a run still in
+                        # finalization keeps its entry here after its group has
+                        # exited, so this delivery is as exposed to pid reuse as
+                        # the tracked-pgid loop above.
+                        if pid not in signaled_pgids:
+                            signaled_pgids[pid] = run.get(
+                                "pid_start", _read_proc_start_time(pid)
+                            )
+                        _killpg_verified(pid, signaled_pgids[pid], signal.SIGKILL)
                     proc = run.get("proc")
                     if proc is not None and proc.returncode is None and pid is None:
                         # See _sigterm_all: killpg already covers pipe-mode runs.
@@ -2163,6 +2176,44 @@ def _pgroup_member_ids(pgid: int) -> list[tuple[int, int | None]]:
         except ValueError:
             continue
     return members
+
+
+def _group_is_still(pgid: int, leader_start: int | None) -> bool:
+    """True while *pgid* still names the group whose leader had *leader_start*.
+
+    A leader that exited leaves its group addressable by the same pgid, so the
+    leader's absence is not disqualifying — that orphaned-descendant shape is the
+    whole point of this module's cleanup. But if some *other* live process now
+    holds that pid, the number has been re-leased and signaling it would hit an
+    unrelated tree.
+
+    leader_start of None means no baseline was recorded, in which case a live
+    holder cannot be distinguished from the original and the group is treated as
+    ours (the pre-existing behaviour) — callers that can record a baseline should.
+    """
+    current = _read_proc_start_time(pgid)
+    if current is not None and leader_start is not None and current != leader_start:
+        return False
+    return _pgroup_alive(pgid)
+
+
+def _killpg_verified(pgid: int, leader_start: int | None, sig: int) -> bool:
+    """Signal process group *pgid*, but only while it is still ours.
+
+    Every killpg in this module goes through here. Checking once and then
+    signaling later is not enough: each of SIGTERM, the post-wait escalation and
+    each poll of shutdown's drain is a separate delivery, and the pgid can be
+    re-leased between any two of them. Returns whether the signal was sent.
+    """
+    if not _group_is_still(pgid, leader_start):
+        return False
+    try:
+        os.killpg(pgid, sig)
+        return True
+    except (ProcessLookupError, PermissionError):
+        return False
+    except Exception:
+        return False
 
 
 def _kill_verified(member: int, start_time: int | None) -> None:

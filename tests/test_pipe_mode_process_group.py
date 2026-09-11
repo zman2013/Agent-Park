@@ -375,6 +375,109 @@ def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path)
         app_state.agents.pop(agent.id, None)
 
 
+def test_kill_task_does_not_signal_a_recycled_pgid(monkeypatch, tmp_path):
+    """kill_task no longer gates on returncode, so it must gate on identity.
+
+    Dropping the returncode guard is what makes this reachable: the direct child
+    can already be reaped while _run_pipe_mode finalizes, freeing the pid for
+    reuse before kill_task runs.
+    """
+
+    async def _run():
+        runner, task, proc, reader = await _spawn(monkeypatch, tmp_path)
+        impostor = [p for p in _pgroup_members(proc.pid) if p != proc.pid]
+        assert impostor, "fixture spawned no second group member"
+        # Report a different start time for the leader: the group stays alive, so
+        # only an identity check can tell this from "our group, leader exited".
+        real = agent_runner_mod._read_proc_start_time
+        monkeypatch.setattr(
+            agent_runner_mod,
+            "_read_proc_start_time",
+            lambda p: (real(p) or 0) + 1 if p == proc.pid else real(p),
+        )
+        try:
+            await runner.kill_task(task.id)
+            await asyncio.sleep(0.5)
+            assert _alive(impostor[0]), "kill_task signaled a recycled pgid"
+        finally:
+            for p in [proc.pid] + impostor:
+                try:
+                    os.kill(p, 9)
+                except ProcessLookupError:
+                    pass
+            reader.cancel()
+
+    asyncio.run(_run())
+
+
+def test_leaderless_branch_retains_pid_when_members_remain(monkeypatch, tmp_path):
+    """The leaderless branch re-enumerates instead of assuming its kills took.
+
+    A member wedged uninterruptibly, or one forked after enumeration, survives
+    _kill_verified — and this branch used to clear the pgid regardless, which is
+    the only handle on it.
+    """
+    pgid, survivor = _leaderless_group()
+    agent = Agent(name="leaderless-retain", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="leaderless-retain")
+    task.status = TaskStatus.running
+    object.__setattr__(task, "subprocess_pid", pgid)
+    object.__setattr__(task, "subprocess_start_time", 12345)  # stale on purpose
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    # Stand in for an uninterruptible member: the kills are swallowed, so the
+    # group is still populated when the metadata would be cleared.
+    monkeypatch.setattr(agent_runner_mod, "_kill_verified", lambda *a, **k: None)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == [task.id]
+        assert getattr(task, "subprocess_pid", None) == pgid, (
+            "pid discarded while group members remained"
+        )
+    finally:
+        try:
+            os.kill(survivor, 9)
+        except ProcessLookupError:
+            pass
+        app_state.agents.pop(agent.id, None)
+
+
+def test_failed_task_with_retained_pid_is_retried(monkeypatch, tmp_path):
+    """Retaining the pid is only useful if a later startup actually revisits it.
+
+    restore_orphan_tasks scans running/waiting, but the retaining branch marks
+    the task failed on its way out — so the promised retry needs the scan to also
+    pick up failed tasks that still carry pid metadata.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    agent = Agent(name="retry", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="retry")
+    task.status = TaskStatus.failed  # as the retaining branch left it
+    object.__setattr__(task, "subprocess_pid", pgid)
+    object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pgid))
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    worker_id = _identity(worker)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == [task.id], (
+            "failed task with a retained pid was skipped; the retry never happens"
+        )
+        for _ in range(30):
+            if not _alive_as(worker, worker_id):
+                break
+            time.sleep(0.1)
+        assert not _alive_as(worker, worker_id), "retry did not kill the group"
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
 def test_reallocated_pid_between_checks_is_not_signaled(monkeypatch, tmp_path):
     """ENOENT is a point-in-time fact, so it is rechecked after enumeration.
 
