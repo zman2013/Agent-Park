@@ -376,6 +376,75 @@ def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path)
         app_state.agents.pop(agent.id, None)
 
 
+def test_unverifiable_group_is_not_reported_as_gone(monkeypatch):
+    """"Don't signal" and "it's gone" must be separate verdicts.
+
+    Callers read the gate both ways: kill_task breaks out of its escalation,
+    shutdown drops the pgid, and orphan recovery clears the persisted pid. If an
+    unreadable stat collapsed to "gone", a SIGTERM-resistant descendant would
+    survive while its only recovery metadata was discarded.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    try:
+        monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+        state = agent_runner_mod._group_state(pgid, 12345)
+        assert state == agent_runner_mod._GROUP_UNKNOWN, state
+        # Not signalable...
+        assert not agent_runner_mod._group_is_still(pgid, 12345)
+        # ...but emphatically not gone either.
+        assert state != agent_runner_mod._GROUP_GONE
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+
+
+def test_orphan_recovery_retains_pid_when_group_is_unverifiable(
+    monkeypatch, tmp_path
+):
+    """An unverifiable group must keep its metadata, not have it discarded.
+
+    A stale pid costs one extra check next boot; a discarded live one costs a
+    permanent writer lock.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    agent = Agent(name="unverifiable", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="unverifiable")
+    task.status = TaskStatus.running
+    object.__setattr__(task, "subprocess_pid", pgid)
+    real_start = _read_proc_start_time(pgid)
+    object.__setattr__(task, "subprocess_start_time", real_start)
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    # Identity verifies on the way in, then becomes unreadable — the group's fate
+    # is unknown at the moment the metadata would be released.
+    calls = {"n": 0}
+
+    def _flaky(p):
+        calls["n"] += 1
+        return real_start if calls["n"] <= 1 else None
+
+    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", _flaky)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == [task.id]
+        assert getattr(task, "subprocess_pid", None) == pgid, (
+            "pid discarded on an unverifiable verdict"
+        )
+        assert getattr(task, "subprocess_start_time", None) is not None
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
 def test_gateway_declines_when_leader_identity_is_unverifiable(monkeypatch):
     """An unreadable start time is not absence, so the gateway must decline.
 

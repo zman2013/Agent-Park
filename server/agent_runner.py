@@ -1643,7 +1643,14 @@ class AgentRunner:
                     # wrapper that exits promptly on SIGTERM says nothing about a
                     # descendant that ignored it, and that descendant is exactly
                     # the writer-lock holder this kill exists to remove.
-                    if not _group_is_still(proc.pid, leader_start):
+                    #
+                    # Only _GROUP_GONE stops the escalation. _GROUP_UNKNOWN means
+                    # we could not verify, which is not evidence of death —
+                    # breaking on it would skip SIGKILL on a live descendant.
+                    # _GROUP_FOREIGN means the pgid is someone else's now, so
+                    # there is nothing of ours left to escalate against.
+                    state = _group_state(proc.pid, leader_start)
+                    if state in (_GROUP_GONE, _GROUP_FOREIGN):
                         break
             # Reap the process so it does not linger as a zombie holding the
             # asyncio transport open.
@@ -1824,9 +1831,12 @@ class AgentRunner:
 
             # Synchronous sleep: this runs at startup before the event loop
             # serves traffic, and the whole point is to not release the pgid
-            # until we know the group is gone. Bounded and short.
+            # until we know the group is gone. Bounded and short. Stop early only
+            # on a definite verdict — _GROUP_UNKNOWN may resolve on a later read.
             for _ in range(10):
-                if not _group_is_still(pid, expected_start_time):
+                if _group_state(pid, expected_start_time) in (
+                    _GROUP_GONE, _GROUP_FOREIGN
+                ):
                     break
                 time.sleep(0.1)
             if _group_is_still(pid, expected_start_time):
@@ -1841,7 +1851,9 @@ class AgentRunner:
                 # handle on the lock holder, so clearing it while the group lives
                 # trades a recoverable orphan for a permanent one.
                 for _ in range(10):
-                    if not _group_is_still(pid, expected_start_time):
+                    if _group_state(pid, expected_start_time) in (
+                        _GROUP_GONE, _GROUP_FOREIGN
+                    ):
                         break
                     time.sleep(0.1)
 
@@ -1854,14 +1866,18 @@ class AgentRunner:
                 pass
 
             task.status = TaskStatus.failed
-            if _pgroup_alive(pid):
-                # Keep subprocess_pid/start_time: the group outlived SIGKILL, so
-                # the next startup should get another chance at it rather than
-                # inherit a task marked failed with no way to find its process.
+            final_state = _group_state(pid, expected_start_time)
+            if final_state in (_GROUP_OURS, _GROUP_UNKNOWN):
+                # Keep subprocess_pid/start_time: the group outlived SIGKILL (or
+                # could not be verified at all), so the next startup should get
+                # another chance at it rather than inherit a task marked failed
+                # with no way to find its process. Retaining on UNKNOWN is the
+                # conservative half of that: a stale pid costs one extra check
+                # next boot, a discarded live one costs a permanent writer lock.
                 logger.error(
-                    "Orphan group pgid=%d (task %s) survived SIGKILL; retaining pid "
+                    "Orphan group pgid=%d (task %s) is %s after SIGKILL; retaining pid "
                     "metadata so a later restart can retry",
-                    pid, task_id,
+                    pid, task_id, final_state,
                 )
             else:
                 object.__setattr__(task, "subprocess_pid", None)
@@ -1900,6 +1916,7 @@ class AgentRunner:
             # make that older run's pid/proc invisible here.
             for run in list(self._live_runs.values()):
                 pid = run.get("pid")
+                group_signaled = False
                 if pid is not None:
                     # Remember the group independently of _live_runs. _on_done
                     # drops the entry as soon as _run_pipe_mode returns, and it
@@ -1919,12 +1936,18 @@ class AgentRunner:
                         signaled_pgids[pid] = run.get(
                             "pid_start", _read_proc_start_time(pid)
                         )
-                    _killpg_verified(pid, signaled_pgids[pid], signal.SIGTERM)
+                    group_signaled = _killpg_verified(
+                        pid, signaled_pgids[pid], signal.SIGTERM
+                    )
                 proc = run.get("proc")
-                if proc is not None and proc.returncode is None and pid is None:
-                    # Only when no pid was recorded: pipe-mode runs now register
-                    # one and are already covered by the killpg above, which
-                    # reaches their grandchildren as proc.terminate() cannot.
+                if proc is not None and proc.returncode is None and (
+                    pid is None or not group_signaled
+                ):
+                    # Normally the killpg above covers pipe-mode runs, reaching
+                    # their grandchildren as proc.terminate() cannot. But if it
+                    # declined (unverifiable identity, or a re-leased pgid), our
+                    # own direct child would otherwise get no signal at all —
+                    # and signaling by handle cannot hit an unrelated process.
                     try:
                         proc.terminate()
                     except ProcessLookupError:
@@ -1955,8 +1978,12 @@ class AgentRunner:
             # or SIGTERM'd until the whole budget is already gone.
             await asyncio.wait(tasks, timeout=min(1.0, max(0.0, deadline - loop.time())))
 
+        # Anything not provably finished keeps the escalation phase alive.
+        # _GROUP_UNKNOWN counts: it means we could not verify, not that the group
+        # died, and excluding it would skip SIGKILL on a live descendant.
         lingering_pgids = {
-            p for p, start in signaled_pgids.items() if _group_is_still(p, start)
+            p for p, start in signaled_pgids.items()
+            if _group_state(p, start) in (_GROUP_OURS, _GROUP_UNKNOWN)
         }
         if self._live_runs or lingering_pgids:
             # SIGTERM didn't finish the job in time — escalate to SIGKILL
@@ -1968,16 +1995,19 @@ class AgentRunner:
             def _sigkill_all() -> None:
                 # Groups first, so one whose _live_runs entry already went away
                 # (stdout closed by a still-running descendant) is still killed.
-                # Drop pgids whose group is gone as we go: retaining a dead
-                # number through the drain is what lets a recycled pgid absorb
-                # this SIGKILL.
+                # Drop only pgids with a definite death/foreign verdict: an
+                # unverifiable one may still be alive, and forgetting it here is
+                # how a live descendant escapes the escalation entirely.
                 for pgid, leader_start in list(signaled_pgids.items()):
-                    if not _group_is_still(pgid, leader_start):
+                    if _group_state(pgid, leader_start) in (
+                        _GROUP_GONE, _GROUP_FOREIGN
+                    ):
                         signaled_pgids.pop(pgid, None)
                         continue
                     _killpg_verified(pgid, leader_start, signal.SIGKILL)
                 for run in list(self._live_runs.values()):
                     pid = run.get("pid")
+                    group_signaled = False
                     if pid is not None:
                         # Same identity gate as _sigterm_all: a run still in
                         # finalization keeps its entry here after its group has
@@ -1987,10 +2017,15 @@ class AgentRunner:
                             signaled_pgids[pid] = run.get(
                                 "pid_start", _read_proc_start_time(pid)
                             )
-                        _killpg_verified(pid, signaled_pgids[pid], signal.SIGKILL)
+                        group_signaled = _killpg_verified(
+                            pid, signaled_pgids[pid], signal.SIGKILL
+                        )
                     proc = run.get("proc")
-                    if proc is not None and proc.returncode is None and pid is None:
-                        # See _sigterm_all: killpg already covers pipe-mode runs.
+                    if proc is not None and proc.returncode is None and (
+                        pid is None or not group_signaled
+                    ):
+                        # See _sigterm_all: fall back to the handle whenever the
+                        # group kill did not land, not only when no pid exists.
                         try:
                             proc.kill()
                         except ProcessLookupError:
@@ -2184,8 +2219,17 @@ def _pgroup_member_ids(pgid: int) -> list[tuple[int, int | None]]:
     return members
 
 
-def _group_is_still(pgid: int, leader_start: int | None) -> bool:
-    """True while *pgid* still names the group whose leader had *leader_start*.
+"""Verdicts from _group_state. "Don't signal" and "it's gone" are different
+facts, and conflating them is how a SIGTERM-resistant descendant survives while
+its only recovery metadata is discarded."""
+_GROUP_OURS = "ours"          # ours and alive → safe to signal
+_GROUP_GONE = "gone"          # provably no live members → done with it
+_GROUP_FOREIGN = "foreign"    # pid re-leased → must not signal, not ours
+_GROUP_UNKNOWN = "unknown"    # cannot verify → must not signal, may still live
+
+
+def _group_state(pgid: int, leader_start: int | None) -> str:
+    """Classify process group *pgid* against the leader's recorded start time.
 
     A leader that exited leaves its group addressable by the same pgid, so the
     leader's absence is not disqualifying — that orphaned-descendant shape is the
@@ -2193,24 +2237,29 @@ def _group_is_still(pgid: int, leader_start: int | None) -> bool:
     holds that pid, the number has been re-leased and signaling it would hit an
     unrelated tree.
 
-    leader_start of None means no baseline was recorded; the pid is then only
-    accepted if it is genuinely absent from /proc, since a live holder cannot be
-    told apart from the original without one.
+    Returns _GROUP_UNKNOWN rather than _GROUP_GONE when identity cannot be
+    established: callers must neither signal it nor treat it as disappeared.
     """
     current = _read_proc_start_time(pgid)
-    if leader_start is None:
-        # No baseline: the only safe evidence that this number is still (or at
-        # worst harmlessly) ours is that nothing holds it.
-        return _pid_is_absent(pgid) and _pgroup_alive(pgid)
-    if current is None:
-        # Unreadable is not absent. A transient stat failure on a live, recycled
-        # pid would otherwise skip the mismatch check below, and _pgroup_alive's
-        # own scan — which may well succeed — would then authorize the signal.
-        if not _pid_is_absent(pgid):
-            return False
-    elif current != leader_start:
-        return False
-    return _pgroup_alive(pgid)
+    if current is not None and leader_start is not None and current != leader_start:
+        return _GROUP_FOREIGN
+    if current is None and not _pid_is_absent(pgid):
+        # Unreadable is not absent: something holds this pid but we cannot tell
+        # whether it is ours. Not signalable, and not evidence of death either.
+        return _GROUP_UNKNOWN
+    if leader_start is None and not _pid_is_absent(pgid):
+        # No baseline to compare against while the pid is held.
+        return _GROUP_UNKNOWN
+    return _GROUP_OURS if _pgroup_alive(pgid) else _GROUP_GONE
+
+
+def _group_is_still(pgid: int, leader_start: int | None) -> bool:
+    """True only when the group is verifiably ours and alive (safe to signal).
+
+    Deliberately NOT a liveness test — see _group_state. Callers asking "is it
+    gone?" must compare against _GROUP_GONE instead.
+    """
+    return _group_state(pgid, leader_start) == _GROUP_OURS
 
 
 def _killpg_verified(pgid: int, leader_start: int | None, sig: int) -> bool:
