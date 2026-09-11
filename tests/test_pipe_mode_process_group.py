@@ -375,6 +375,136 @@ def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path)
         app_state.agents.pop(agent.id, None)
 
 
+def test_reallocated_pid_between_checks_is_not_signaled(monkeypatch, tmp_path):
+    """ENOENT is a point-in-time fact, so it is rechecked after enumeration.
+
+    A pid absent at the first check can be handed out before the group is
+    enumerated; the new holder calling setsid creates a group with that very
+    pgid, which enumeration would return as a "survivor".
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    worker_id, leader_id = _identity(worker), _identity(pgid)
+    agent = Agent(name="realloc", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="realloc")
+    task.status = TaskStatus.running
+    object.__setattr__(task, "subprocess_pid", pgid)
+    object.__setattr__(task, "subprocess_start_time", 999999)  # mismatch
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    # The group is real and live throughout. Only the FIRST absence check lies,
+    # standing in for "absent when observed, re-allocated a moment later".
+    calls = {"n": 0}
+
+    def _absent_once(_pid):
+        calls["n"] += 1
+        return calls["n"] == 1
+
+    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", _absent_once)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == [task.id]
+        assert calls["n"] >= 2, "absence was never rechecked after enumeration"
+        time.sleep(0.5)  # let a wrongly-issued kill land before concluding
+        assert _alive_as(worker, worker_id), "re-allocated pgid's group was killed"
+        assert _alive_as(pgid, leader_id), "re-allocated pid was killed"
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
+def test_orphan_recovery_retains_pid_when_group_survives_sigkill(
+    monkeypatch, tmp_path
+):
+    """Clearing the pid while the group lives trades a recoverable orphan for a
+    permanent one — SIGKILL can stay pending on an uninterruptible member."""
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    agent = Agent(name="pendingkill", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="pendingkill")
+    task.status = TaskStatus.running
+    object.__setattr__(task, "subprocess_pid", pgid)
+    object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pgid))
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    # Stand in for a member wedged uninterruptibly: signals are swallowed, so
+    # the group is still alive when the metadata would be cleared.
+    monkeypatch.setattr(agent_runner_mod.os, "killpg", lambda *a, **k: None)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == [task.id]
+        assert getattr(task, "subprocess_pid", None) == pgid, (
+            "pid discarded while its group was still alive"
+        )
+        assert getattr(task, "subprocess_start_time", None) is not None
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
+async def _check_shutdown_drops_a_recycled_pgid(monkeypatch, tmp_path):
+    """A pgid retained across the drain must not absorb a SIGKILL after reuse.
+
+    signaled_pgids survives up to 10s of draining. If the group exits early and
+    the kernel re-leases the number, escalating on the bare number sends SIGKILL
+    to whatever holds it now.
+
+    Two things must hold, and only the second distinguishes the fix from
+    `_pgroup_alive` alone: the impostor group survives, AND the SIGKILL phase
+    actually ran (otherwise the survival is vacuous). A second, genuinely-ours
+    lingering group forces that phase to execute.
+    """
+    runner, task, proc, reader = await _spawn(
+        monkeypatch, tmp_path, wrapper=_eof_then_stubborn_wrapper
+    )
+    impostor = [p for p in _pgroup_members(proc.pid) if p != proc.pid]
+    assert impostor, "fixture spawned no second group member"
+    reader.add_done_callback(lambda _f: runner._live_runs.pop("run-killtest", None))
+    runner._live_runs["run-killtest"]["task"] = reader
+
+    # A second group that IS still ours: it keeps _live_runs/lingering non-empty
+    # so shutdown() reaches the SIGKILL phase, where the recycled pgid would be
+    # killed if it were still tracked by bare number.
+    victim_pgid, victim_worker, victim_leader = _live_group_with_stubborn_worker()
+    runner._live_runs["run-victim"] = {"pid": victim_pgid}
+
+    # Report a different start time for the first group's leader from now on.
+    # Everything else about /proc stays truthful, so its group still reads alive
+    # — which is precisely what _pgroup_alive cannot distinguish from reuse.
+    real = agent_runner_mod._read_proc_start_time
+    monkeypatch.setattr(
+        agent_runner_mod,
+        "_read_proc_start_time",
+        lambda p: (real(p) or 0) + 1 if p == proc.pid else real(p),
+    )
+    try:
+        await runner.shutdown()
+        await asyncio.sleep(0.5)
+        assert not _alive(victim_worker), (
+            "SIGKILL phase never ran; the impostor's survival proves nothing"
+        )
+        assert _alive(impostor[0]), "SIGKILL sent to a recycled pgid's group"
+    finally:
+        for p in [proc.pid, victim_pgid, victim_worker] + impostor:
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        victim_leader.wait(timeout=10)
+
+
+def test_shutdown_drops_a_recycled_pgid_instead_of_killing_it(monkeypatch, tmp_path):
+    asyncio.run(_check_shutdown_drops_a_recycled_pgid(monkeypatch, tmp_path))
+
+
 def _leaderless_group():
     """A setsid leader that exits, leaving a live child still in its group.
 

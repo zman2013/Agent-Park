@@ -1720,11 +1720,25 @@ class AgentRunner:
                 # A None start time also covers a transient stat read/parse
                 # failure on a pid that still exists, and a live stranger that
                 # called setsid leads a group whose pgid equals that same pid —
-                # signaling it would kill an unrelated tree. Only ENOENT on
-                # /proc/<pid> proves nothing can have re-leased the number, and
-                # therefore that every member still reporting this pgid descends
-                # from our original leader.
-                survivors = _pgroup_members(pid) if _pid_is_absent(pid) else []
+                # signaling it would kill an unrelated tree.
+                #
+                # ENOENT is only a point-in-time observation, so it is checked
+                # again after enumeration: nothing stops the kernel from handing
+                # this number out in between, and a new leader claiming it would
+                # create a group with this very pgid that _pgroup_member_ids
+                # would happily return. Absent before AND after means no such
+                # window opened. Members carry their start times so the kill
+                # itself is identity-checked too (see _kill_verified).
+                survivors = (
+                    _pgroup_member_ids(pid) if _pid_is_absent(pid) else []
+                )
+                if survivors and not _pid_is_absent(pid):
+                    logger.warning(
+                        "Orphan task %s pid=%d was re-allocated while enumerating its "
+                        "group; skip signaling to avoid killing an unrelated tree",
+                        task_id, pid,
+                    )
+                    survivors = []
                 if survivors:
                     logger.warning(
                         "Orphan task %s leader pid=%d is gone but %d process(es) remain in "
@@ -1733,14 +1747,8 @@ class AgentRunner:
                         pid,
                         len(survivors),
                     )
-                    for member in survivors:
-                        for sig in (signal.SIGTERM, signal.SIGKILL):
-                            try:
-                                os.kill(member, sig)
-                            except (ProcessLookupError, PermissionError):
-                                break
-                            except Exception:
-                                break
+                    for member, member_start in survivors:
+                        _kill_verified(member, member_start)
                 else:
                     logger.warning(
                         "Orphan task %s pid identity check failed (pid=%d expected_start=%s actual_start=%s); "
@@ -1796,6 +1804,15 @@ class AgentRunner:
                     pass
                 except Exception:
                     pass
+                # SIGKILL is not synchronous either: a member wedged in an
+                # uninterruptible wait keeps it pending and stays alive. Confirm
+                # before releasing the metadata below — this pgid is the only
+                # handle on the lock holder, so clearing it while the group lives
+                # trades a recoverable orphan for a permanent one.
+                for _ in range(10):
+                    if not _pgroup_alive(pid):
+                        break
+                    time.sleep(0.1)
 
             # Also reap zombie children
             try:
@@ -1806,8 +1823,18 @@ class AgentRunner:
                 pass
 
             task.status = TaskStatus.failed
-            object.__setattr__(task, "subprocess_pid", None)
-            object.__setattr__(task, "subprocess_start_time", None)
+            if _pgroup_alive(pid):
+                # Keep subprocess_pid/start_time: the group outlived SIGKILL, so
+                # the next startup should get another chance at it rather than
+                # inherit a task marked failed with no way to find its process.
+                logger.error(
+                    "Orphan group pgid=%d (task %s) survived SIGKILL; retaining pid "
+                    "metadata so a later restart can retry",
+                    pid, task_id,
+                )
+            else:
+                object.__setattr__(task, "subprocess_pid", None)
+                object.__setattr__(task, "subprocess_start_time", None)
             logger.info(
                 "Orphan task %s (pid=%d) terminated and marked as failed",
                 task_id, pid,
@@ -1828,8 +1855,24 @@ class AgentRunner:
         loop = asyncio.get_event_loop()
         # Process groups we have signaled, tracked outside _live_runs so a group
         # whose entry disappears mid-drain still gets escalated. See the comment
-        # at the .add() below.
-        signaled_pgids: set[int] = set()
+        # at the .add() below. Keyed by pgid, valued by the leader's start time so
+        # a recycled pgid is distinguishable: the drain runs for up to 10s, and a
+        # bare number retained across it could name an unrelated group by the
+        # time the SIGKILL phase reads it.
+        signaled_pgids: dict[int, int | None] = {}
+
+        def _still_ours(pgid: int, leader_start: int | None) -> bool:
+            """True while this pgid still names the group we signaled.
+
+            A leader that exited leaves its group addressable by the same pgid,
+            so absence of the leader is not disqualifying on its own — but if
+            some *other* live process now holds that pid, the number has been
+            re-leased and must not be signaled.
+            """
+            current = _read_proc_start_time(pgid)
+            if current is not None and current != leader_start:
+                return False
+            return _pgroup_alive(pgid)
 
         def _sigterm_all() -> None:
             # Iterate _live_runs (keyed by run_id, never overwritten by an
@@ -1848,7 +1891,7 @@ class AgentRunner:
                     # forgotten before the SIGKILL phase and keep its writer
                     # lock; _pgroup_alive, not entry lifetime, decides when we
                     # are done with it.
-                    signaled_pgids.add(pid)
+                    signaled_pgids.setdefault(pid, _read_proc_start_time(pid))
                     try:
                         os.killpg(pid, signal.SIGTERM)
                     except Exception:
@@ -1891,7 +1934,9 @@ class AgentRunner:
             # or SIGTERM'd until the whole budget is already gone.
             await asyncio.wait(tasks, timeout=min(1.0, max(0.0, deadline - loop.time())))
 
-        lingering_pgids = {p for p in signaled_pgids if _pgroup_alive(p)}
+        lingering_pgids = {
+            p for p, start in signaled_pgids.items() if _still_ours(p, start)
+        }
         if self._live_runs or lingering_pgids:
             # SIGTERM didn't finish the job in time — escalate to SIGKILL
             # and give finalization a second, shorter window. run.sh's
@@ -1902,7 +1947,13 @@ class AgentRunner:
             def _sigkill_all() -> None:
                 # Groups first, so one whose _live_runs entry already went away
                 # (stdout closed by a still-running descendant) is still killed.
-                for pgid in {p for p in signaled_pgids if _pgroup_alive(p)}:
+                # Drop pgids whose group is gone as we go: retaining a dead
+                # number through the drain is what lets a recycled pgid absorb
+                # this SIGKILL.
+                for pgid, leader_start in list(signaled_pgids.items()):
+                    if not _still_ours(pgid, leader_start):
+                        signaled_pgids.pop(pgid, None)
+                        continue
                     try:
                         os.killpg(pgid, signal.SIGKILL)
                     except Exception:
@@ -1910,7 +1961,7 @@ class AgentRunner:
                 for run in list(self._live_runs.values()):
                     pid = run.get("pid")
                     if pid is not None:
-                        signaled_pgids.add(pid)
+                        signaled_pgids.setdefault(pid, _read_proc_start_time(pid))
                         try:
                             os.killpg(pid, signal.SIGKILL)
                         except Exception:
@@ -2078,14 +2129,16 @@ def _pid_is_absent(pid: int) -> bool:
     return False
 
 
-def _pgroup_members(pgid: int) -> list[int]:
-    """Live (non-zombie) pids in process group *pgid*.
+def _pgroup_member_ids(pgid: int) -> list[tuple[int, int | None]]:
+    """Live (non-zombie) members of process group *pgid* as (pid, starttime).
 
-    kill(-pgid, 0) is not a substitute: it succeeds as long as the group still
-    holds a zombie, and it says nothing about *which* processes remain — orphan
-    recovery needs the members themselves once the group leader is gone.
+    Returns identities, not bare pids: a pid is only a stable handle for as long
+    as the process lives, and every caller here signals *after* observing. The
+    start-time field pins which process a number referred to at enumeration
+    time, so a number reused in between is detectable rather than silently
+    inheriting a kill aimed at its predecessor.
     """
-    members: list[int] = []
+    members: list[tuple[int, int | None]] = []
     try:
         entries = os.listdir("/proc")
     except OSError:
@@ -2097,19 +2150,48 @@ def _pgroup_members(pgid: int) -> list[int]:
             stat_text = Path(f"/proc/{name}/stat").read_text(encoding="utf-8")
         except (OSError, ValueError):
             continue
-        # The state letter and pgid follow the parenthesised comm, which can
-        # itself contain spaces and parens — split on the last ')'.
+        # state, ppid, pgrp, ..., starttime follow the parenthesised comm, which
+        # can itself contain spaces and parens — split on the last ')'.
         fields = stat_text.rpartition(")")[2].split()
-        if len(fields) < 3:
+        if len(fields) < 20:
             continue
         if fields[0] in ("Z", "X", "x"):
             continue
         try:
             if int(fields[2]) == pgid:
-                members.append(int(name))
+                members.append((int(name), int(fields[19])))
         except ValueError:
             continue
     return members
+
+
+def _kill_verified(member: int, start_time: int | None) -> None:
+    """SIGTERM+SIGKILL *member*, but only while it is still the same process.
+
+    Re-reads the start time immediately before each signal: between enumeration
+    and delivery the kernel is free to hand this number to something unrelated,
+    and killing by bare pid at that point is how orphan cleanup turns into
+    collateral damage.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if _read_proc_start_time(member) != start_time:
+            return
+        try:
+            os.kill(member, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        except Exception:
+            return
+
+
+def _pgroup_members(pgid: int) -> list[int]:
+    """Live (non-zombie) pids in process group *pgid*.
+
+    kill(-pgid, 0) is not a substitute: it succeeds as long as the group still
+    holds a zombie, and it says nothing about *which* processes remain — orphan
+    recovery needs the members themselves once the group leader is gone.
+    """
+    return [pid for pid, _start in _pgroup_member_ids(pgid)]
 
 
 def _pgroup_alive(pgid: int) -> bool:
