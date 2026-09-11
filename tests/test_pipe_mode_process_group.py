@@ -22,14 +22,16 @@ import time
 from pathlib import Path
 
 from server import agent_runner as agent_runner_mod
+from server import process_group as pg_mod
 from server.adapters.codex import CodexAdapter
-from server.agent_runner import AgentRunner, _pgroup_members, _read_proc_start_time
+from server.agent_runner import AgentRunner
 from server.models import Agent, Task, TaskStatus
+from server.process_group import pgroup_members, read_proc_start_time
 from server.state import app_state
 
 # 真实探针的引用，供需要"先打桩再恢复"的测试用（monkeypatch.undo 会连
 # save_agent_tasks 的桩一起撤掉，那会写进真实 data/ 目录）。
-_real_pid_is_absent = agent_runner_mod._pid_is_absent
+_real_pid_is_absent = pg_mod.pid_is_absent
 
 
 def _descendants(pid):
@@ -49,7 +51,7 @@ def _identity(pid):
     start-time field too means a recycled pid reads as dead (different identity)
     rather than as a survivor.
     """
-    return (pid, _read_proc_start_time(pid))
+    return (pid, read_proc_start_time(pid))
 
 
 def _alive_as(pid, identity):
@@ -377,7 +379,7 @@ def test_orphan_recovery_escalates_before_discarding_the_pid(monkeypatch, tmp_pa
     task.status = TaskStatus.running
     object.__setattr__(task, "subprocess_pid", pgid)
     # Real recorded identity, so the verified branch is the one taken.
-    object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pgid))
+    object.__setattr__(task, "subprocess_start_time", read_proc_start_time(pgid))
     app_state.agents[agent.id] = agent
     # See the isolation note in the leaderless-group test: never add to the real
     # registry, restore_orphan_tasks signals every running task it finds.
@@ -405,7 +407,7 @@ def test_orphan_recovery_escalates_before_discarding_the_pid(monkeypatch, tmp_pa
 def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path):
     """A transient stat failure must not authorize signaling a recycled group.
 
-    _read_proc_start_time returns None both when the pid is gone and when its
+    read_proc_start_time returns None both when the pid is gone and when its
     stat cannot be read. Gating the fallback on the latter would let a live,
     unrelated setsid leader (whose pgid equals the recycled pid) be killed.
     """
@@ -421,7 +423,7 @@ def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path)
     monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
     # Simulate the transient failure: pid exists, its start time is unreadable.
     # Patched after the identities above are captured, since they use it too.
-    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(pg_mod, "read_proc_start_time", lambda _p: None)
     try:
         assert AgentRunner().restore_orphan_tasks() == [task.id]
         # Give a wrongly-issued kill time to land before concluding it was not
@@ -448,24 +450,24 @@ def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path)
 def test_incomplete_proc_scan_is_unknown_not_gone(monkeypatch):
     """An unreadable /proc cannot prove a group is empty.
 
-    _scan_pgroup returning [] on a listdir/stat failure used to read as "no
+    scan_pgroup returning [] on a listdir/stat failure used to read as "no
     members", so a verified-identity group was classified gone — stopping the
     escalation and releasing the metadata of a possibly live group.
     """
     pgid, worker, leader = _live_group_with_stubborn_worker()
-    real_start = _read_proc_start_time(pgid)
+    real_start = read_proc_start_time(pgid)
     try:
-        assert agent_runner_mod._group_state(pgid, real_start) == (
-            agent_runner_mod._GROUP_OURS
+        assert pg_mod.group_state(pgid, real_start) == (
+            pg_mod.GROUP_OURS
         )
         # Now the whole listing fails: same identity, but nothing is knowable.
         monkeypatch.setattr(
-            agent_runner_mod.os, "listdir", lambda _p: (_ for _ in ()).throw(OSError())
+            pg_mod.os, "listdir", lambda _p: (_ for _ in ()).throw(OSError())
         )
-        members, complete = agent_runner_mod._scan_pgroup(pgid)
+        members, complete = pg_mod.scan_pgroup(pgid)
         assert (members, complete) == ([], False)
-        assert agent_runner_mod._group_state(pgid, real_start) == (
-            agent_runner_mod._GROUP_UNKNOWN
+        assert pg_mod.group_state(pgid, real_start) == (
+            pg_mod.GROUP_UNKNOWN
         )
     finally:
         for p in (worker, pgid):
@@ -481,7 +483,7 @@ def test_group_state_rechecks_absence_after_enumeration(monkeypatch):
 
     A pid absent at the identity checks can be re-leased before the member scan;
     the new session leader's group then answers to this pgid and would be
-    classified ours, which _killpg_verified would happily signal.
+    classified ours, which killpg_verified would happily signal.
     """
     pgid, worker, leader = _live_group_with_stubborn_worker()
     calls = {"n": 0}
@@ -490,12 +492,12 @@ def test_group_state_rechecks_absence_after_enumeration(monkeypatch):
         calls["n"] += 1
         return calls["n"] == 1  # absent at the checks, held by the recheck
 
-    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", _absent_once)
-    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(pg_mod, "pid_is_absent", _absent_once)
+    monkeypatch.setattr(pg_mod, "read_proc_start_time", lambda _p: None)
     try:
-        state = agent_runner_mod._group_state(pgid, 12345)
-        assert state == agent_runner_mod._GROUP_FOREIGN, state
-        assert not agent_runner_mod._killpg_verified(pgid, 12345, signal.SIGKILL)
+        state = pg_mod.group_state(pgid, 12345)
+        assert state == pg_mod.GROUP_FOREIGN, state
+        assert not pg_mod.killpg_verified(pgid, 12345, signal.SIGKILL)
         time.sleep(0.3)
         assert _alive(worker), "signaled a group whose pgid was re-leased"
     finally:
@@ -508,7 +510,7 @@ def test_group_state_rechecks_absence_after_enumeration(monkeypatch):
 
 
 def test_unreadable_initial_identity_retains_pid(monkeypatch, tmp_path):
-    """The initial mismatch branch bypasses _group_state, so it needs its own gate.
+    """The initial mismatch branch bypasses group_state, so it needs its own gate.
 
     A transient None on the very first read used to fall through to "identity
     check failed", which cleared subprocess_pid — leaving the failed-task retry
@@ -519,13 +521,13 @@ def test_unreadable_initial_identity_retains_pid(monkeypatch, tmp_path):
     task = Task(agent_id=agent.id, name="unreadable-initial")
     task.status = TaskStatus.running
     object.__setattr__(task, "subprocess_pid", pgid)
-    object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pgid))
+    object.__setattr__(task, "subprocess_start_time", read_proc_start_time(pgid))
     app_state.agents[agent.id] = agent
     monkeypatch.setattr(app_state, "tasks", {task.id: task})
     monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
     # Every read fails, so the very first identity check is unverifiable while
     # the pid is provably present.
-    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(pg_mod, "read_proc_start_time", lambda _p: None)
     try:
         assert AgentRunner().restore_orphan_tasks() == [task.id]
         assert getattr(task, "subprocess_pid", None) == pgid, (
@@ -552,13 +554,13 @@ def test_unverifiable_group_is_not_reported_as_gone(monkeypatch):
     """
     pgid, worker, leader = _live_group_with_stubborn_worker()
     try:
-        monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
-        state = agent_runner_mod._group_state(pgid, 12345)
-        assert state == agent_runner_mod._GROUP_UNKNOWN, state
+        monkeypatch.setattr(pg_mod, "read_proc_start_time", lambda _p: None)
+        state = pg_mod.group_state(pgid, 12345)
+        assert state == pg_mod.GROUP_UNKNOWN, state
         # Not signalable...
-        assert not agent_runner_mod._group_is_still(pgid, 12345)
+        assert not pg_mod.group_is_still(pgid, 12345)
         # ...but emphatically not gone either.
-        assert state != agent_runner_mod._GROUP_GONE
+        assert state != pg_mod.GROUP_GONE
     finally:
         for p in (worker, pgid):
             try:
@@ -581,7 +583,7 @@ def test_orphan_recovery_retains_pid_when_group_is_unverifiable(
     task = Task(agent_id=agent.id, name="unverifiable")
     task.status = TaskStatus.running
     object.__setattr__(task, "subprocess_pid", pgid)
-    real_start = _read_proc_start_time(pgid)
+    real_start = read_proc_start_time(pgid)
     object.__setattr__(task, "subprocess_start_time", real_start)
     app_state.agents[agent.id] = agent
     monkeypatch.setattr(app_state, "tasks", {task.id: task})
@@ -594,7 +596,7 @@ def test_orphan_recovery_retains_pid_when_group_is_unverifiable(
         calls["n"] += 1
         return real_start if calls["n"] <= 1 else None
 
-    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", _flaky)
+    monkeypatch.setattr(pg_mod, "read_proc_start_time", _flaky)
     try:
         assert AgentRunner().restore_orphan_tasks() == [task.id]
         assert getattr(task, "subprocess_pid", None) == pgid, (
@@ -614,7 +616,7 @@ def test_orphan_recovery_retains_pid_when_group_is_unverifiable(
 def test_gateway_declines_when_leader_identity_is_unverifiable(monkeypatch):
     """An unreadable start time is not absence, so the gateway must decline.
 
-    _group_is_still is now the single door every killpg goes through, so a None
+    group_is_still is now the single door every killpg goes through, so a None
     start time treated as "leader merely exited" would re-introduce the recycled-
     pgid kill at kill_task and shutdown too, not just in orphan recovery.
     """
@@ -622,11 +624,11 @@ def test_gateway_declines_when_leader_identity_is_unverifiable(monkeypatch):
     try:
         # Baseline recorded, but the leader's stat is unreadable right now while
         # the pid is very much present: unverifiable, so decline.
-        monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
-        assert not agent_runner_mod._group_is_still(pgid, 12345)
-        assert not agent_runner_mod._killpg_verified(pgid, 12345, signal.SIGKILL)
+        monkeypatch.setattr(pg_mod, "read_proc_start_time", lambda _p: None)
+        assert not pg_mod.group_is_still(pgid, 12345)
+        assert not pg_mod.killpg_verified(pgid, 12345, signal.SIGKILL)
         # No baseline at all is equally unverifiable while the pid is held.
-        assert not agent_runner_mod._group_is_still(pgid, None)
+        assert not pg_mod.group_is_still(pgid, None)
         time.sleep(0.3)
         assert _alive(worker), "gateway signaled a group it could not verify"
     finally:
@@ -671,14 +673,14 @@ def test_kill_task_does_not_signal_a_recycled_pgid(monkeypatch, tmp_path):
 
     async def _run():
         runner, task, proc, reader = await _spawn(monkeypatch, tmp_path)
-        impostor = [p for p in _pgroup_members(proc.pid) if p != proc.pid]
+        impostor = [p for p in pgroup_members(proc.pid) if p != proc.pid]
         assert impostor, "fixture spawned no second group member"
         # Report a different start time for the leader: the group stays alive, so
         # only an identity check can tell this from "our group, leader exited".
-        real = agent_runner_mod._read_proc_start_time
+        real = pg_mod.read_proc_start_time
         monkeypatch.setattr(
-            agent_runner_mod,
-            "_read_proc_start_time",
+            pg_mod,
+            "read_proc_start_time",
             lambda p: (real(p) or 0) + 1 if p == proc.pid else real(p),
         )
         try:
@@ -700,7 +702,7 @@ def test_leaderless_branch_retains_pid_when_members_remain(monkeypatch, tmp_path
     """The leaderless branch re-enumerates instead of assuming its kills took.
 
     A member wedged uninterruptibly, or one forked after enumeration, survives
-    _kill_verified — and this branch used to clear the pgid regardless, which is
+    kill_verified — and this branch used to clear the pgid regardless, which is
     the only handle on it.
     """
     pgid, survivor = _leaderless_group()
@@ -714,7 +716,7 @@ def test_leaderless_branch_retains_pid_when_members_remain(monkeypatch, tmp_path
     monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
     # Stand in for an uninterruptible member: the kills are swallowed, so the
     # group is still populated when the metadata would be cleared.
-    monkeypatch.setattr(agent_runner_mod, "_kill_verified", lambda *a, **k: None)
+    monkeypatch.setattr(pg_mod, "kill_verified", lambda *a, **k: None)
     try:
         assert AgentRunner().restore_orphan_tasks() == [task.id]
         assert getattr(task, "subprocess_pid", None) == pgid, (
@@ -740,7 +742,7 @@ def test_failed_task_with_retained_pid_is_retried(monkeypatch, tmp_path):
     task = Task(agent_id=agent.id, name="retry")
     task.status = TaskStatus.failed  # as the retaining branch left it
     object.__setattr__(task, "subprocess_pid", pgid)
-    object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pgid))
+    object.__setattr__(task, "subprocess_start_time", read_proc_start_time(pgid))
     app_state.agents[agent.id] = agent
     monkeypatch.setattr(app_state, "tasks", {task.id: task})
     monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
@@ -789,7 +791,7 @@ def test_reallocated_pid_between_checks_is_not_signaled(monkeypatch, tmp_path):
         calls["n"] += 1
         return calls["n"] == 1
 
-    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", _absent_once)
+    monkeypatch.setattr(pg_mod, "pid_is_absent", _absent_once)
     try:
         assert AgentRunner().restore_orphan_tasks() == [task.id]
         assert calls["n"] >= 2, "absence was never rechecked after enumeration"
@@ -816,13 +818,13 @@ def test_orphan_recovery_retains_pid_when_group_survives_sigkill(
     task = Task(agent_id=agent.id, name="pendingkill")
     task.status = TaskStatus.running
     object.__setattr__(task, "subprocess_pid", pgid)
-    object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pgid))
+    object.__setattr__(task, "subprocess_start_time", read_proc_start_time(pgid))
     app_state.agents[agent.id] = agent
     monkeypatch.setattr(app_state, "tasks", {task.id: task})
     monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
     # Stand in for a member wedged uninterruptibly: signals are swallowed, so
     # the group is still alive when the metadata would be cleared.
-    monkeypatch.setattr(agent_runner_mod.os, "killpg", lambda *a, **k: None)
+    monkeypatch.setattr(pg_mod.os, "killpg", lambda *a, **k: None)
     try:
         assert AgentRunner().restore_orphan_tasks() == [task.id]
         assert getattr(task, "subprocess_pid", None) == pgid, (
@@ -847,14 +849,14 @@ async def _check_shutdown_drops_a_recycled_pgid(monkeypatch, tmp_path):
     to whatever holds it now.
 
     Two things must hold, and only the second distinguishes the fix from
-    `_pgroup_alive` alone: the impostor group survives, AND the SIGKILL phase
+    `pgroup_alive` alone: the impostor group survives, AND the SIGKILL phase
     actually ran (otherwise the survival is vacuous). A second, genuinely-ours
     lingering group forces that phase to execute.
     """
     runner, task, proc, reader = await _spawn(
         monkeypatch, tmp_path, wrapper=_eof_then_stubborn_wrapper
     )
-    impostor = [p for p in _pgroup_members(proc.pid) if p != proc.pid]
+    impostor = [p for p in pgroup_members(proc.pid) if p != proc.pid]
     assert impostor, "fixture spawned no second group member"
     reader.add_done_callback(lambda _f: runner._live_runs.pop("run-killtest", None))
     runner._live_runs["run-killtest"]["task"] = reader
@@ -865,16 +867,16 @@ async def _check_shutdown_drops_a_recycled_pgid(monkeypatch, tmp_path):
     victim_pgid, victim_worker, victim_leader = _live_group_with_stubborn_worker()
     # 带上 spawn 时读到的身份 —— 两条 spawn 路径都是这么记的（真实值，此刻还没打桩）。
     runner._live_runs["run-victim"] = {
-        "pid": victim_pgid, "pid_start": _read_proc_start_time(victim_pgid),
+        "pid": victim_pgid, "pid_start": read_proc_start_time(victim_pgid),
     }
 
     # Report a different start time for the first group's leader from now on.
     # Everything else about /proc stays truthful, so its group still reads alive
-    # — which is precisely what _pgroup_alive cannot distinguish from reuse.
-    real = agent_runner_mod._read_proc_start_time
+    # — which is precisely what pgroup_alive cannot distinguish from reuse.
+    real = pg_mod.read_proc_start_time
     monkeypatch.setattr(
-        agent_runner_mod,
-        "_read_proc_start_time",
+        pg_mod,
+        "read_proc_start_time",
         lambda p: (real(p) or 0) + 1 if p == proc.pid else real(p),
     )
     try:
@@ -932,7 +934,7 @@ def _leaderless_group():
 def test_orphan_recovery_kills_survivors_of_a_leaderless_group(monkeypatch, tmp_path):
     """A dead leader must not make its surviving group unrecoverable.
 
-    _read_proc_start_time(pid) returns None once the leader is reaped, so the
+    read_proc_start_time(pid) returns None once the leader is reaped, so the
     identity check used to skip killpg entirely and clear the pid — abandoning
     exactly the writer-lock holder this PR exists to remove.
     """
@@ -983,7 +985,7 @@ async def _check_shutdown_escalates_a_forgotten_group(monkeypatch, tmp_path):
     # Find it by pgid, not by walking children: the wrapper exits immediately so
     # the descendant is reparented to init and pgrep -P finds nothing. Staying in
     # the group after losing its parent is the whole property under test.
-    stubborn = [p for p in _pgroup_members(proc.pid) if p != proc.pid]
+    stubborn = [p for p in pgroup_members(proc.pid) if p != proc.pid]
     assert stubborn, "fixture spawned no SIGTERM-ignoring child"
     # _spawn registers the _live_runs entry by hand (it calls _run_pipe_mode
     # directly, not _start_subprocess), so the real _on_done is not attached.
@@ -1020,7 +1022,7 @@ def test_shutdown_escalates_a_group_whose_run_entry_is_gone(monkeypatch, tmp_pat
 async def _check_cleanup_retains_pid_when_group_unverifiable(monkeypatch, tmp_path):
     """kill_task 全程 UNKNOWN 时，per-run cleanup 不能清掉 pid 元数据。
 
-    闸门对 _GROUP_UNKNOWN 两次投递都拒发，可 handle 版 SIGTERM 仍会让直接子进程退出，
+    闸门对 GROUP_UNKNOWN 两次投递都拒发，可 handle 版 SIGTERM 仍会让直接子进程退出，
     抗 SIGTERM 的后代活下来。此时 subprocess_pid 是它唯一的把手，而
     _cleanup_run_resources 原来无条件清空 —— 可恢复的孤儿就变成永久的。
     """
@@ -1031,13 +1033,13 @@ async def _check_cleanup_retains_pid_when_group_unverifiable(monkeypatch, tmp_pa
     assert stubborn, "fixture spawned no SIGTERM-ignoring child"
     # 这个 run 才是资源的主人，否则 cleanup 会提前 return，测不到清理分支。
     runner._run_ids[task.id] = "run-killtest"
-    # /proc 从此读不出身份：_group_state 一路 UNKNOWN，闸门拒发两次。
-    # 两个探针都要打：只打 _read_proc_start_time 的话，leader 一退出
-    # _pid_is_absent 就返回 True，"leader 只是退了"那条路又把状态推回 OURS/GONE，
+    # /proc 从此读不出身份：group_state 一路 UNKNOWN，闸门拒发两次。
+    # 两个探针都要打：只打 read_proc_start_time 的话，leader 一退出
+    # pid_is_absent 就返回 True，"leader 只是退了"那条路又把状态推回 OURS/GONE，
     # 复现不出"始终无法核验"。EACCES/EIO 这类读失败才是 codex 描述的场景 ——
     # 目录还在，但读不出来，既不是缺席也不是身份不符。
-    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
-    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", lambda _p: False)
+    monkeypatch.setattr(pg_mod, "read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(pg_mod, "pid_is_absent", lambda _p: False)
     try:
         await runner.kill_task(task.id)
         assert task.id in runner._retain_pid, (
@@ -1100,15 +1102,15 @@ async def _check_retained_pgid_survives_resume(monkeypatch, tmp_path):
         monkeypatch, tmp_path, wrapper=_stubborn_wrapper
     )
     old_pgid = proc.pid
-    old_start = _read_proc_start_time(old_pgid)
+    old_start = read_proc_start_time(old_pgid)
     stubborn = [p for p in _descendants(old_pgid) if _alive(p)]
     assert stubborn, "fixture spawned no SIGTERM-ignoring child"
-    stubborn_ids = [(p, _read_proc_start_time(p)) for p in stubborn]
+    stubborn_ids = [(p, read_proc_start_time(p)) for p in stubborn]
     runner._run_ids[task.id] = "run-killtest"
-    # /proc 读不出身份：_group_state 一路 UNKNOWN，闸门两次投递都拒发。两个探针都要
+    # /proc 读不出身份：group_state 一路 UNKNOWN，闸门两次投递都拒发。两个探针都要
     # 打，理由见 _check_cleanup_retains_pid_when_group_unverifiable。
-    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
-    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", lambda _p: False)
+    monkeypatch.setattr(pg_mod, "read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(pg_mod, "pid_is_absent", lambda _p: False)
     try:
         await runner.kill_task(task.id)
         assert [old_pgid] == [
@@ -1125,9 +1127,9 @@ async def _check_retained_pgid_survives_resume(monkeypatch, tmp_path):
     finally:
         # 恢复真实探针，否则下面的收割和断言都读不出身份。
         monkeypatch.setattr(
-            agent_runner_mod, "_read_proc_start_time", _read_proc_start_time
+            pg_mod, "read_proc_start_time", read_proc_start_time
         )
-        monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", _real_pid_is_absent)
+        monkeypatch.setattr(pg_mod, "pid_is_absent", _real_pid_is_absent)
     try:
         # 把手确实能用：restore_orphan_tasks 为 retained_pgids 单独扫一趟。记录的
         # 身份必须是真的，否则闸门（正确地）拒发。
@@ -1171,7 +1173,7 @@ async def _check_shutdown_drains_retained_pgids(monkeypatch, tmp_path):
     task = Task(agent_id=agent.id, name="retaindrain")
     # 任务当前状态与把手无关：resume 之后它可能已经跑成功了，旧组照样还在。
     task.status = TaskStatus.success
-    object.__setattr__(task, "retained_pgids", [[pgid, _read_proc_start_time(pgid)]])
+    object.__setattr__(task, "retained_pgids", [[pgid, read_proc_start_time(pgid)]])
     app_state.agents[agent.id] = agent
     monkeypatch.setattr(app_state, "tasks", {task.id: task})
     monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
@@ -1214,7 +1216,7 @@ async def _check_shutdown_signals_every_identity_of_a_reused_pgid(
     """
     pgid, worker, leader = _live_group_with_stubborn_worker(stubborn=False)
     worker_id = _identity(worker)
-    real_start = _read_proc_start_time(pgid)
+    real_start = read_proc_start_time(pgid)
     agent = Agent(name="reusedpgid", command="/bin/true", cwd=str(tmp_path))
     task = Task(agent_id=agent.id, name="reusedpgid")
     task.status = TaskStatus.success
@@ -1264,7 +1266,7 @@ async def _check_shutdown_waits_for_retained_only_groups(monkeypatch, tmp_path):
     agent = Agent(name="retainwait", command="/bin/true", cwd=str(tmp_path))
     task = Task(agent_id=agent.id, name="retainwait")
     task.status = TaskStatus.success
-    object.__setattr__(task, "retained_pgids", [[pgid, _read_proc_start_time(pgid)]])
+    object.__setattr__(task, "retained_pgids", [[pgid, read_proc_start_time(pgid)]])
     app_state.agents[agent.id] = agent
     monkeypatch.setattr(app_state, "tasks", {task.id: task})
     monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
@@ -1329,15 +1331,15 @@ async def _check_shutdown_rechecks_retained_after_sigkill(monkeypatch, tmp_path)
         verdicts["n"] += 1
         # 前几轮 SIGKILL 还没落地；之后组才可证明消失，循环随即收敛。
         return (
-            agent_runner_mod._GROUP_UNKNOWN if verdicts["n"] <= 4
-            else agent_runner_mod._GROUP_GONE
+            pg_mod.GROUP_UNKNOWN if verdicts["n"] <= 4
+            else pg_mod.GROUP_GONE
         )
 
     attempts = []
-    monkeypatch.setattr(agent_runner_mod, "_group_state", fake_state)
+    monkeypatch.setattr(pg_mod, "group_state", fake_state)
     monkeypatch.setattr(
-        agent_runner_mod,
-        "_killpg_verified",
+        pg_mod,
+        "killpg_verified",
         lambda p, s, sig: attempts.append((p, sig)) or False,
     )
     try:
@@ -1381,15 +1383,15 @@ async def _check_shutdown_rechecks_signaled_after_sigkill(monkeypatch, tmp_path)
         verdicts["n"] += 1
         # 前几轮 SIGKILL 还没落地：组仍是 UNKNOWN，不能当成消失。
         return (
-            agent_runner_mod._GROUP_UNKNOWN if verdicts["n"] <= 4
-            else agent_runner_mod._GROUP_GONE
+            pg_mod.GROUP_UNKNOWN if verdicts["n"] <= 4
+            else pg_mod.GROUP_GONE
         )
 
     attempts = []
-    monkeypatch.setattr(agent_runner_mod, "_group_state", fake_state)
+    monkeypatch.setattr(pg_mod, "group_state", fake_state)
     monkeypatch.setattr(
-        agent_runner_mod,
-        "_killpg_verified",
+        pg_mod,
+        "killpg_verified",
         lambda p, s, sig: attempts.append((p, sig)) or False,
     )
     runner = AgentRunner()
@@ -1432,7 +1434,7 @@ async def _check_sigterm_grace_covers_signaled_only_groups(monkeypatch, tmp_path
     worker 装好 handler 后要 3s 才干净退出并留下 marker；marker 存在即证明它拿到了
     graceful 窗口，不存在就说明 SIGKILL 在同一个事件循环回合里就落下来了。
 
-    delay 特意远大于 0.6s：_group_state 每次都要扫一遍 /proc（约 0.3s），坏实现在
+    delay 特意远大于 0.6s：group_state 每次都要扫一遍 /proc（约 0.3s），坏实现在
     "break → prune → escalate" 这一路上会白捡几百毫秒的间隔，短 delay 会被这点偶然
     余量盖住，测试就成了空守卫。
     """
@@ -1445,7 +1447,7 @@ async def _check_sigterm_grace_covers_signaled_only_groups(monkeypatch, tmp_path
     # 只有 pid：没有 task 可 await，也没有 proc/transport —— _on_done 摘掉 entry 前后
     # 那一瞬的形状。SIGTERM 首发把它登记进 signaled_pgids。
     runner._live_runs["run-signaled"] = {
-        "pid": pgid, "pid_start": _read_proc_start_time(pgid),
+        "pid": pgid, "pid_start": read_proc_start_time(pgid),
     }
 
     async def _drop_entry():
@@ -1498,11 +1500,11 @@ async def _check_shutdown_persists_unresolved_groups(monkeypatch, tmp_path):
     monkeypatch.setattr(agent_runner_mod, "_sigkill_grace_seconds", lambda: 0)
     # 一直读不出身份：闸门拒发，判决 UNKNOWN，正是本例要守的形状。
     monkeypatch.setattr(
-        agent_runner_mod, "_group_state",
-        lambda p, s: agent_runner_mod._GROUP_UNKNOWN,
+        pg_mod, "group_state",
+        lambda p, s: pg_mod.GROUP_UNKNOWN,
     )
     monkeypatch.setattr(
-        agent_runner_mod, "_killpg_verified", lambda p, s, sig: False
+        pg_mod, "killpg_verified", lambda p, s, sig: False
     )
     pgid, leader_start = 636363, 4242
     runner = AgentRunner()
@@ -1547,15 +1549,15 @@ async def _check_shutdown_signals_both_identities_of_a_reused_live_pid(
     def fake_state(_pgid, start):
         # 陈旧身份早已不是我们的；活身份始终无法核验（不许当成消失）。
         return (
-            agent_runner_mod._GROUP_FOREIGN if start == stale_start
-            else agent_runner_mod._GROUP_UNKNOWN
+            pg_mod.GROUP_FOREIGN if start == stale_start
+            else pg_mod.GROUP_UNKNOWN
         )
 
     attempts = []
-    monkeypatch.setattr(agent_runner_mod, "_group_state", fake_state)
+    monkeypatch.setattr(pg_mod, "group_state", fake_state)
     monkeypatch.setattr(
-        agent_runner_mod,
-        "_killpg_verified",
+        pg_mod,
+        "killpg_verified",
         lambda p, s, sig: attempts.append((p, s)) or False,
     )
     runner = AgentRunner()
@@ -1698,7 +1700,7 @@ def test_start_time_survives_a_comm_with_spaces(tmp_path, monkeypatch):
 
     整行 split() 会被括号里的 comm 撑开：`(foo bar)` 让后面每个字段右移一位，读到的
     "start time" 其实是别的字段（常见结果是 0）。这样算出来的假身份还会撞车 —— 另一
-    个同样带空格名字的进程复用了 pid/pgid 后得到同一个值，_group_state 就把陌生人的
+    个同样带空格名字的进程复用了 pid/pgid 后得到同一个值，group_state 就把陌生人的
     组认成我们的，闸门放行 killpg。
     """
     # 真实 stat 行的形状，comm 里塞进空格和括号（内核只是原样填进程名）。
@@ -1706,31 +1708,31 @@ def test_start_time_survives_a_comm_with_spaces(tmp_path, monkeypatch):
     tail = " ".join(["S", "1", "4242"] + ["0"] * 16 + ["987654"] + ["0"] * 30)
     fake_stat = f"4242 (evil ) name) {tail}\n"
 
-    fields = agent_runner_mod._stat_fields_after_comm(fake_stat)
+    fields = pg_mod.stat_fields_after_comm(fake_stat)
     assert fields[0] == "S"
-    assert fields[2] == "4242"  # pgrp，_scan_pgroup 的匹配依据
+    assert fields[2] == "4242"  # pgrp，scan_pgroup 的匹配依据
     assert fields[19] == "987654"
 
-    # _read_proc_start_time 走同一条解析路径：打掉读文件，只验字段切分。
+    # read_proc_start_time 走同一条解析路径：打掉读文件，只验字段切分。
     monkeypatch.setattr(
-        agent_runner_mod.Path, "read_text", lambda self, **kw: fake_stat
+        pg_mod.Path, "read_text", lambda self, **kw: fake_stat
     )
-    assert agent_runner_mod._read_proc_start_time(4242) == 987654
+    assert pg_mod.read_proc_start_time(4242) == 987654
 
     # 不是合法 stat（没有右括号）时按"读取失败"处理，而不是按错位字段下判决。
-    assert agent_runner_mod._stat_fields_after_comm("no parens here") == []
+    assert pg_mod.stat_fields_after_comm("no parens here") == []
 
 
 def test_group_state_revalidates_a_live_leader_after_the_scan(monkeypatch):
     """活着的 leader 在扫 /proc 期间被换掉，也必须判 FOREIGN。
 
-    _scan_pgroup 要走一遍 /proc（几百毫秒），这期间 leader 可能退出、pid 被回收并重
+    scan_pgroup 要走一遍 /proc（几百毫秒），这期间 leader 可能退出、pid 被回收并重
     新分配给一个新的 session leader，扫出来的成员就是它的。此前只有"进来时就已缺席"
-    的 leader 才补检重分配，活着的 leader 走不到那个分支 —— 判成 _GROUP_OURS 后闸门
+    的 leader 才补检重分配，活着的 leader 走不到那个分支 —— 判成 GROUP_OURS 后闸门
     就会向陌生人的组投信号。
     """
     pgid, worker, leader = _live_group_with_stubborn_worker()
-    real = agent_runner_mod._read_proc_start_time
+    real = pg_mod.read_proc_start_time
     real_start = real(pgid)
     calls = {"n": 0}
 
@@ -1742,12 +1744,12 @@ def test_group_state_revalidates_a_live_leader_after_the_scan(monkeypatch):
         return real_start if calls["n"] == 1 else (real_start or 0) + 1
 
     monkeypatch.setattr(
-        agent_runner_mod, "_read_proc_start_time", _changes_after_first_read
+        pg_mod, "read_proc_start_time", _changes_after_first_read
     )
     try:
-        state = agent_runner_mod._group_state(pgid, real_start)
-        assert state == agent_runner_mod._GROUP_FOREIGN, state
-        assert not agent_runner_mod._killpg_verified(pgid, real_start, signal.SIGKILL)
+        state = pg_mod.group_state(pgid, real_start)
+        assert state == pg_mod.GROUP_FOREIGN, state
+        assert not pg_mod.killpg_verified(pgid, real_start, signal.SIGKILL)
         time.sleep(0.3)
         assert _alive(worker), "signaled a group whose live leader was replaced"
     finally:
@@ -1779,7 +1781,7 @@ async def _check_pty_shutdown_recaptures_a_missing_leader_identity(monkeypatch):
     """spawn 时身份读失败的 PTY 组，shutdown 必须补读身份后照常杀掉。
 
     上一轮给 PTY 路径加了"spawn 时读一次 leader_start"，但那一次读可能瞬时失败并记成
-    None：此后 _killpg_verified 每一发都被闸门拒发，而 PTY 记录没有 proc 句柄可以兜底
+    None：此后 killpg_verified 每一发都被闸门拒发，而 PTY 记录没有 proc 句柄可以兜底
     —— 关 transport 只让读循环收尾，进程组照样活着。于是 `run.sh stop/restart` 永久漏
     掉这个组（它还握着 codex writer lock），下次启动也只会"保留"而不是杀掉它。
 
@@ -1820,7 +1822,7 @@ def test_pty_shutdown_recaptures_a_missing_leader_identity(monkeypatch):
 async def _check_pty_shutdown_falls_back_to_the_direct_child(monkeypatch):
     """补读也失败时，PTY 路径至少要把自家那个直接子进程 signal 掉。
 
-    /proc 一直读不出身份 ⇒ _group_state 恒为 UNKNOWN ⇒ 闸门拒发（这是对的，UNKNOWN
+    /proc 一直读不出身份 ⇒ group_state 恒为 UNKNOWN ⇒ 闸门拒发（这是对的，UNKNOWN
     不许投递）。pipe 路径此时还有 proc.terminate()/kill() 兜底，PTY 路径原来什么都没有
     —— 连我们自己 fork 出来的那个直接子进程都收不到信号，`run.sh stop` 之后它继续跑。
 
@@ -1838,8 +1840,8 @@ async def _check_pty_shutdown_falls_back_to_the_direct_child(monkeypatch):
     real = _real_pid_is_absent
     # 目录还在但 stat 读不出来：既不是缺席也不是身份不符，正是 UNKNOWN 那一格。
     # 兜底路径读的是 ppid（独立函数、独立字段），所以不打它。
-    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
-    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", lambda p: real(p))
+    monkeypatch.setattr(pg_mod, "read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(pg_mod, "pid_is_absent", lambda p: real(p))
     runner = AgentRunner()
     runner._live_runs["run-pty"] = _pty_shaped_run(pgid)
     try:
