@@ -1586,3 +1586,69 @@ def test_shutdown_budget_fits_run_sh_backend_grace():
     assert budget < grace, (
         f"shutdown 总预算 {budget}s 不小于 run.sh 的 backend grace {grace}s"
     )
+
+
+def test_start_time_survives_a_comm_with_spaces(tmp_path, monkeypatch):
+    """进程名含空格时，身份必须还是 stat 的第 22 字段。
+
+    整行 split() 会被括号里的 comm 撑开：`(foo bar)` 让后面每个字段右移一位，读到的
+    "start time" 其实是别的字段（常见结果是 0）。这样算出来的假身份还会撞车 —— 另一
+    个同样带空格名字的进程复用了 pid/pgid 后得到同一个值，_group_state 就把陌生人的
+    组认成我们的，闸门放行 killpg。
+    """
+    # 真实 stat 行的形状，comm 里塞进空格和括号（内核只是原样填进程名）。
+    # 前两字段之后的第 20 个（state 起算）才是 starttime = 987654。
+    tail = " ".join(["S", "1", "4242"] + ["0"] * 16 + ["987654"] + ["0"] * 30)
+    fake_stat = f"4242 (evil ) name) {tail}\n"
+
+    fields = agent_runner_mod._stat_fields_after_comm(fake_stat)
+    assert fields[0] == "S"
+    assert fields[2] == "4242"  # pgrp，_scan_pgroup 的匹配依据
+    assert fields[19] == "987654"
+
+    # _read_proc_start_time 走同一条解析路径：打掉读文件，只验字段切分。
+    monkeypatch.setattr(
+        agent_runner_mod.Path, "read_text", lambda self, **kw: fake_stat
+    )
+    assert agent_runner_mod._read_proc_start_time(4242) == 987654
+
+    # 不是合法 stat（没有右括号）时按"读取失败"处理，而不是按错位字段下判决。
+    assert agent_runner_mod._stat_fields_after_comm("no parens here") == []
+
+
+def test_group_state_revalidates_a_live_leader_after_the_scan(monkeypatch):
+    """活着的 leader 在扫 /proc 期间被换掉，也必须判 FOREIGN。
+
+    _scan_pgroup 要走一遍 /proc（几百毫秒），这期间 leader 可能退出、pid 被回收并重
+    新分配给一个新的 session leader，扫出来的成员就是它的。此前只有"进来时就已缺席"
+    的 leader 才补检重分配，活着的 leader 走不到那个分支 —— 判成 _GROUP_OURS 后闸门
+    就会向陌生人的组投信号。
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    real = agent_runner_mod._read_proc_start_time
+    real_start = real(pgid)
+    calls = {"n": 0}
+
+    def _changes_after_first_read(p):
+        if p != pgid:
+            return real(p)
+        calls["n"] += 1
+        # 第一次（扫描前的身份检查）报真身份，之后（扫描后的复检）报别人的。
+        return real_start if calls["n"] == 1 else (real_start or 0) + 1
+
+    monkeypatch.setattr(
+        agent_runner_mod, "_read_proc_start_time", _changes_after_first_read
+    )
+    try:
+        state = agent_runner_mod._group_state(pgid, real_start)
+        assert state == agent_runner_mod._GROUP_FOREIGN, state
+        assert not agent_runner_mod._killpg_verified(pgid, real_start, signal.SIGKILL)
+        time.sleep(0.3)
+        assert _alive(worker), "signaled a group whose live leader was replaced"
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)

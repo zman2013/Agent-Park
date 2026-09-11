@@ -2432,14 +2432,30 @@ def _window_tasks(tasks: list, window: int) -> list:
     return finished[:window] if window > 0 else []
 
 
+def _stat_fields_after_comm(stat_text: str) -> list[str]:
+    """/proc/<pid>/stat 里 comm 之后的字段（state 起算，即原第 3 字段起）。
+
+    comm 是括号包起来的进程名，本身可以含空格和括号，所以整行 split() 会让它后面
+    所有字段整体错位 —— 取到的"start time"其实是别的字段（进程名带一个空格时通常
+    读成 0）。这种被污染的身份还会撞车：另一个同样带空格名字的进程复用了 pid/pgid
+    后算出同一个假值，_group_state 就会把陌生人的组认成我们的并放行 killpg。
+    唯一可靠的切法是从最后一个 ')' 之后开始。没有 ')' 说明这行不是合法 stat，返回
+    空列表，让调用方按"读取失败"处理而不是按错位字段下判决。
+    """
+    _, sep, tail = stat_text.rpartition(")")
+    if not sep:
+        return []
+    return tail.split()
+
+
 def _read_proc_start_time(pid: int) -> int | None:
     """Read /proc/<pid>/stat field 22 (process start time since boot)."""
     try:
         stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        parts = stat_text.split()
-        if len(parts) < 22:
+        fields = _stat_fields_after_comm(stat_text)
+        if len(fields) < 20:
             return None
-        return int(parts[21])
+        return int(fields[19])
     except Exception:
         return None
 
@@ -2490,7 +2506,7 @@ def _scan_pgroup(pgid: int) -> tuple[list[tuple[int, int | None]], bool]:
             continue
         # state, ppid, pgrp, ..., starttime follow the parenthesised comm, which
         # can itself contain spaces and parens — split on the last ')'.
-        fields = stat_text.rpartition(")")[2].split()
+        fields = _stat_fields_after_comm(stat_text)
         if len(fields) < 20:
             complete = False
             continue
@@ -2553,12 +2569,25 @@ def _group_state(pgid: int, leader_start: int | None) -> str:
     if not complete:
         # An incomplete /proc scan cannot prove the group is empty.
         return _GROUP_UNKNOWN
-    if leader_absent and not _pid_is_absent(pgid):
+    # 扫完再核一次 leader 身份。上面的检查只在那一瞬成立，而 _scan_pgroup 要走一遍
+    # /proc（几百毫秒量级）：这期间 leader 可能退出、pid 被回收并重新分配给一个新的
+    # session leader，扫出来的成员就是它的组而不是我们的。之前只对"进来时就已缺席"
+    # 的 leader 补检了重分配，活着的 leader 走不到那个分支 —— 判成 _GROUP_OURS 后
+    # _killpg_verified 就会向陌生人的组投信号。
+    after = _read_proc_start_time(pgid)
+    after_absent = _pid_is_absent(pgid)
+    if after is not None and leader_start is not None and after != leader_start:
+        # 号码在扫描期间被重新出让给了别人。
+        return _GROUP_FOREIGN
+    if leader_absent and not after_absent:
         # The number was free when we checked and is held now: it was re-leased
         # during enumeration, so a new session leader may own this pgid and the
         # members we just collected could be its, not ours. Absence is only ever
         # a point-in-time fact, which is why it is rechecked after the scan.
         return _GROUP_FOREIGN
+    if after is None and not after_absent:
+        # 扫描后读不出身份：既不能确认成员属于我们，也不是死亡证据。
+        return _GROUP_UNKNOWN
     return _GROUP_OURS if members else _GROUP_GONE
 
 
