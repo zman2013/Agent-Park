@@ -333,19 +333,30 @@ const toolDescription = computed(() => parsedToolInput.value?.description || '')
 
 // Messages persisted before created_at existed have an empty value — render
 // nothing rather than an epoch or "Invalid Date".
-const timestampText = computed(() => {
-  const raw = props.message.created_at
-  if (!raw) return ''
+function parseCreatedAt(raw) {
+  if (!raw) return null
   const d = new Date(raw)
-  if (Number.isNaN(d.getTime())) return ''
-  return d.toLocaleTimeString('zh-CN', { hour12: false })
+  return Number.isNaN(d.getTime()) ? null : d
+}
+
+// Long-running tasks span days, so a bare HH:MM:SS is ambiguous. Prefix the
+// date only when the message isn't from today — keeps the common case narrow
+// while still distinguishing yesterday's 09:12 from today's.
+const timestampText = computed(() => {
+  const d = parseCreatedAt(props.message.created_at)
+  if (!d) return ''
+  const time = d.toLocaleTimeString('zh-CN', { hour12: false })
+  const now = new Date()
+  const isToday = d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  if (isToday) return time
+  return `${d.getMonth() + 1}/${d.getDate()} ${time}`
 })
 
 const timestampTitle = computed(() => {
-  const raw = props.message.created_at
-  if (!raw) return ''
-  const d = new Date(raw)
-  if (Number.isNaN(d.getTime())) return ''
+  const d = parseCreatedAt(props.message.created_at)
+  if (!d) return ''
   return d.toLocaleString('zh-CN', { hour12: false })
 })
 
