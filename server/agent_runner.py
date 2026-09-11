@@ -19,6 +19,7 @@ import os
 import pty
 import signal
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -1706,23 +1707,24 @@ class AgentRunner:
                 or actual_start_time is None
                 or str(actual_start_time) != str(expected_start_time)
             ):
-                # The leader is gone (or is a recycled stranger), but the group
-                # it created can outlive it — that orphaned-descendant shape is
-                # precisely what holds codex's thread writer lock and makes
-                # every later resume fail. The recorded pid doubles as the pgid
-                # (both the PTY path's setsid child and pipe mode's
-                # start_new_session child lead their own group), so surviving
-                # members are still addressable even with no leader to identify.
-                # Signal them individually: killpg would need the group to still
-                # exist as such, and we deliberately do not trust `pid` here.
-                # Only when /proc has no such pid at all. The other two branches
-                # (no recorded baseline, start-time mismatch) mean the pid may
-                # be a recycled stranger, and a stranger that called setsid
-                # leads a group whose pgid equals that same pid — signaling it
-                # would kill an unrelated process tree. With the pid absent,
-                # nothing can have re-leased it, so every member still reporting
-                # this pgid provably descends from our original leader.
-                survivors = _pgroup_members(pid) if actual_start_time is None else []
+                # The leader is gone, but the group it created can outlive it —
+                # that orphaned-descendant shape is precisely what holds codex's
+                # thread writer lock and makes every later resume fail. The
+                # recorded pid doubles as the pgid (both the PTY path's setsid
+                # child and pipe mode's start_new_session child lead their own
+                # group), so surviving members stay addressable with no leader
+                # to identify. Signal them individually: killpg would need the
+                # group to still exist as such, and we do not trust `pid` here.
+                #
+                # Gated on _pid_is_absent, NOT on actual_start_time being None.
+                # A None start time also covers a transient stat read/parse
+                # failure on a pid that still exists, and a live stranger that
+                # called setsid leads a group whose pgid equals that same pid —
+                # signaling it would kill an unrelated tree. Only ENOENT on
+                # /proc/<pid> proves nothing can have re-leased the number, and
+                # therefore that every member still reporting this pgid descends
+                # from our original leader.
+                survivors = _pgroup_members(pid) if _pid_is_absent(pid) else []
                 if survivors:
                     logger.warning(
                         "Orphan task %s leader pid=%d is gone but %d process(es) remain in "
@@ -1757,6 +1759,12 @@ class AgentRunner:
 
             # Kill the surviving process — we've lost the PTY fd and
             # cannot recover the I/O channel.
+            #
+            # Escalate to SIGKILL before clearing subprocess_pid below: this is
+            # the last moment we hold the group's identity, so a worker that
+            # ignores SIGTERM would otherwise keep codex's writer lock forever
+            # with no metadata left to find it by. Identity was just verified
+            # against the recorded start time, so killpg on this pgid is safe.
             try:
                 os.killpg(pid, signal.SIGTERM)
                 logger.info("Sent SIGTERM to orphan pid %d (task %s)", pid, task_id)
@@ -1765,6 +1773,25 @@ class AgentRunner:
             except Exception:
                 try:
                     os.kill(pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+
+            # Synchronous sleep: this runs at startup before the event loop
+            # serves traffic, and the whole point is to not release the pgid
+            # until we know the group is gone. Bounded and short.
+            for _ in range(10):
+                if not _pgroup_alive(pid):
+                    break
+                time.sleep(0.1)
+            if _pgroup_alive(pid):
+                logger.warning(
+                    "Orphan group pgid=%d (task %s) survived SIGTERM; escalating to SIGKILL",
+                    pid, task_id,
+                )
+                try:
+                    os.killpg(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 except Exception:
@@ -2032,6 +2059,24 @@ def _read_proc_start_time(pid: int) -> int | None:
         return int(parts[21])
     except Exception:
         return None
+
+def _pid_is_absent(pid: int) -> bool:
+    """True only when /proc has no entry for *pid* at all.
+
+    Distinct from `_read_proc_start_time(pid) is None`, which also covers a
+    transient read/parse failure on a pid that very much still exists. Callers
+    that signal a process group derived from *pid* must use this: treating an
+    unreadable stat as proof of absence would let them kill a live, recycled
+    stranger's group. ENOENT on the directory itself is the only safe evidence.
+    """
+    try:
+        os.stat(f"/proc/{pid}")
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
 
 def _pgroup_members(pgid: int) -> list[int]:
     """Live (non-zombie) pids in process group *pgid*.

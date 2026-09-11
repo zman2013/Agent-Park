@@ -20,8 +20,9 @@ import sys
 import time
 from pathlib import Path
 
+from server import agent_runner as agent_runner_mod
 from server.adapters.codex import CodexAdapter
-from server.agent_runner import AgentRunner, _pgroup_members
+from server.agent_runner import AgentRunner, _pgroup_members, _read_proc_start_time
 from server.models import Agent, Task, TaskStatus
 from server.state import app_state
 
@@ -33,6 +34,22 @@ def _descendants(pid):
     ).stdout
     kids = [int(x) for x in out.split()]
     return kids + [g for k in kids for g in _descendants(k)]
+
+
+def _identity(pid):
+    """(pid, starttime) — a pid alone is not a stable process identity.
+
+    These tests kill processes and then assert on the result, which is exactly
+    when the kernel is free to hand the number to something else. Comparing the
+    start-time field too means a recycled pid reads as dead (different identity)
+    rather than as a survivor.
+    """
+    return (pid, _read_proc_start_time(pid))
+
+
+def _alive_as(pid, identity):
+    """True only if *pid* is running AND is still the same process as *identity*."""
+    return _alive(pid) and _identity(pid) == identity
 
 
 def _alive(pid):
@@ -248,6 +265,116 @@ def test_sigkill_escalates_on_the_group_not_the_wrapper(monkeypatch, tmp_path):
     asyncio.run(_check_sigkill_escalates_on_the_group(monkeypatch, tmp_path))
 
 
+def _live_group_with_stubborn_worker():
+    """A live setsid leader whose worker ignores SIGTERM.
+
+    The identity-verified branch of restore_orphan_tasks(): recorded start time
+    matches, so it signals the group and then clears subprocess_pid. Returns
+    (pgid, worker_pid, leader_popen).
+    """
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,subprocess,sys,time\n"
+            "p = subprocess.Popen([sys.executable, '-c',"
+            " 'import signal,time;"
+            " signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)'])\n"
+            "print(os.getpid(), p.pid, flush=True)\n"
+            "time.sleep(300)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid, worker = (int(x) for x in leader.stdout.readline().split())
+    assert _alive(pgid) and _alive(worker)
+    assert os.getpgid(worker) == pgid
+    return pgid, worker, leader
+
+
+def test_orphan_recovery_escalates_before_discarding_the_pid(monkeypatch, tmp_path):
+    """SIGTERM alone leaks the writer-lock holder along with its only handle.
+
+    restore_orphan_tasks() clears subprocess_pid unconditionally, so this is the
+    last moment the group is identifiable. A worker that ignores SIGTERM must be
+    SIGKILLed here or it keeps codex's lock forever, unfindable.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    worker_id = _identity(worker)
+    agent = Agent(name="escalatetest", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="escalatetest")
+    task.status = TaskStatus.running
+    object.__setattr__(task, "subprocess_pid", pgid)
+    # Real recorded identity, so the verified branch is the one taken.
+    object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pgid))
+    app_state.agents[agent.id] = agent
+    # See the isolation note in the leaderless-group test: never add to the real
+    # registry, restore_orphan_tasks signals every running task it finds.
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == [task.id]
+        for _ in range(30):
+            if not _alive_as(worker, worker_id):
+                break
+            time.sleep(0.1)
+        assert not _alive_as(worker, worker_id), (
+            "SIGTERM-ignoring worker outlived its own metadata"
+        )
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
+def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path):
+    """A transient stat failure must not authorize signaling a recycled group.
+
+    _read_proc_start_time returns None both when the pid is gone and when its
+    stat cannot be read. Gating the fallback on the latter would let a live,
+    unrelated setsid leader (whose pgid equals the recycled pid) be killed.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    worker_id, leader_id = _identity(worker), _identity(pgid)
+    agent = Agent(name="unreadable", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="unreadable")
+    task.status = TaskStatus.running
+    object.__setattr__(task, "subprocess_pid", pgid)
+    object.__setattr__(task, "subprocess_start_time", 999999)  # mismatch
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    # Simulate the transient failure: pid exists, its start time is unreadable.
+    # Patched after the identities above are captured, since they use it too.
+    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == [task.id]
+        # Give a wrongly-issued kill time to land before concluding it was not
+        # issued. Asserting immediately would pass on timing luck alone: the
+        # signal is delivered asynchronously, so a freshly-signaled process
+        # still reads as running for a moment.
+        time.sleep(0.5)
+        assert _alive_as(worker, worker_id), (
+            "unrelated group killed on an unreadable stat"
+        )
+        assert _alive_as(pgid, leader_id), (
+            "unrelated leader killed on an unreadable stat"
+        )
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
 def _leaderless_group():
     """A setsid leader that exits, leaving a live child still in its group.
 
@@ -288,6 +415,7 @@ def test_orphan_recovery_kills_survivors_of_a_leaderless_group(monkeypatch, tmp_
     exactly the writer-lock holder this PR exists to remove.
     """
     pgid, survivor = _leaderless_group()
+    survivor_id = _identity(survivor)
     agent = Agent(name="orphantest", command="/bin/true", cwd=str(tmp_path))
     task = Task(agent_id=agent.id, name="orphantest")
     task.status = TaskStatus.running
@@ -306,10 +434,12 @@ def test_orphan_recovery_kills_survivors_of_a_leaderless_group(monkeypatch, tmp_
         cleaned = AgentRunner().restore_orphan_tasks()
         assert cleaned == [task.id]
         for _ in range(30):
-            if not _alive(survivor):
+            if not _alive_as(survivor, survivor_id):
                 break
             time.sleep(0.1)
-        assert not _alive(survivor), "survivor of a leaderless group was abandoned"
+        assert not _alive_as(survivor, survivor_id), (
+            "survivor of a leaderless group was abandoned"
+        )
     finally:
         try:
             os.kill(survivor, 9)
