@@ -15,6 +15,7 @@ tests pin the same property for pipe mode.
 
 import asyncio
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -372,6 +373,56 @@ def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path)
             except ProcessLookupError:
                 pass
         leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
+def test_gateway_declines_when_leader_identity_is_unverifiable(monkeypatch):
+    """An unreadable start time is not absence, so the gateway must decline.
+
+    _group_is_still is now the single door every killpg goes through, so a None
+    start time treated as "leader merely exited" would re-introduce the recycled-
+    pgid kill at kill_task and shutdown too, not just in orphan recovery.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    try:
+        # Baseline recorded, but the leader's stat is unreadable right now while
+        # the pid is very much present: unverifiable, so decline.
+        monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+        assert not agent_runner_mod._group_is_still(pgid, 12345)
+        assert not agent_runner_mod._killpg_verified(pgid, 12345, signal.SIGKILL)
+        # No baseline at all is equally unverifiable while the pid is held.
+        assert not agent_runner_mod._group_is_still(pgid, None)
+        time.sleep(0.3)
+        assert _alive(worker), "gateway signaled a group it could not verify"
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+
+
+def test_successful_task_with_stale_pid_is_not_marked_failed(monkeypatch, tmp_path):
+    """_finish_task persists success before the pid is cleared and persisted.
+
+    A crash in that window leaves a genuinely successful task holding a stale
+    pid; the retry path must not adopt it and rewrite the result to failed.
+    """
+    agent = Agent(name="successstale", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="successstale")
+    task.status = TaskStatus.success
+    object.__setattr__(task, "subprocess_pid", 999999)  # stale, long gone
+    object.__setattr__(task, "subprocess_start_time", 12345)
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == []
+        assert task.status == TaskStatus.success, (
+            "a completed task was rewritten to failed over a stale pid"
+        )
+    finally:
         app_state.agents.pop(agent.id, None)
 
 

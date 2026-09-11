@@ -1701,8 +1701,14 @@ class AgentRunner:
             # later startup can retry; without this clause that retry never
             # happens, since the task was marked failed on the way out and the
             # status filter alone would skip it forever.
+            #
+            # Restricted to `failed`, not "anything not running": _finish_task
+            # persists a successful status before _cleanup_run_resources clears
+            # and persists the pid, so a crash in that window leaves a genuinely
+            # successful task holding a stale pid. Admitting it here would
+            # rewrite a completed result to failed on the next startup.
             retry_pid = (
-                task.status.value not in ("running", "waiting")
+                task.status == TaskStatus.failed
                 and getattr(task, "subprocess_pid", None) is not None
             )
             if task.status.value not in ("running", "waiting") and not retry_pid:
@@ -2187,12 +2193,22 @@ def _group_is_still(pgid: int, leader_start: int | None) -> bool:
     holds that pid, the number has been re-leased and signaling it would hit an
     unrelated tree.
 
-    leader_start of None means no baseline was recorded, in which case a live
-    holder cannot be distinguished from the original and the group is treated as
-    ours (the pre-existing behaviour) — callers that can record a baseline should.
+    leader_start of None means no baseline was recorded; the pid is then only
+    accepted if it is genuinely absent from /proc, since a live holder cannot be
+    told apart from the original without one.
     """
     current = _read_proc_start_time(pgid)
-    if current is not None and leader_start is not None and current != leader_start:
+    if leader_start is None:
+        # No baseline: the only safe evidence that this number is still (or at
+        # worst harmlessly) ours is that nothing holds it.
+        return _pid_is_absent(pgid) and _pgroup_alive(pgid)
+    if current is None:
+        # Unreadable is not absent. A transient stat failure on a live, recycled
+        # pid would otherwise skip the mismatch check below, and _pgroup_alive's
+        # own scan — which may well succeed — would then authorize the signal.
+        if not _pid_is_absent(pgid):
+            return False
+    elif current != leader_start:
         return False
     return _pgroup_alive(pgid)
 
