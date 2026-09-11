@@ -24,6 +24,10 @@ class FakeCtx:
         self.task_id = task_id
         self.created: list[tuple[str, str, str]] = []
         self.closed: list[str] = []
+        # (message_id, delta) — what a live client would actually receive.
+        self.deltas: list[tuple[str, str]] = []
+        # message_id -> the Message object handed out, to check final state.
+        self.messages: dict[str, Message] = {}
 
     async def create_message(self, role, type_, content, tool_name="", streaming=False):
         msg = Message(
@@ -31,7 +35,21 @@ class FakeCtx:
             tool_name=tool_name, streaming=streaming,
         )
         self.created.append((type_, tool_name, content))
+        self.messages[msg.id] = msg
         return msg
+
+    async def append_delta(self, message_id, text):
+        self.deltas.append((message_id, text))
+
+    def client_view(self, message_id, opening):
+        """Replay what a live client holds: opening content plus its deltas.
+
+        The frontend applies message_chunk by appending the delta and
+        message_done by clearing `streaming` only — it never re-reads content
+        from the server. So this, not msg.content, is what the user sees
+        without reloading the task.
+        """
+        return opening + "".join(d for mid, d in self.deltas if mid == message_id)
 
     async def close_message(self, message_id):
         self.closed.append(message_id)
@@ -179,6 +197,80 @@ def test_turn_completed_counts_turns_even_without_usage():
     assert task.num_turns == 4, task.num_turns
 
 
+def test_repeated_identical_replies_are_both_shown():
+    """Two confirmations both answered "OK" are two replies, not one.
+
+    Deduplicating on (thread, text) swallowed the second, leaving its tool
+    call with no visible result — the user could not tell the second request
+    had completed. The real distinction is the verb: spawn/send_input/wait
+    solicit a reply, close_agent only echoes prior state.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+    states = {tid: {"status": "completed", "message": "OK"}}
+
+    async def drive():
+        for i in range(2):
+            item = _collab(f"item_{i}", "send_input", tids=[tid],
+                           prompt="确认一次", states=states)
+            await adapter.handle_chunk({"type": "item.started", "item": item}, ctx)
+            await adapter.handle_chunk({"type": "item.completed", "item": item}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert len(replies) == 2, replies
+
+
+def test_close_agent_does_not_re_emit_an_echoed_reply():
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+    states = {tid: {"status": "completed", "message": "done"}}
+
+    async def drive():
+        for i, tool in ((0, "wait"), (1, "close_agent")):
+            item = _collab(f"item_{i}", tool, tids=[tid], states=states)
+            await adapter.handle_chunk({"type": "item.started", "item": item}, ctx)
+            await adapter.handle_chunk({"type": "item.completed", "item": item}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert replies == [f"[{CodexAdapter._short_tid(tid)} completed]\ndone"], replies
+
+
+def test_finalized_detail_reaches_live_clients():
+    """The thread id and status that only item.completed carries must be sent.
+
+    Assigning msg.content server-side is invisible to connected clients:
+    close_message broadcasts only the id, and markMessageDone clears
+    `streaming` without touching content.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+
+    async def drive():
+        opening = _collab("item_0", "spawn_agent", prompt="做这件事")
+        await adapter.handle_chunk({"type": "item.started", "item": opening}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "spawn_agent", tids=[tid], prompt="做这件事",
+                             states={tid: {"status": "pending_init", "message": None}})},
+            ctx,
+        )
+
+    _run(drive())
+    opening_content = ctx.created[0][2]
+    msg_id = next(iter(ctx.messages))
+    seen = ctx.client_view(msg_id, opening_content)
+    label = CodexAdapter._short_tid(tid)
+    assert label in seen, seen
+    assert "pending_init" in seen, seen
+    # And the client's view matches the authoritative server-side content.
+    assert seen == ctx.messages[msg_id].content, (seen, ctx.messages[msg_id].content)
+
+
 def test_concurrent_sub_agents_get_distinct_labels():
     """Thread ids are time-ordered, so same-turn agents share a prefix.
 
@@ -190,10 +282,36 @@ def test_concurrent_sub_agents_get_distinct_labels():
     assert CodexAdapter._short_tid(a) != CodexAdapter._short_tid(b)
 
 
+def test_reordered_thread_ids_still_append_cleanly():
+    """`receiver_thread_ids` order is not stable between started and completed.
+
+    A real `wait` over two agents listed them in one order on item.started and
+    the reverse on item.completed. Without a stable ordering the append-only
+    diff failed and the bubble ended up with two `agents:` lines.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    a = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+    b = "01a08e82-5133-7520-8a88-4dd599ecc862"
+
+    async def drive():
+        await adapter.handle_chunk(
+            {"type": "item.started", "item": _collab("item_0", "wait", tids=[a, b])}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "wait", tids=[b, a],
+                             states={b: {"status": "completed", "message": "mb"},
+                                     a: {"status": "completed", "message": "ma"}})}, ctx)
+
+    _run(drive())
+    msg_id = next(iter(ctx.messages))
+    seen = ctx.client_view(msg_id, ctx.created[0][2])
+    assert seen.count("agents:") == 1, seen
+    assert seen == ctx.messages[msg_id].content
+
+
 def test_reset_clears_collab_state():
     adapter = CodexAdapter()
     adapter._collab_msgs["x"] = Message(role="agent", type="tool_use", content="c")
-    adapter._seen_replies["tid"] = "old"
     adapter.reset()
     assert adapter._collab_msgs == {}
-    assert adapter._seen_replies == {}

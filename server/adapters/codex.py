@@ -32,6 +32,12 @@ from server.models import Message, TaskStatus
 
 logger = logging.getLogger(__name__)
 
+# Sub-agent verbs that solicit a fresh reply. `close_agent` (and any other
+# lifecycle verb) only echoes whatever agents_states already held, so it must
+# not be treated as carrying a new answer.
+_REPLY_VERBS = frozenset({"spawn_agent", "send_input", "wait", "resume_agent",
+                          "write_stdin", "send_message", "followup_task"})
+
 
 class CodexAdapter(BaseAdapter):
     def __init__(self) -> None:
@@ -42,9 +48,6 @@ class CodexAdapter(BaseAdapter):
         # `wait` on one agent can open while another agent's `send_input` is
         # still in flight, and a single slot would close the wrong bubble.
         self._collab_msgs: dict[str, Message] = {}
-        # Last reply text already emitted per sub-agent thread, so a reply is
-        # not repeated by every subsequent call that echoes agents_states.
-        self._seen_replies: dict[str, str] = {}
         # Number of task.messages observed when the current turn started.
         # Used to scope per-turn usage attachment so it never bleeds into
         # earlier turns (e.g. when the current turn produces only ignored
@@ -189,8 +192,23 @@ class CodexAdapter(BaseAdapter):
         item_id = item.get("id", "")
         msg = self._collab_msgs.pop(item_id, None)
         if msg is not None:
-            msg.content = self._collab_summary(item)
+            # item.completed carries details item.started lacked — the spawned
+            # thread id and the final status. Assigning to msg.content alone
+            # would only update server-side state: close_message broadcasts
+            # just the id, and the frontend's markMessageDone clears
+            # `streaming` without touching content, so live clients would keep
+            # showing the initial prompt until they reloaded the task. Send the
+            # new detail as a delta so it actually lands in the open bubble.
+            final = self._collab_summary(item)
+            delta = final[len(msg.content):] if final.startswith(msg.content) else ""
+            if not delta and final != msg.content:
+                # Not a pure append (unexpected, but do not silently drop the
+                # finalized state): resend the whole summary on a new line.
+                delta = "\n" + final
+            msg.content += delta
             msg.streaming = False
+            if delta:
+                await ctx.append_delta(msg.id, delta)
             await ctx.close_message(msg.id)
         else:
             # No matching item.started (interrupted run, or a verb that only
@@ -202,17 +220,25 @@ class CodexAdapter(BaseAdapter):
 
         # The sub-agent's reply lives in agents_states[tid].message. This is
         # the payload worth reading — it is what the sub-agent handed back.
-        # Deduped per thread: agents_states keeps carrying the last message on
-        # every later call, so a spawn→wait→close sequence would otherwise
-        # print the same reply three times.
+        #
+        # Only verbs that actually solicit a reply emit one. agents_states
+        # keeps echoing the last message on every later call, so without this
+        # a spawn→wait→close sequence would print the same reply three times.
+        # Keying on (thread, text) instead would be wrong in the other
+        # direction: two confirmations both answered "OK" are distinct
+        # replies, and the second would be swallowed, leaving its tool call
+        # with no visible result.
+        if item.get("tool") not in _REPLY_VERBS:
+            return
         replies = []
-        for tid, state in (item.get("agents_states") or {}).items():
+        states = item.get("agents_states") or {}
+        for tid in sorted(states, key=self._short_tid):
+            state = states[tid]
             if not isinstance(state, dict):
                 continue
             text = (state.get("message") or "").strip()
-            if not text or self._seen_replies.get(tid) == text:
+            if not text:
                 continue
-            self._seen_replies[tid] = text
             status = state.get("status", "")
             replies.append(f"[{self._short_tid(tid)} {status}]\n{text}")
         if replies:
@@ -230,19 +256,31 @@ class CodexAdapter(BaseAdapter):
         return f"agent:{item.get('tool') or 'collab'}"
 
     def _collab_summary(self, item: dict) -> str:
-        """Human-readable parameters for the tool_use bubble."""
+        """Human-readable parameters for the tool_use bubble.
+
+        Ordered prompt-first so that the fields item.completed adds (thread
+        ids, statuses) extend the tail. _handle_collab_completed relies on
+        that: it diffs against the opening summary and streams the difference
+        as a delta, which is only correct while growth is append-only.
+        """
         lines = []
-        tids = item.get("receiver_thread_ids") or []
-        if tids:
-            lines.append(f"agents: {', '.join(self._short_tid(t) for t in tids)}")
-        for tid, state in (item.get("agents_states") or {}).items():
-            if isinstance(state, dict) and state.get("status"):
-                lines.append(f"  {self._short_tid(tid)}: {state['status']}")
         prompt = (item.get("prompt") or "").strip()
         if prompt:
+            lines.append(prompt)
+        tids = item.get("receiver_thread_ids") or []
+        if tids:
             if lines:
                 lines.append("")
-            lines.append(prompt)
+            # Sorted: a real `wait` over two agents listed them in one order on
+            # item.started and the reverse on item.completed, which broke the
+            # append-only diff and duplicated the whole line in the bubble.
+            labels = sorted(self._short_tid(t) for t in tids)
+            lines.append(f"agents: {', '.join(labels)}")
+        states = item.get("agents_states") or {}
+        for tid in sorted(states, key=self._short_tid):
+            state = states[tid]
+            if isinstance(state, dict) and state.get("status"):
+                lines.append(f"  {self._short_tid(tid)}: {state['status']}")
         return "\n".join(lines)
 
     @staticmethod
@@ -320,5 +358,4 @@ class CodexAdapter(BaseAdapter):
         """Clear internal state between sessions."""
         self._current_tool_msg = None
         self._collab_msgs.clear()
-        self._seen_replies.clear()
         self._turn_start_msg_count = None
