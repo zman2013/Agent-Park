@@ -575,6 +575,10 @@ class AgentRunner:
         # task_id -> leader's /proc start time, read at spawn. Gates every signal
         # so a recycled pid/pgid cannot absorb a kill aimed at our group.
         self._proc_starts: dict[str, int | None] = {}
+        # task_ids whose kill_task ended without proof that the group is gone
+        # (闸门因 _GROUP_UNKNOWN 拒发，或组扛过了 SIGKILL)。_cleanup_run_resources
+        # 见到它就保留 subprocess_pid，让下次启动的 restore_orphan_tasks 再试一次。
+        self._retain_pid: set[str] = set()
         self._adapters: dict[str, BaseAdapter] = {}  # task_id -> active adapter
         self._session_ids: dict[str, str] = self._load_sessions()
         self._resuming: set[str] = set()          # task_ids being killed for resume
@@ -904,9 +908,14 @@ class AgentRunner:
         # Clear persisted PID — subprocess is gone
         task = app_state.get_task(task_id)
         if task:
-            object.__setattr__(task, "subprocess_pid", None)
-            object.__setattr__(task, "subprocess_start_time", None)
-            app_state.save_agent_tasks(task.agent_id)
+            # 除非 kill_task 没能证明组已消失：那时 pid 元数据是残留后代唯一的把手，
+            # 清掉就等于把可恢复的孤儿换成永久的孤儿。留着最多下次启动多查一次。
+            if task_id in self._retain_pid:
+                self._retain_pid.discard(task_id)
+            else:
+                object.__setattr__(task, "subprocess_pid", None)
+                object.__setattr__(task, "subprocess_start_time", None)
+                app_state.save_agent_tasks(task.agent_id)
 
     async def maybe_dispatch_auto_compact(self, task_id: str, *, success: bool) -> None:
         """Dispatch `/compact` as next input if this turn crossed the auto-compact threshold.
@@ -1039,6 +1048,8 @@ class AgentRunner:
                 object.__setattr__(task, "subprocess_pid", pid)
                 object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pid))
                 app_state.save_agent_tasks(task.agent_id)
+            # 同 pipe 路径：元数据已换成这个新进程，旧 run 的保留标记不再适用。
+            self._retain_pid.discard(task_id)
 
             logger.info("Spawned %s pid=%d for task %s (pty mode)", args[0], pid, task_id)
 
@@ -1169,6 +1180,9 @@ class AgentRunner:
             object.__setattr__(task, "subprocess_pid", proc.pid)
             object.__setattr__(task, "subprocess_start_time", leader_start)
             app_state.save_agent_tasks(task.agent_id)
+        # 元数据现在描述的是这个新进程，上一轮 kill_task 留下的保留标记对它无效
+        # （resume 时旧 run 的 cleanup 可能因 run_id 不匹配提前返回而没消费掉它）。
+        self._retain_pid.discard(task_id)
 
         logger.info("Spawned %s pid=%d for task %s (pipe mode)", args[0], proc.pid, task_id)
 
@@ -1624,6 +1638,7 @@ class AgentRunner:
             # means the pid may already be free, so each delivery is gated on the
             # leader's recorded start time — otherwise dropping the returncode
             # guard would let a reused pgid absorb this kill.
+            state = _GROUP_UNKNOWN
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 sent = _killpg_verified(proc.pid, leader_start, sig)
                 if not sent and proc.returncode is None:
@@ -1652,6 +1667,27 @@ class AgentRunner:
                     state = _group_state(proc.pid, leader_start)
                     if state in (_GROUP_GONE, _GROUP_FOREIGN):
                         break
+                else:
+                    # SIGKILL 也不是同步的：卡在不可中断等待里的成员会让它挂起。
+                    # 和 restore_orphan_tasks 一样先轮询等一小会儿，再下最终判决，
+                    # 否则一个其实马上就会死的组会被误判成"扛过了 SIGKILL"。
+                    for _ in range(10):
+                        state = _group_state(proc.pid, leader_start)
+                        if state in (_GROUP_GONE, _GROUP_FOREIGN):
+                            break
+                        await asyncio.sleep(0.1)
+            # 最终判决：只有 gone/foreign 才算"我们这边已经没有活口"。
+            # _GROUP_OURS 表示组扛过了 SIGKILL，_GROUP_UNKNOWN 表示两次投递都被闸门
+            # 拒绝（/proc 一直读不全），两者都不是死亡证据 —— 而直接子进程可能已经
+            # 因为 handle 版 SIGTERM 退出，pgid 就成了残留后代（codex writer lock 的
+            # 持有者）唯一的把手。标记一下，别让 _cleanup_run_resources 把它清掉。
+            if state not in (_GROUP_GONE, _GROUP_FOREIGN):
+                self._retain_pid.add(task_id)
+                logger.error(
+                    "Group pgid=%d (task %s) not verifiably gone after kill_task; "
+                    "retaining pid metadata for startup retry",
+                    proc.pid, task_id,
+                )
             # Reap the process so it does not linger as a zombie holding the
             # asyncio transport open.
             try:
@@ -1682,6 +1718,8 @@ class AgentRunner:
         self._compact_warned.discard(task_id)
         self._compact_pending.discard(task_id)
         self._handoff_pending.discard(task_id)
+        # 任务已被删除，没有下一次启动可以重试它的组了。
+        self._retain_pid.discard(task_id)
         self._run_start_index.pop(task_id, None)
         self._input_locks.pop(task_id, None)
         # Cleared here, not in _cleanup_run_resources: the snapshot must outlive

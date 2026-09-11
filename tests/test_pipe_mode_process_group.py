@@ -943,3 +943,74 @@ async def _check_shutdown_escalates_a_forgotten_group(monkeypatch, tmp_path):
 
 def test_shutdown_escalates_a_group_whose_run_entry_is_gone(monkeypatch, tmp_path):
     asyncio.run(_check_shutdown_escalates_a_forgotten_group(monkeypatch, tmp_path))
+
+
+async def _check_cleanup_retains_pid_when_group_unverifiable(monkeypatch, tmp_path):
+    """kill_task 全程 UNKNOWN 时，per-run cleanup 不能清掉 pid 元数据。
+
+    闸门对 _GROUP_UNKNOWN 两次投递都拒发，可 handle 版 SIGTERM 仍会让直接子进程退出，
+    抗 SIGTERM 的后代活下来。此时 subprocess_pid 是它唯一的把手，而
+    _cleanup_run_resources 原来无条件清空 —— 可恢复的孤儿就变成永久的。
+    """
+    runner, task, proc, reader = await _spawn(
+        monkeypatch, tmp_path, wrapper=_stubborn_wrapper
+    )
+    stubborn = [p for p in _descendants(proc.pid) if _alive(p)]
+    assert stubborn, "fixture spawned no SIGTERM-ignoring child"
+    # 这个 run 才是资源的主人，否则 cleanup 会提前 return，测不到清理分支。
+    runner._run_ids[task.id] = "run-killtest"
+    # /proc 从此读不出身份：_group_state 一路 UNKNOWN，闸门拒发两次。
+    # 两个探针都要打：只打 _read_proc_start_time 的话，leader 一退出
+    # _pid_is_absent 就返回 True，"leader 只是退了"那条路又把状态推回 OURS/GONE，
+    # 复现不出"始终无法核验"。EACCES/EIO 这类读失败才是 codex 描述的场景 ——
+    # 目录还在，但读不出来，既不是缺席也不是身份不符。
+    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", lambda _p: False)
+    try:
+        await runner.kill_task(task.id)
+        assert task.id in runner._retain_pid, (
+            "unknown verdict did not mark the pid for retention"
+        )
+        runner._cleanup_run_resources(task.id, "run-killtest")
+        assert getattr(task, "subprocess_pid", None) == proc.pid, (
+            "pid discarded while the group's fate was unknown"
+        )
+        assert getattr(task, "subprocess_start_time", None) is not None
+    finally:
+        for p in [proc.pid] + stubborn:
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        reader.cancel()
+
+
+def test_cleanup_retains_pid_when_group_verification_is_unknown(monkeypatch, tmp_path):
+    asyncio.run(_check_cleanup_retains_pid_when_group_unverifiable(monkeypatch, tmp_path))
+
+
+async def _check_cleanup_clears_pid_when_group_is_gone(monkeypatch, tmp_path):
+    """反向守卫：组确实死了就必须清掉 pid，别把保留变成永远不清。
+
+    留着一个已释放的 pid 会让下次启动把它当孤儿再查一遍，也可能撞上被回收的号。
+    """
+    runner, task, proc, reader = await _spawn(monkeypatch, tmp_path)
+    tree = [proc.pid] + _descendants(proc.pid)
+    runner._run_ids[task.id] = "run-killtest"
+    try:
+        await runner.kill_task(task.id)
+        runner._cleanup_run_resources(task.id, "run-killtest")
+        assert getattr(task, "subprocess_pid", None) is None, (
+            "pid retained even though the group is provably gone"
+        )
+    finally:
+        for p in tree:
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        reader.cancel()
+
+
+def test_cleanup_clears_pid_when_group_is_provably_gone(monkeypatch, tmp_path):
+    asyncio.run(_check_cleanup_clears_pid_when_group_is_gone(monkeypatch, tmp_path))
