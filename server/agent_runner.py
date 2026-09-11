@@ -737,7 +737,7 @@ class AgentRunner:
         # keyed _subprocess_tasks/_pids/_async_procs/_pty_read_transports
         # entries below and making the old run invisible to a task_id-keyed
         # lookup.
-        self._live_runs[run_id] = {}
+        self._live_runs[run_id] = {"task_id": task_id}
 
         t = asyncio.create_task(
             self._run_subprocess(task_id, prompt, run_id),
@@ -1081,13 +1081,18 @@ class AgentRunner:
             os.close(slave_fd)
             self._pids[task_id] = pid
             self._master_fds[task_id] = master_fd
+            # 与 pipe 路径一致：身份在 spawn 时读一次并记进 _live_runs，shutdown 的每
+            # 一发信号都按它过闸门。等到 shutdown 时才现读的话，leader 可能已经被回收，
+            # 读到的是复用者的身份 —— 那会把陌生人的组当成我们的登记进信号集合。
+            leader_start = _read_proc_start_time(pid)
             if run_id in self._live_runs:
                 self._live_runs[run_id]["pid"] = pid
+                self._live_runs[run_id]["pid_start"] = leader_start
             # Persist PID to task for orphan recovery
             task = app_state.get_task(task_id)
             if task:
                 object.__setattr__(task, "subprocess_pid", pid)
-                object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pid))
+                object.__setattr__(task, "subprocess_start_time", leader_start)
                 app_state.save_agent_tasks(task.agent_id)
             # 同 pipe 路径：元数据已换成这个新进程，旧 run 的保留标记不再适用。
             self._retain_pid.discard(task_id)
@@ -2067,21 +2072,26 @@ class AgentRunner:
             return max(0.0, min(cap, budget_deadline - loop.time() - reserve))
         # Process groups we have signaled, tracked outside _live_runs so a group
         # whose entry disappears mid-drain still gets escalated. See the comment
-        # at the .add() below. Keyed by pgid, valued by the leader's start time so
-        # a recycled pgid is distinguishable: the drain runs for up to 10s, and a
-        # bare number retained across it could name an unrelated group by the
-        # time the SIGKILL phase reads it.
-        signaled_pgids: dict[int, int | None] = {}
+        # at the .add() below.
+        #
+        # 键是 (pgid, leader_start) 整体，不是裸 pgid：kill_existing=False 的续话可以在
+        # 上一个 run 还在 finalize 时启动，若旧 pid/pgid 已被回收复用，_live_runs 里就同
+        # 时存在两条 pid 相同、pid_start 不同的记录。按裸 pgid 记的话先来的身份占坑，新
+        # run 的投递被闸门正确地判成 foreign 拒发（且每轮又被重新装回旧身份），它的后代
+        # 一个信号都收不到 —— 与第 13 轮 retained 集合改成按身份存是同一个道理。
+        #
+        # 值是 task_id：见下面 _persist_unresolved()，把手要写回哪个任务的元数据全靠它。
+        signaled_pgids: dict[tuple[int, int | None], str | None] = {}
 
         def _prune_signaled() -> None:
-            """只摘掉拿到确定判决（GONE/FOREIGN）的号。
+            """只摘掉拿到确定判决（GONE/FOREIGN）的组。
 
             UNKNOWN 不是死亡证据（见 _group_state），把它当成消失就等于放走一个可能还
-            活着的后代。留在集合里的号即意味着"还有 OURS/UNKNOWN 要继续等/复检"。
+            活着的后代。留在集合里的组即意味着"还有 OURS/UNKNOWN 要继续等/复检"。
             """
-            for pgid, leader_start in list(signaled_pgids.items()):
-                if _group_state(pgid, leader_start) in (_GROUP_GONE, _GROUP_FOREIGN):
-                    signaled_pgids.pop(pgid, None)
+            for entry in list(signaled_pgids):
+                if _group_state(*entry) in (_GROUP_GONE, _GROUP_FOREIGN):
+                    signaled_pgids.pop(entry, None)
 
         # kill_task 判决"没能证明消失"的旧组：后续 resume 已经把 subprocess_pid 换成
         # 新 pid，它们既不在 _live_runs 里，也不在上面这份 signaled_pgids 里，唯一的
@@ -2118,6 +2128,37 @@ class AgentRunner:
             # restore_orphan_tasks 一个 owner（见 _record_retained_pgid），它在下次
             # 启动时按身份复核后摘除。多留一轮的代价只是下次启动多一次核验。
 
+        def _persist_unresolved() -> None:
+            """把 shutdown 结束时仍未判定消失的组写进任务的 retained_pgids。
+
+            这是刻意打破"只有 restore_orphan_tasks 能写把手"的一处例外，因为不写就没有
+            把手了：signaled_pgids 是 shutdown 的局部变量，随进程一起消失；而这些组的另
+            一份把手 subprocess_pid 会被它们自己那条 run 的 _cleanup_run_resources 清掉
+            —— shutdown 既没有走 kill_task，也就没进 _retain_pid，那条保留逻辑不生效。
+            于是 `run.sh restart` 之后，一个仍握着 codex writer lock 的后代对新后端完全
+            不可见。
+
+            只写 _prune_signaled 之后还剩下的条目，即判决为 OURS/UNKNOWN 的组；拿到
+            GONE/FOREIGN 的已经被摘掉，不会被误记。多记一条活把手的代价只是下次启动多一
+            次按身份的核验（同一身份重复记不会堆项，见 _record_retained_pgid），而
+            restore_orphan_tasks 只在证明其消失后才摘除 —— 永远不会误删活把手。
+            """
+            _prune_signaled()
+            for (pgid, leader_start), task_id in signaled_pgids.items():
+                if task_id is None:
+                    logger.error(
+                        "Group pgid=%d not verifiably gone at shutdown and has no owning "
+                        "task; no handle survives this exit",
+                        pgid,
+                    )
+                    continue
+                logger.error(
+                    "Group pgid=%d (task %s) not verifiably gone at shutdown; persisting "
+                    "the handle so the next startup can retry",
+                    pgid, task_id,
+                )
+                self._record_retained_pgid(task_id, pgid, leader_start)
+
         def _sigterm_all() -> None:
             # Iterate _live_runs (keyed by run_id, never overwritten by an
             # unrelated run) rather than the task_id-keyed _pids/_async_procs
@@ -2142,13 +2183,9 @@ class AgentRunner:
                     # reaped, and reading then would either get None or, worse,
                     # a new holder's start time — baking the impostor's identity
                     # into the map as though it were ours.
-                    if pid not in signaled_pgids:
-                        signaled_pgids[pid] = run.get(
-                            "pid_start", _read_proc_start_time(pid)
-                        )
-                    group_signaled = _killpg_verified(
-                        pid, signaled_pgids[pid], signal.SIGTERM
-                    )
+                    entry = (pid, run.get("pid_start", _read_proc_start_time(pid)))
+                    signaled_pgids.setdefault(entry, run.get("task_id"))
+                    group_signaled = _killpg_verified(*entry, signal.SIGTERM)
                 proc = run.get("proc")
                 if proc is not None and proc.returncode is None and (
                     pid is None or not group_signaled
@@ -2236,8 +2273,8 @@ class AgentRunner:
                 # unverifiable one may still be alive, and forgetting it here is
                 # how a live descendant escapes the escalation entirely.
                 _prune_signaled()
-                for pgid, leader_start in list(signaled_pgids.items()):
-                    _killpg_verified(pgid, leader_start, signal.SIGKILL)
+                for entry in list(signaled_pgids):
+                    _killpg_verified(*entry, signal.SIGKILL)
                 for run in list(self._live_runs.values()):
                     pid = run.get("pid")
                     group_signaled = False
@@ -2246,13 +2283,11 @@ class AgentRunner:
                         # finalization keeps its entry here after its group has
                         # exited, so this delivery is as exposed to pid reuse as
                         # the tracked-pgid loop above.
-                        if pid not in signaled_pgids:
-                            signaled_pgids[pid] = run.get(
-                                "pid_start", _read_proc_start_time(pid)
-                            )
-                        group_signaled = _killpg_verified(
-                            pid, signaled_pgids[pid], signal.SIGKILL
+                        entry = (
+                            pid, run.get("pid_start", _read_proc_start_time(pid))
                         )
+                        signaled_pgids.setdefault(entry, run.get("task_id"))
+                        group_signaled = _killpg_verified(*entry, signal.SIGKILL)
                     proc = run.get("proc")
                     if proc is not None and proc.returncode is None and (
                         pid is None or not group_signaled
@@ -2328,6 +2363,11 @@ class AgentRunner:
                 if tasks:
                     await asyncio.wait(tasks, timeout=_budget_left(2))
 
+        # 进程组两阶段到此结束。仍未判定消失的组要在这里落盘：signaled_pgids 只活在这个
+        # 函数的栈上，而它们的另一份把手 subprocess_pid 马上就会被各自 run 的
+        # _cleanup_run_resources 清掉（shutdown 没走 kill_task，_retain_pid 那条保留逻辑
+        # 不生效）。放在预算收敛之后、返回之前，等的都等过了，判决是最终的那一次。
+        _persist_unresolved()
         # Give in-flight Feishu notifications a bounded window to finish before
         # the event loop closes and cancels them. send_feishu_card's own CLI
         # timeout is 30s (wiki_notify.py); this outer wait must exceed that

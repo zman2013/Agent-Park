@@ -1474,6 +1474,108 @@ def test_sigterm_grace_covers_signaled_only_groups(monkeypatch, tmp_path):
     asyncio.run(_check_sigterm_grace_covers_signaled_only_groups(monkeypatch, tmp_path))
 
 
+async def _check_shutdown_persists_unresolved_groups(monkeypatch, tmp_path):
+    """shutdown 结束时仍未判定消失的组，必须在返回前写进 retained_pgids。
+
+    `bash run.sh restart` 遇到一个 /proc 一直核验不出来（UNKNOWN）的 pipe 组：shutdown
+    退回去打直接子进程的把手，那条 run 于是走到 _cleanup_run_resources，把
+    subprocess_pid 清掉了 —— 它没走 kill_task，所以 _retain_pid 那条保留逻辑不生效。
+    而 signaled_pgids 只活在 shutdown 的栈上，进程一退就没了。两份把手都没了，新后端
+    对这个仍握着 codex writer lock 的后代完全不可见，永远回收不了。
+
+    判决固定为 UNKNOWN（既不许投递，也不是死亡证据），预算压到很小让两阶段快速收敛，
+    然后断言把手落在了任务元数据里、且身份完整。
+    """
+    agent = Agent(name="persistunres", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="persistunres")
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    monkeypatch.setattr(agent_runner_mod, "_sigterm_grace_seconds", lambda: 0)
+    monkeypatch.setattr(agent_runner_mod, "_sigkill_grace_seconds", lambda: 0)
+    # 一直读不出身份：闸门拒发，判决 UNKNOWN，正是本例要守的形状。
+    monkeypatch.setattr(
+        agent_runner_mod, "_group_state",
+        lambda p, s: agent_runner_mod._GROUP_UNKNOWN,
+    )
+    monkeypatch.setattr(
+        agent_runner_mod, "_killpg_verified", lambda p, s, sig: False
+    )
+    pgid, leader_start = 636363, 4242
+    runner = AgentRunner()
+    runner._live_runs["run-unres"] = {
+        "task_id": task.id, "pid": pgid, "pid_start": leader_start,
+    }
+    try:
+        await runner.shutdown()
+        # cleanup 会清掉 subprocess_pid（这里没有真 run 去跑它，但线上就是这样），
+        # 所以 retained_pgids 是这个组唯一能跨进程存活的把手。
+        assert [pgid, leader_start] in (
+            getattr(task, "retained_pgids", None) or []
+        ), (
+            "shutdown 结束时未判定消失的组没有落盘，重启后无从回收 writer lock 持有者"
+        )
+    finally:
+        runner._live_runs.clear()
+        app_state.agents.pop(agent.id, None)
+
+
+def test_shutdown_persists_unresolved_groups(monkeypatch, tmp_path):
+    asyncio.run(_check_shutdown_persists_unresolved_groups(monkeypatch, tmp_path))
+
+
+async def _check_shutdown_signals_both_identities_of_a_reused_live_pid(
+    monkeypatch, tmp_path
+):
+    """两条 _live_runs 记录 pid 相同、身份不同时，两个身份都要各自过闸门。
+
+    kill_existing=False 的续话可以在上一个 run 还在 finalize 时启动；旧 pgid 若已被回
+    收，_live_runs 里就同时存在两条 pid 相同、pid_start 不同的记录。shutdown 的
+    signaled_pgids 若按裸 pgid 记，先来的那个陈旧身份占坑，新 run 的投递被闸门正确地判
+    成 foreign 拒发 —— 它的后代一个组信号都收不到，只有直接 wrapper 吃到 handle 兜底。
+    """
+    pgid = 646464
+    stale_start, live_start = 111, 222
+    monkeypatch.setattr(app_state, "tasks", {})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    monkeypatch.setattr(agent_runner_mod, "_sigterm_grace_seconds", lambda: 0)
+    monkeypatch.setattr(agent_runner_mod, "_sigkill_grace_seconds", lambda: 0)
+
+    def fake_state(_pgid, start):
+        # 陈旧身份早已不是我们的；活身份始终无法核验（不许当成消失）。
+        return (
+            agent_runner_mod._GROUP_FOREIGN if start == stale_start
+            else agent_runner_mod._GROUP_UNKNOWN
+        )
+
+    attempts = []
+    monkeypatch.setattr(agent_runner_mod, "_group_state", fake_state)
+    monkeypatch.setattr(
+        agent_runner_mod,
+        "_killpg_verified",
+        lambda p, s, sig: attempts.append((p, s)) or False,
+    )
+    runner = AgentRunner()
+    # 陈旧身份先登记 —— 按裸 pgid 去重时它就是那个占坑的。
+    runner._live_runs["run-stale"] = {"pid": pgid, "pid_start": stale_start}
+    runner._live_runs["run-live"] = {"pid": pgid, "pid_start": live_start}
+    try:
+        await runner.shutdown()
+        assert (pgid, live_start) in attempts, (
+            "新 run 的身份被同号的陈旧记录挤掉了，它的组一个信号都没收到"
+        )
+    finally:
+        runner._live_runs.clear()
+
+
+def test_shutdown_signals_both_identities_of_a_reused_live_pid(monkeypatch, tmp_path):
+    asyncio.run(
+        _check_shutdown_signals_both_identities_of_a_reused_live_pid(
+            monkeypatch, tmp_path
+        )
+    )
+
+
 async def _check_unfinished_notifications_are_cancelled(monkeypatch):
     """通知 drain 超时后必须显式取消，不能留给事件循环 teardown 静默丢弃。
 
