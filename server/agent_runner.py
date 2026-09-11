@@ -2027,22 +2027,27 @@ class AgentRunner:
         # 与 signaled_pgids 分开存：某个旧 pgid 可能已被我们的新 run 复用，混进同一份
         # 映射会让那条 live run 拿着旧身份去投递（闸门正确地拒发 → 组里的后代反而一个
         # 信号都收不到）。
-        retained_pgids: dict[int, int | None] = {}
+        #
+        # 以 (pgid, leader_start) 整体为元素，而不是 pgid → 身份的映射：同一个号可以在
+        # 元数据里出现多次（旧组尚未被证明消失，号已被后来的 run 复用，两条记录都要留到
+        # 下次启动才复核）。只保留先记下的那个身份会让另一个身份的组永远收不到信号 ——
+        # 前者每轮被判 FOREIGN 剔掉、下一轮又从元数据里被加回来，后者始终进不了集合。
+        # 每个身份各占一条，该不该投递交给闸门按身份逐条判。
+        retained_pgids: set[tuple[int, int | None]] = set()
 
         def _refresh_retained() -> None:
             # 每一趟都重扫任务元数据：drain 期间仍可能有 kill_task 落地并记下新把手。
-            # setdefault 而非覆盖 —— 先记下的身份来自更早的观测，更可信。
             for t in list(app_state.tasks.values()):
                 for pgid, leader_start in (getattr(t, "retained_pgids", None) or []):
-                    retained_pgids.setdefault(pgid, leader_start)
-            for pgid, leader_start in list(retained_pgids.items()):
-                if _group_state(pgid, leader_start) in (_GROUP_GONE, _GROUP_FOREIGN):
-                    # 只有确定的判决才移出这份映射；UNKNOWN 不是死亡证据。
-                    retained_pgids.pop(pgid, None)
+                    retained_pgids.add((pgid, leader_start))
+            for entry in list(retained_pgids):
+                if _group_state(*entry) in (_GROUP_GONE, _GROUP_FOREIGN):
+                    # 只有确定的判决才移出这份集合；UNKNOWN 不是死亡证据。
+                    retained_pgids.discard(entry)
 
         def _signal_retained(sig: int) -> None:
             _refresh_retained()
-            for pgid, leader_start in list(retained_pgids.items()):
+            for pgid, leader_start in list(retained_pgids):
                 _killpg_verified(pgid, leader_start, sig)
             # 不在这里改写 retained_pgids 元数据：把手的生命周期只有
             # restore_orphan_tasks 一个 owner（见 _record_retained_pgid），它在下次
@@ -2106,12 +2111,19 @@ class AgentRunner:
         # newcomers until the set actually drains (or the overall budget below
         # runs out) keeps such continuations from being silently orphaned.
         deadline = loop.time() + 10
-        while self._live_runs and loop.time() < deadline:
+        while (self._live_runs or retained_pgids) and loop.time() < deadline:
             _sigterm_all()  # catch pids/procs registered by new continuations
             _signal_retained(signal.SIGTERM)
             tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
             if not tasks:
-                break
+                if not retained_pgids:
+                    break
+                # 保留组没有任何 asyncio task 可以 await（它们本来就不属于哪个 live
+                # run），但"没东西可等"不等于"可以立刻升级"。按短间隔轮询到 deadline，
+                # 保留组才真正拿到一段 graceful SIGTERM 窗口；否则 _live_runs 一空，
+                # 下面就在同一个事件循环回合里 SIGKILL 了它。
+                await asyncio.sleep(min(0.2, max(0.0, deadline - loop.time())))
+                continue
             # Poll on a short interval rather than waiting the full remaining
             # budget: asyncio.wait's default ALL_COMPLETED means a single
             # still-running task (e.g. a PTY reader blocked on a lingering
@@ -2201,11 +2213,18 @@ class AgentRunner:
             # which can already be empty here when the only thing left is a
             # lingering process group (its run entry dropped on stdout EOF).
             _sigkill_all()
-            while self._live_runs and loop.time() < kill_deadline:
+            while (self._live_runs or retained_pgids) and loop.time() < kill_deadline:
                 _sigkill_all()
                 tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
                 if not tasks:
-                    break
+                    if not retained_pgids:
+                        break
+                    # 同 SIGTERM 阶段：保留组没有可 await 的 task，但 SIGKILL 也不是
+                    # 同步的 —— 卡在不可中断等待里的成员要过一会儿才真正消失。轮询到
+                    # kill_deadline 再放手，否则投完信号就返回，run.sh stop 之后那个组
+                    # 可能还握着 codex writer lock 活着。
+                    await asyncio.sleep(min(0.2, max(0.0, kill_deadline - loop.time())))
+                    continue
                 # Same reasoning as the SIGTERM loop above: poll on a short
                 # interval so a continuation registered mid-drain gets
                 # re-snapshotted and SIGKILL'd instead of waiting out this

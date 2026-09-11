@@ -270,21 +270,67 @@ def test_sigkill_escalates_on_the_group_not_the_wrapper(monkeypatch, tmp_path):
     asyncio.run(_check_sigkill_escalates_on_the_group(monkeypatch, tmp_path))
 
 
-def _live_group_with_stubborn_worker():
+def _live_group_with_stubborn_worker(stubborn=True):
     """A live setsid leader whose worker ignores SIGTERM.
 
     The identity-verified branch of restore_orphan_tasks(): recorded start time
     matches, so it signals the group and then clears subprocess_pid. Returns
     (pgid, worker_pid, leader_popen).
+
+    stubborn=False gives the worker default SIGTERM handling — for tests that
+    only need to observe *whether* a group was signaled, not the escalation.
     """
+    worker_body = "import signal,time; "
+    if stubborn:
+        worker_body += "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+    worker_body += "time.sleep(300)"
     leader = subprocess.Popen(
         [
             sys.executable,
             "-c",
             "import os,subprocess,sys,time\n"
             "p = subprocess.Popen([sys.executable, '-c',"
-            " 'import signal,time;"
-            " signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)'])\n"
+            f" {worker_body!r}])\n"
+            "print(os.getpid(), p.pid, flush=True)\n"
+            "time.sleep(300)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid, worker = (int(x) for x in leader.stdout.readline().split())
+    assert _alive(pgid) and _alive(worker)
+    assert os.getpgid(worker) == pgid
+    return pgid, worker, leader
+
+
+def _live_group_with_graceful_worker(marker, delay=0.6):
+    """A live setsid leader whose worker exits on SIGTERM, but not instantly.
+
+    The worker takes *delay* seconds to shut down cleanly and touches *marker* on
+    its way out; a SIGKILL arriving inside that window leaves no marker. That is
+    the observable difference between "shutdown gave the group a graceful TERM
+    interval" and "shutdown escalated in the same loop turn".
+
+    SIG_IGN is installed at handler entry so the repeated SIGTERMs of shutdown's
+    drain cannot re-enter the handler. Returns (pgid, worker_pid, leader_popen).
+    """
+    worker_src = (
+        "import signal,sys,time\n"
+        "def _bye(*_):\n"
+        "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"    time.sleep({delay})\n"
+        f"    open({str(marker)!r}, 'w').close()\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, _bye)\n"
+        "time.sleep(300)\n"
+    )
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,subprocess,sys,time\n"
+            f"p = subprocess.Popen([sys.executable, '-c', {worker_src!r}])\n"
             "print(os.getpid(), p.pid, flush=True)\n"
             "time.sleep(300)\n",
         ],
@@ -1131,3 +1177,157 @@ async def _check_shutdown_drains_retained_pgids(monkeypatch, tmp_path):
 
 def test_shutdown_drains_retained_pgids(monkeypatch, tmp_path):
     asyncio.run(_check_shutdown_drains_retained_pgids(monkeypatch, tmp_path))
+
+
+async def _check_shutdown_signals_every_identity_of_a_reused_pgid(
+    monkeypatch, tmp_path
+):
+    """同一个 pgid 号在元数据里出现多次时，每个身份都要各自过闸门。
+
+    retained_pgids 是 append-only 的：一个旧组还没被证明消失，它的号就可能被后来的
+    run 复用，于是两条 [pgid, start] 记录并存到下次启动复核为止。若 shutdown 按
+    pgid 去重（只留先记下的身份），那条陈旧身份每轮都被判 FOREIGN 剔掉、下一轮又从
+    元数据里加回来，真正对得上活组的那个身份则永远进不了集合 —— `run.sh stop` 从此
+    对这个仍握着 codex writer lock 的组一个信号都不发。
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker(stubborn=False)
+    worker_id = _identity(worker)
+    real_start = _read_proc_start_time(pgid)
+    agent = Agent(name="reusedpgid", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="reusedpgid")
+    task.status = TaskStatus.success
+    # 先记下的是那条陈旧身份（号已被复用，start 对不上），真正的活组排在后面。
+    object.__setattr__(
+        task, "retained_pgids", [[pgid, (real_start or 0) - 12345], [pgid, real_start]]
+    )
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    runner = AgentRunner()
+    assert not runner._live_runs
+    try:
+        await runner.shutdown()
+        assert not _alive_as(worker, worker_id), (
+            "活组的身份被同号的陈旧记录挤掉了，shutdown 没给它发过任何信号"
+        )
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
+def test_shutdown_signals_every_identity_of_a_reused_pgid(monkeypatch, tmp_path):
+    asyncio.run(
+        _check_shutdown_signals_every_identity_of_a_reused_pgid(monkeypatch, tmp_path)
+    )
+
+
+async def _check_shutdown_waits_for_retained_only_groups(monkeypatch, tmp_path):
+    """只剩保留组时，两个 deadline 轮询都必须把它算进去。
+
+    _live_runs 为空时，SIGTERM 的等待循环整个被跳过、SIGKILL 立刻发出、之后 5s 的
+    复检循环同样被跳过 —— 保留组既没拿到 graceful TERM 窗口，投递之后也没人复核。
+    一个正在干净退出（或 SIGKILL 尚挂在不可中断等待里）的成员就这样活过了
+    `run.sh stop`，writer lock 泄漏依旧。
+    """
+    marker = tmp_path / "worker-exited-cleanly"
+    # leader 用默认 SIGTERM 行为：它先退，组只剩 worker，worker 干净退出后组即 GONE，
+    # 循环立刻收敛，不必耗掉整个 10s 预算。
+    pgid, worker, leader = _live_group_with_graceful_worker(marker)
+    worker_id = _identity(worker)
+    agent = Agent(name="retainwait", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="retainwait")
+    task.status = TaskStatus.success
+    object.__setattr__(task, "retained_pgids", [[pgid, _read_proc_start_time(pgid)]])
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    runner = AgentRunner()
+    assert not runner._live_runs
+    try:
+        await runner.shutdown()
+        assert marker.exists(), (
+            "保留组在 SIGTERM 之后没等就被 SIGKILL 了，等于没有 graceful 窗口"
+        )
+        # shutdown 返回时必须已经复核过：不能投完信号就退出。
+        assert not _alive_as(worker, worker_id), (
+            "shutdown 返回时保留组还活着，说明投递之后没有任何等待/复检"
+        )
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
+def test_shutdown_waits_for_retained_only_groups(monkeypatch, tmp_path):
+    asyncio.run(_check_shutdown_waits_for_retained_only_groups(monkeypatch, tmp_path))
+
+
+async def _check_shutdown_rechecks_retained_after_sigkill(monkeypatch, tmp_path):
+    """SIGKILL 之后也要复检保留组，不能投完一发就返回。
+
+    SIGKILL 不是同步的：卡在不可中断等待里的成员会让它挂起，组暂时仍是 OURS/UNKNOWN。
+    escalation 阶段的复检循环若只看 _live_runs，只剩保留组时它一轮都不跑 —— 一次投递
+    之后 shutdown 直接返回，那个组就活过了 `run.sh stop`。
+
+    这里把闸门与判决都换成探针：`retained_pgids` 在 SIGTERM 阶段之后才出现（drain 期间
+    落地的 kill_task 就是这个形状），所以 SIGTERM 循环整个被跳过，SIGKILL 阶段成为唯一
+    的等待机会；判决连续几轮报 UNKNOWN，模拟 SIGKILL 尚未落地。
+    """
+    agent = Agent(name="retainrecheck", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="retainrecheck")
+    task.status = TaskStatus.success
+    pgid, leader_start = 424242, 999
+    object.__setattr__(task, "retained_pgids", [[pgid, leader_start]])
+    app_state.agents[agent.id] = agent
+
+    class _LateTasks:
+        """第一次读为空，之后才含这个任务 —— 把手在 SIGTERM 阶段之后才登记。"""
+
+        def __init__(self):
+            self.reads = 0
+
+        def values(self):
+            self.reads += 1
+            return [] if self.reads == 1 else [task]
+
+    monkeypatch.setattr(app_state, "tasks", _LateTasks())
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    verdicts = {"n": 0}
+
+    def fake_state(_pgid, _start):
+        verdicts["n"] += 1
+        # 前几轮 SIGKILL 还没落地；之后组才可证明消失，循环随即收敛。
+        return (
+            agent_runner_mod._GROUP_UNKNOWN if verdicts["n"] <= 4
+            else agent_runner_mod._GROUP_GONE
+        )
+
+    attempts = []
+    monkeypatch.setattr(agent_runner_mod, "_group_state", fake_state)
+    monkeypatch.setattr(
+        agent_runner_mod,
+        "_killpg_verified",
+        lambda p, s, sig: attempts.append((p, sig)) or False,
+    )
+    try:
+        await AgentRunner().shutdown()
+        kills = [a for a in attempts if a == (pgid, signal.SIGKILL)]
+        assert len(kills) >= 2, (
+            "SIGKILL 只投了一发就返回，保留组在 escalation 阶段没有被复检"
+        )
+        assert verdicts["n"] > 4, "shutdown 没有等到保留组出现确定判决"
+    finally:
+        app_state.agents.pop(agent.id, None)
+
+
+def test_shutdown_rechecks_retained_after_sigkill(monkeypatch, tmp_path):
+    asyncio.run(_check_shutdown_rechecks_retained_after_sigkill(monkeypatch, tmp_path))
