@@ -61,8 +61,12 @@ class CodexAdapter(BaseAdapter):
         self._collab_msgs: dict[str, Message] = {}
         # Last reply text surfaced per sub-agent thread. agents_states echoes
         # every thread on every call, so this is what makes "emit each reply
-        # once" possible; a fresh prompt to a thread clears its entry.
+        # once" possible.
         self._shown_replies: dict[str, str] = {}
+        # Threads that were prompted (or resumed) and owe a new answer. Kept
+        # apart from _shown_replies so a thread that is re-prompted and then
+        # interrupted before answering does not republish its previous text.
+        self._awaiting_new_reply: set[str] = set()
         # Number of task.messages observed when the current turn started.
         # Used to scope per-turn usage attachment so it never bleeds into
         # earlier turns (e.g. when the current turn produces only ignored
@@ -250,26 +254,38 @@ class CodexAdapter(BaseAdapter):
         states = item.get("agents_states") or {}
         if item.get("prompt"):
             for tid in item.get("receiver_thread_ids") or []:
-                self._shown_replies.pop(tid, None)
+                self._awaiting_new_reply.add(tid)
         replies = []
         for tid in sorted(states, key=self._short_tid):
             state = states[tid]
             if not isinstance(state, dict):
                 continue
             if state.get("status") in _PENDING_STATUSES:
-                # Back to pending means this thread will answer again, so
-                # whatever it says next is a new reply even if the text
-                # repeats. This is what covers resume_agent, which carries no
-                # prompt to trigger the reset above: a resumed agent returning
-                # its previous text would otherwise be read as an echo and its
-                # tool call would render with no result. Keyed on the observed
-                # state transition rather than on the verb, so an
-                # interrupt/resume pair spelled any other way is covered too.
-                self._shown_replies.pop(tid, None)
+                # Back to pending means a new answer is coming, so the next
+                # settled snapshot counts even if the text repeats. This is
+                # what covers resume_agent, which carries no prompt to trigger
+                # the reset above; keying on the observed state transition
+                # rather than the verb covers any spelling of interrupt/resume.
+                self._awaiting_new_reply.add(tid)
                 continue
             text = (state.get("message") or "").strip()
-            if not text or self._shown_replies.get(tid) == text:
+            if not text:
                 continue
+            # "Awaiting" and "last shown" are tracked separately on purpose. A
+            # thread can be prompted again and then interrupt or error before
+            # answering, while its snapshot still carries the previous message
+            # — dropping the remembered text would republish that stale answer.
+            #
+            # A repeat therefore only counts as new when a new generation was
+            # requested AND the thread completed successfully: an unsuccessful
+            # settle whose text is unchanged is the old answer echoed, not a
+            # new one. An unsuccessful settle carrying a *different* message
+            # (the real error text) still shows, because the text differs.
+            fresh_generation = (tid in self._awaiting_new_reply
+                                and state.get("status") == "completed")
+            if self._shown_replies.get(tid) == text and not fresh_generation:
+                continue
+            self._awaiting_new_reply.discard(tid)
             self._shown_replies[tid] = text
             status = state.get("status", "")
             replies.append(f"[{self._short_tid(tid)} {status}]\n{text}")
@@ -396,4 +412,5 @@ class CodexAdapter(BaseAdapter):
         self._current_tool_msg = None
         self._collab_msgs.clear()
         self._shown_replies.clear()
+        self._awaiting_new_reply.clear()
         self._turn_start_msg_count = None

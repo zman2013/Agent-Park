@@ -353,6 +353,57 @@ def test_repeated_wait_polling_does_not_replay_shown_replies():
                        f"[{CodexAdapter._short_tid(b)} completed]\nreply-B"], replies
 
 
+def test_unsuccessful_settle_does_not_republish_the_previous_answer():
+    """Re-prompted, then errored before answering, snapshot still holds it.
+
+    Forgetting the shown text on a new generation would republish that stale
+    answer as a fresh reply. Only a successful completion proves the new
+    answer actually arrived.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+
+    async def drive():
+        for item in (
+            _collab("item_0", "wait", tids=[tid],
+                    states={tid: {"status": "completed", "message": "alpha"}}),
+            _collab("item_1", "send_message", tids=[tid], prompt="再来",
+                    states={tid: {"status": "running", "message": "alpha"}}),
+            _collab("item_2", "wait", tids=[tid],
+                    states={tid: {"status": "errored", "message": "alpha"}}),
+        ):
+            await adapter.handle_chunk({"type": "item.completed", "item": item}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert replies == [f"[{CodexAdapter._short_tid(tid)} completed]\nalpha"], replies
+
+
+def test_failure_message_is_shown_when_it_differs():
+    """The guard above must not hide a real error message."""
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+
+    async def drive():
+        for item in (
+            _collab("item_0", "wait", tids=[tid],
+                    states={tid: {"status": "completed", "message": "alpha"}}),
+            _collab("item_1", "send_message", tids=[tid], prompt="再来",
+                    states={tid: {"status": "running", "message": "alpha"}}),
+            _collab("item_2", "wait", tids=[tid],
+                    states={tid: {"status": "errored", "message": "boom"}}),
+        ):
+            await adapter.handle_chunk({"type": "item.completed", "item": item}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    label = CodexAdapter._short_tid(tid)
+    assert replies == [f"[{label} completed]\nalpha",
+                       f"[{label} errored]\nboom"], replies
+
+
 def test_resumed_agent_repeating_its_answer_is_shown_again():
     """resume_agent carries no prompt, so the prompt-based reset misses it.
 
