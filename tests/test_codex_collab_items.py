@@ -28,6 +28,8 @@ class FakeCtx:
         self.deltas: list[tuple[str, str]] = []
         # message_id -> replacement text sent with message_done.
         self.finalized: dict[str, str] = {}
+        # (input, output) per update_tokens call — the turns_info carrier.
+        self.token_updates: list[tuple[int, int]] = []
         # message_id -> the Message object handed out, to check final state.
         self.messages: dict[str, Message] = {}
 
@@ -63,8 +65,8 @@ class FakeCtx:
     async def save_session(self, session_id):
         pass
 
-    async def update_tokens(self, *a, **k):
-        pass
+    async def update_tokens(self, input_tokens=0, output_tokens=0, *a, **k):
+        self.token_updates.append((input_tokens, output_tokens))
 
     async def attach_usage(self, *a, **k):
         pass
@@ -347,6 +349,58 @@ def test_repeated_wait_polling_does_not_replay_shown_replies():
     replies = [c for t, _, c in ctx.created if t == "tool_result"]
     assert replies == [f"[{CodexAdapter._short_tid(a)} completed]\nreply-A",
                        f"[{CodexAdapter._short_tid(b)} completed]\nreply-B"], replies
+
+
+def test_nonblocking_dispatch_does_not_replay_the_previous_answer():
+    """A dispatch can complete before the target has answered.
+
+    agents_states then still holds the thread's *previous* message with a
+    non-terminal status. Classifying by verb re-emitted that stale answer as
+    if it were new, so the settled status is the judge instead.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+
+    async def drive():
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "wait", tids=[tid],
+                             states={tid: {"status": "completed", "message": "old"}})}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_1", "send_message", tids=[tid], prompt="新任务",
+                             states={tid: {"status": "running", "message": "old"}})}, ctx)
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_2", "wait", tids=[tid],
+                             states={tid: {"status": "completed", "message": "new"}})}, ctx)
+
+    _run(drive())
+    label = CodexAdapter._short_tid(tid)
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert replies == [f"[{label} completed]\nold",
+                       f"[{label} completed]\nnew"], replies
+
+
+def test_turn_without_usage_still_broadcasts_the_count():
+    """update_tokens is the only path that carries turns_info to clients.
+
+    Skipping it on the no-usage early return left the displayed turn count
+    lagging until some later turn happened to report usage.
+    """
+    task = Task(id="t-broadcast", agent_id="a1", name="n")
+    app_state.tasks["t-broadcast"] = task
+    adapter = CodexAdapter()
+    ctx = FakeCtx("t-broadcast")
+
+    async def drive():
+        await adapter.handle_chunk({"type": "turn.started"}, ctx)
+        await adapter.handle_chunk({"type": "turn.completed", "usage": {}}, ctx)
+
+    _run(drive())
+    assert task.num_turns == 1
+    assert ctx.token_updates == [(0, 0)], ctx.token_updates
 
 
 def test_prompting_one_agent_does_not_replay_another():

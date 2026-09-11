@@ -32,11 +32,14 @@ from server.models import Message, TaskStatus
 
 logger = logging.getLogger(__name__)
 
-# Sub-agent verbs that solicit a fresh reply. `close_agent` (and any other
-# lifecycle verb) only echoes whatever agents_states already held, so it must
-# not be treated as carrying a new answer.
-_REPLY_VERBS = frozenset({"spawn_agent", "send_input", "wait", "resume_agent",
-                          "write_stdin", "send_message", "followup_task"})
+# Sub-agent statuses that mean "this thread's message is a settled answer".
+# Keying on the state rather than on the calling verb is deliberate: a
+# nonblocking dispatch (send_message / followup_task) completes before the
+# target has answered, and agents_states still holds the *previous* message
+# with a non-terminal status. Verb-based classification re-emitted that stale
+# answer as if it were new.
+_SETTLED_STATUSES = frozenset({"completed", "failed", "cancelled", "aborted",
+                               "error", "closed"})
 
 
 class CodexAdapter(BaseAdapter):
@@ -217,36 +220,35 @@ class CodexAdapter(BaseAdapter):
         # The sub-agent's reply lives in agents_states[tid].message. This is
         # the payload worth reading — it is what the sub-agent handed back.
         #
-        # agents_states echoes every thread's latest message on every call, so
-        # each reply has to be surfaced exactly once. Two failure modes bound
-        # the rule:
+        # agents_states echoes every live thread's latest message on every
+        # call, so each reply has to be surfaced exactly once. Three failure
+        # modes bound the rule, all of them observed:
         #
-        #  - A lifecycle verb (close_agent) only echoes; treating it as
-        #    carrying a reply printed the same answer on spawn, wait and close.
+        #  - spawn→wait→close printed the same answer three times, because a
+        #    lifecycle verb only echoes what was already there.
         #  - Repeated `wait` polling is normal when agents finish at different
         #    times: waiting on A and B surfaces A, and the next wait echoes A
         #    alongside B. Only B is new.
+        #  - A nonblocking dispatch completes before the target has answered,
+        #    and the echo still carries the *previous* message.
         #
-        # So: skip echo-only verbs, then emit a thread's message only when it
-        # differs from the last one shown for that thread — while a fresh
-        # prompt to that thread resets the mark, because two confirmations both
-        # answered "OK" are two distinct replies, and swallowing the second
-        # would leave its tool call with no visible result.
-        if item.get("tool") not in _REPLY_VERBS:
-            return
+        # Hence: a reply counts only when the thread's status says it settled,
+        # and only when its text differs from the last one shown for that
+        # thread. A prompt to that thread clears the mark, because two
+        # confirmations both answered "OK" are two distinct replies and
+        # swallowing the second would leave its tool call with no visible
+        # result. Marks are cleared per receiver_thread_ids, not per echoed
+        # thread, or prompting A would replay B's last answer.
         states = item.get("agents_states") or {}
         if item.get("prompt"):
-            # A new prompt was sent: whatever those threads say next is a new
-            # answer even if the text repeats. Only the threads actually
-            # addressed — agents_states echoes every live thread, so clearing
-            # by that would replay an unrelated agent's last answer alongside
-            # the real new reply.
             for tid in item.get("receiver_thread_ids") or []:
                 self._shown_replies.pop(tid, None)
         replies = []
         for tid in sorted(states, key=self._short_tid):
             state = states[tid]
             if not isinstance(state, dict):
+                continue
+            if state.get("status") not in _SETTLED_STATUSES:
                 continue
             text = (state.get("message") or "").strip()
             if not text or self._shown_replies.get(tid) == text:
@@ -334,6 +336,11 @@ class CodexAdapter(BaseAdapter):
         usage = chunk.get("usage", {})
         if not usage:
             self._turn_start_msg_count = None
+            # update_tokens is what normally carries turns_info to clients, and
+            # it is skipped here. A zero-token update keeps the displayed count
+            # from lagging until some later turn happens to report usage.
+            if task is not None:
+                await ctx.update_tokens(0, 0)
             return
         in_tok = usage.get("input_tokens", 0)
         out_tok = usage.get("output_tokens", 0)
