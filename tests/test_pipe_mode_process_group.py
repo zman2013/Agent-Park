@@ -16,9 +16,8 @@ tests pin the same property for pipe mode.
 import asyncio
 import os
 import subprocess
+import sys
 from pathlib import Path
-
-import pytest
 
 from server.adapters.codex import CodexAdapter
 from server.agent_runner import AgentRunner
@@ -70,6 +69,27 @@ def _wrapper(tmp_path):
     return outer
 
 
+def _stubborn_wrapper(tmp_path):
+    """A wrapper that dies instantly on SIGTERM while its child ignores it.
+
+    This is the shape proc.returncode cannot see: the direct child is gone
+    (`exec sleep` takes SIGTERM immediately), yet the descendant holding the
+    writer lock installed SIG_IGN and is only removable by SIGKILL. The child is
+    a bare interpreter with no children of its own so the fixture proves the
+    escalation, not a cascade of collateral kills.
+    """
+    middle = tmp_path / "stubborn.sh"
+    middle.write_text(
+        "#!/bin/bash\n"
+        'echo \'{"type":"thread.started","thread_id":"t-test"}\'\n'
+        f"{sys.executable} -c 'import signal,time;"
+        " signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)' &\n"
+        "exec sleep 300\n"
+    )
+    middle.chmod(0o755)
+    return middle
+
+
 class _Ctx:
     """_run_pipe_mode only reads .task_id on the paths these tests reach."""
 
@@ -77,9 +97,9 @@ class _Ctx:
         self.task_id = task_id
 
 
-async def _spawn(monkeypatch, tmp_path):
+async def _spawn(monkeypatch, tmp_path, wrapper=_wrapper):
     """Start a real pipe-mode run and return (runner, task, proc, run_id)."""
-    agent = Agent(name="killtest", command=str(_wrapper(tmp_path)), cwd=str(tmp_path))
+    agent = Agent(name="killtest", command=str(wrapper(tmp_path)), cwd=str(tmp_path))
     task = Task(agent_id=agent.id, name="killtest")
     app_state.agents[agent.id] = agent
     app_state.tasks[task.id] = task
@@ -110,9 +130,7 @@ async def _spawn(monkeypatch, tmp_path):
     return runner, task, proc, reader
 
 
-@pytest.mark.asyncio
-async def test_pipe_mode_child_leads_its_own_process_group(monkeypatch, tmp_path):
-    """start_new_session makes proc.pid a pgid, which is what killpg needs."""
+async def _check_child_leads_its_own_process_group(monkeypatch, tmp_path):
     runner, task, proc, reader = await _spawn(monkeypatch, tmp_path)
     try:
         assert os.getpgid(proc.pid) == proc.pid
@@ -121,9 +139,12 @@ async def test_pipe_mode_child_leads_its_own_process_group(monkeypatch, tmp_path
         reader.cancel()
 
 
-@pytest.mark.asyncio
-async def test_kill_task_reaps_grandchildren(monkeypatch, tmp_path):
-    """The whole tree dies, not just the process asyncio holds a handle to."""
+def test_pipe_mode_child_leads_its_own_process_group(monkeypatch, tmp_path):
+    """start_new_session makes proc.pid a pgid, which is what killpg needs."""
+    asyncio.run(_check_child_leads_its_own_process_group(monkeypatch, tmp_path))
+
+
+async def _check_kill_task_reaps_grandchildren(monkeypatch, tmp_path):
     runner, task, proc, reader = await _spawn(monkeypatch, tmp_path)
     tree = [proc.pid] + _descendants(proc.pid)
     assert len(tree) >= 2, "fixture spawned no grandchild; test would prove nothing"
@@ -140,15 +161,12 @@ async def test_kill_task_reaps_grandchildren(monkeypatch, tmp_path):
         reader.cancel()
 
 
-@pytest.mark.asyncio
-async def test_pipe_mode_pid_is_recorded_for_killpg_and_orphan_recovery(
-    monkeypatch, tmp_path
-):
-    """shutdown() and restore_orphan_tasks() both signal by recorded pid.
+def test_kill_task_reaps_grandchildren(monkeypatch, tmp_path):
+    """The whole tree dies, not just the process asyncio holds a handle to."""
+    asyncio.run(_check_kill_task_reaps_grandchildren(monkeypatch, tmp_path))
 
-    Neither can reach a pipe-mode tree without one: shutdown() would fall back
-    to proc.terminate(), and orphan recovery would not even see the process.
-    """
+
+async def _check_pid_is_recorded(monkeypatch, tmp_path):
     runner, task, proc, reader = await _spawn(monkeypatch, tmp_path)
     try:
         assert runner._live_runs["run-killtest"]["pid"] == proc.pid
@@ -157,3 +175,43 @@ async def test_pipe_mode_pid_is_recorded_for_killpg_and_orphan_recovery(
     finally:
         await runner.kill_task(task.id)
         reader.cancel()
+
+
+def test_pipe_mode_pid_is_recorded_for_killpg_and_orphan_recovery(
+    monkeypatch, tmp_path
+):
+    """shutdown() and restore_orphan_tasks() both signal by recorded pid.
+
+    Neither can reach a pipe-mode tree without one: shutdown() would fall back
+    to proc.terminate(), and orphan recovery would not even see the process.
+    """
+    asyncio.run(_check_pid_is_recorded(monkeypatch, tmp_path))
+
+
+async def _check_sigkill_escalates_on_the_group(monkeypatch, tmp_path):
+    runner, task, proc, reader = await _spawn(
+        monkeypatch, tmp_path, wrapper=_stubborn_wrapper
+    )
+    stubborn = [p for p in _descendants(proc.pid) if _alive(p)]
+    assert stubborn, "fixture spawned no SIGTERM-ignoring child"
+    try:
+        await runner.kill_task(task.id)
+        await asyncio.sleep(0.6)
+        assert [p for p in stubborn if _alive(p)] == []
+    finally:
+        for p in [proc.pid] + stubborn:
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        reader.cancel()
+
+
+def test_sigkill_escalates_on_the_group_not_the_wrapper(monkeypatch, tmp_path):
+    """A dead wrapper must not cancel SIGKILL while the group is still alive.
+
+    Gating escalation on proc.returncode leaves exactly the writer-lock holder
+    this change exists to remove: the wrapper reports exited, so SIGKILL is
+    skipped, and the SIGTERM-ignoring descendant survives.
+    """
+    asyncio.run(_check_sigkill_escalates_on_the_group(monkeypatch, tmp_path))

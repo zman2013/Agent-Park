@@ -1605,7 +1605,10 @@ class AgentRunner:
         # codex's thread writer lock makes every later resume fail. Signal by
         # pgid first and fall back to the bare pid if the group is already gone.
         proc = self._async_procs.pop(task_id, None)
-        if proc and proc.returncode is None:
+        if proc is not None:
+            # Not gated on proc.returncode: the bug being fixed here is exactly
+            # a dead wrapper whose descendants outlived it, and those orphans
+            # stay in the group even after the direct child is reaped.
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(proc.pid, sig)
@@ -1621,7 +1624,11 @@ class AgentRunner:
                         pass
                 if sig == signal.SIGTERM:
                     await asyncio.sleep(0.5)
-                    if proc.returncode is not None:
+                    # Escalate on the process group, not on proc.returncode: a
+                    # wrapper that exits promptly on SIGTERM says nothing about a
+                    # descendant that ignored it, and that descendant is exactly
+                    # the writer-lock holder this kill exists to remove.
+                    if not _pgroup_alive(proc.pid):
                         break
             # Reap the process so it does not linger as a zombie holding the
             # asyncio transport open.
@@ -1965,6 +1972,40 @@ def _read_proc_start_time(pid: int) -> int | None:
         return int(parts[21])
     except Exception:
         return None
+
+def _pgroup_alive(pgid: int) -> bool:
+    """True while any non-zombie process remains in process group *pgid*.
+
+    kill(-pgid, 0) is not enough: it succeeds as long as the group still holds a
+    zombie, and the direct child's returncode says nothing about descendants
+    that ignored SIGTERM. Walk /proc instead so SIGKILL escalation is decided by
+    the group, not by the wrapper.
+    """
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return False
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            stat_text = Path(f"/proc/{name}/stat").read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        # The state letter and pgid follow the parenthesised comm, which can
+        # itself contain spaces and parens — split on the last ')'.
+        fields = stat_text.rpartition(")")[2].split()
+        if len(fields) < 3:
+            continue
+        if fields[0] in ("Z", "X", "x"):
+            continue
+        try:
+            if int(fields[2]) == pgid:
+                return True
+        except ValueError:
+            continue
+    return False
+
 
 def _clean_env(task_id: str = "") -> dict[str, str]:
     """Return a copy of os.environ with virtualenv and Claude Code session
