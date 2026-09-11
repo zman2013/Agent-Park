@@ -46,6 +46,36 @@ def _runner(monkeypatch, sent):
     return runner
 
 
+def test_sweep_ignores_bubbles_appended_during_the_broadcast(monkeypatch):
+    """A replacement run's bubble must survive the dying run's sweep.
+
+    user_message is allowed while a task is running, so send_input() can append
+    a new streaming message while _finish_task is suspended on a broadcast.
+    Iterating the live list would close that bubble even though its subprocess
+    is still producing output.
+    """
+    task = _task_with_open_bubbles("t-race")
+    newcomer = Message(role="agent", type="tool_use", content="new run",
+                       streaming=True)
+    sent = []
+
+    async def racing_broadcast(payload):
+        # The concurrent append lands while we are suspended here.
+        if payload.get("type") == "message_done" and newcomer not in task.messages:
+            task.messages.append(newcomer)
+        sent.append(payload)
+
+    monkeypatch.setattr("server.routes_ws.broadcast", racing_broadcast)
+    runner = AgentRunner()
+    monkeypatch.setattr(runner, "_schedule_notify", lambda *a, **k: None)
+    monkeypatch.setattr(runner, "_record_history", lambda *a, **k: None)
+    asyncio.run(runner._finish_task("t-race", TaskStatus.failed))
+
+    assert newcomer.streaming is True, "closed the replacement run's bubble"
+    done_ids = [p["message_id"] for p in sent if p.get("type") == "message_done"]
+    assert newcomer.id not in done_ids, done_ids
+
+
 def test_premature_exit_closes_open_bubbles(monkeypatch):
     task = _task_with_open_bubbles("t-premature")
     sent = []

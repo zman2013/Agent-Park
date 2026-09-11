@@ -1306,18 +1306,28 @@ class AgentRunner:
         # Close any bubble the subprocess left open. A run that dies between
         # item.started and item.completed (crash, EOF, nonzero exit) otherwise
         # leaves streaming=True forever: this path never closed messages, and
-        # only the explicit WS stop path swept them. Done after the snapshots
-        # above, which must be taken before the first await, and before
-        # save_agent_tasks below, so the persisted transcript is also clean.
+        # only the explicit WS stop path swept them.
+        #
+        # Collected and marked synchronously, before the broadcasts below. A
+        # user_message is allowed while a task is running, so send_input() can
+        # append a new streaming message to this same list while we are
+        # suspended on a broadcast — iterating the live list would then close a
+        # bubble belonging to the replacement run, whose subprocess is still
+        # producing output.
+        stale_streaming = []
         if task and not was_terminal:
             for msg in task.messages:
                 if msg.streaming:
                     msg.streaming = False
-                    await broadcast({
-                        "type": "message_done",
-                        "task_id": task_id,
-                        "message_id": msg.id,
-                    })
+                    stale_streaming.append(msg.id)
+
+        # Before save_agent_tasks below, so the persisted transcript is clean too.
+        for message_id in stale_streaming:
+            await broadcast({
+                "type": "message_done",
+                "task_id": task_id,
+                "message_id": message_id,
+            })
 
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
