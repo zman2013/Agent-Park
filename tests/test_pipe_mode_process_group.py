@@ -17,11 +17,12 @@ import asyncio
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from server.adapters.codex import CodexAdapter
-from server.agent_runner import AgentRunner
-from server.models import Agent, Task
+from server.agent_runner import AgentRunner, _pgroup_members
+from server.models import Agent, Task, TaskStatus
 from server.state import app_state
 
 
@@ -90,11 +91,41 @@ def _stubborn_wrapper(tmp_path):
     return middle
 
 
+def _eof_then_stubborn_wrapper(tmp_path):
+    """Wrapper dies on SIGTERM; its SIGTERM-ignoring descendant keeps running.
+
+    The descendant redirects its own stdout to /dev/null, so the wrapper's exit
+    is enough to close the pipe: _run_pipe_mode hits EOF, returns, and the
+    _live_runs entry is dropped — while the process itself lives on. That is how
+    a group gets forgotten between shutdown()'s SIGTERM and SIGKILL phases.
+    """
+    script = tmp_path / "eof_stubborn.sh"
+    script.write_text(
+        "#!/bin/bash\n"
+        'echo \'{"type":"thread.started","thread_id":"t-test"}\'\n'
+        f"{sys.executable} -c 'import signal,time;"
+        " signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(300)'"
+        " >/dev/null 2>&1 &\n"
+        # exec so SIGTERM lands on this pid directly with no bash trap handling.
+        "exec sleep 300\n"
+    )
+    script.chmod(0o755)
+    return script
+
+
 class _Ctx:
-    """_run_pipe_mode only reads .task_id on the paths these tests reach."""
+    """_run_pipe_mode only reads .task_id on the paths these tests reach.
+
+    save_session is a no-op: the fixture emits a thread.started line so the
+    reader has something to parse, and the adapter persists the session id from
+    it. Writing it would touch the live data/ directory.
+    """
 
     def __init__(self, task_id):
         self.task_id = task_id
+
+    async def save_session(self, *a, **k):
+        pass
 
 
 async def _spawn(monkeypatch, tmp_path, wrapper=_wrapper):
@@ -215,3 +246,120 @@ def test_sigkill_escalates_on_the_group_not_the_wrapper(monkeypatch, tmp_path):
     skipped, and the SIGTERM-ignoring descendant survives.
     """
     asyncio.run(_check_sigkill_escalates_on_the_group(monkeypatch, tmp_path))
+
+
+def _leaderless_group():
+    """A setsid leader that exits, leaving a live child still in its group.
+
+    This is the shape restore_orphan_tasks() sees after a backend restart: the
+    persisted pid is the group leader, /proc no longer has it, but the writer-
+    lock holder is still in the group. Returns (pgid, survivor_pid).
+    """
+    leader = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,subprocess,sys,time\n"
+            "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])\n"
+            "print(os.getpid(), p.pid, flush=True)\n",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid, survivor = (int(x) for x in leader.stdout.readline().split())
+    leader.wait(timeout=10)
+    # Reaped by Popen.wait, so /proc/<pgid> is fully gone — not a zombie.
+    for _ in range(50):
+        if not Path(f"/proc/{pgid}").exists():
+            break
+        time.sleep(0.1)
+    assert not Path(f"/proc/{pgid}").exists(), "leader did not disappear"
+    assert _alive(survivor), "survivor died with its leader"
+    assert os.getpgid(survivor) == pgid
+    return pgid, survivor
+
+
+def test_orphan_recovery_kills_survivors_of_a_leaderless_group(monkeypatch, tmp_path):
+    """A dead leader must not make its surviving group unrecoverable.
+
+    _read_proc_start_time(pid) returns None once the leader is reaped, so the
+    identity check used to skip killpg entirely and clear the pid — abandoning
+    exactly the writer-lock holder this PR exists to remove.
+    """
+    pgid, survivor = _leaderless_group()
+    agent = Agent(name="orphantest", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="orphantest")
+    task.status = TaskStatus.running
+    object.__setattr__(task, "subprocess_pid", pgid)
+    object.__setattr__(task, "subprocess_start_time", 12345)  # stale on purpose
+    app_state.agents[agent.id] = agent
+    # Replace the task registry outright rather than adding to it. app_state
+    # loads every persisted task from data/ at import, and restore_orphan_tasks
+    # killpg's the recorded pid of EVERY running/waiting task it finds — running
+    # this test against the real registry would kill whatever live agent tasks
+    # the machine happens to be running, this test process's own session
+    # included. monkeypatch restores the real dict at teardown.
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    try:
+        cleaned = AgentRunner().restore_orphan_tasks()
+        assert cleaned == [task.id]
+        for _ in range(30):
+            if not _alive(survivor):
+                break
+            time.sleep(0.1)
+        assert not _alive(survivor), "survivor of a leaderless group was abandoned"
+    finally:
+        try:
+            os.kill(survivor, 9)
+        except ProcessLookupError:
+            pass
+        app_state.agents.pop(agent.id, None)
+
+
+async def _check_shutdown_escalates_a_forgotten_group(monkeypatch, tmp_path):
+    """A group whose _live_runs entry is gone must still be SIGKILLed.
+
+    _run_pipe_mode returns on stdout EOF, and a descendant can cause that EOF
+    just by closing stdout while it keeps running — so _on_done drops the entry
+    before shutdown()'s SIGKILL phase and the group used to be forgotten.
+    """
+    runner, task, proc, reader = await _spawn(
+        monkeypatch, tmp_path, wrapper=_eof_then_stubborn_wrapper
+    )
+    # Find it by pgid, not by walking children: the wrapper exits immediately so
+    # the descendant is reparented to init and pgrep -P finds nothing. Staying in
+    # the group after losing its parent is the whole property under test.
+    stubborn = [p for p in _pgroup_members(proc.pid) if p != proc.pid]
+    assert stubborn, "fixture spawned no SIGTERM-ignoring child"
+    # _spawn registers the _live_runs entry by hand (it calls _run_pipe_mode
+    # directly, not _start_subprocess), so the real _on_done is not attached.
+    # Attach the one part that matters: dropping the entry when the reader
+    # completes. The entry must still be present when shutdown() starts — that
+    # is how the pid gets recorded — and disappear during the drain, which is
+    # what used to lose the group before the SIGKILL phase.
+    reader.add_done_callback(lambda _f: runner._live_runs.pop("run-killtest", None))
+    # shutdown() drains on run["task"]; without it the SIGTERM loop exits at once
+    # and never gives the wrapper time to die (which is what drops the entry).
+    runner._live_runs["run-killtest"]["task"] = reader
+    assert "run-killtest" in runner._live_runs
+    assert not reader.done(), "wrapper died before shutdown; fixture proves nothing"
+    try:
+        await runner.shutdown()
+        # The entry is gone (wrapper took SIGTERM, its exit closed stdout, the
+        # reader finished, the callback fired) — so only the independent pgid
+        # tracking can still reach the descendant.
+        assert not runner._live_runs, "entry survived; the bug is not reproduced"
+        await asyncio.sleep(0.5)
+        assert [p for p in stubborn if _alive(p)] == []
+    finally:
+        for p in [proc.pid] + stubborn:
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+
+
+def test_shutdown_escalates_a_group_whose_run_entry_is_gone(monkeypatch, tmp_path):
+    asyncio.run(_check_shutdown_escalates_a_forgotten_group(monkeypatch, tmp_path))
