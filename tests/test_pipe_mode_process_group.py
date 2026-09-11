@@ -376,6 +376,103 @@ def test_unreadable_stat_is_not_treated_as_leader_absence(monkeypatch, tmp_path)
         app_state.agents.pop(agent.id, None)
 
 
+def test_incomplete_proc_scan_is_unknown_not_gone(monkeypatch):
+    """An unreadable /proc cannot prove a group is empty.
+
+    _scan_pgroup returning [] on a listdir/stat failure used to read as "no
+    members", so a verified-identity group was classified gone — stopping the
+    escalation and releasing the metadata of a possibly live group.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    real_start = _read_proc_start_time(pgid)
+    try:
+        assert agent_runner_mod._group_state(pgid, real_start) == (
+            agent_runner_mod._GROUP_OURS
+        )
+        # Now the whole listing fails: same identity, but nothing is knowable.
+        monkeypatch.setattr(
+            agent_runner_mod.os, "listdir", lambda _p: (_ for _ in ()).throw(OSError())
+        )
+        members, complete = agent_runner_mod._scan_pgroup(pgid)
+        assert (members, complete) == ([], False)
+        assert agent_runner_mod._group_state(pgid, real_start) == (
+            agent_runner_mod._GROUP_UNKNOWN
+        )
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+
+
+def test_group_state_rechecks_absence_after_enumeration(monkeypatch):
+    """The centralized gateway needs the same post-scan absence recheck.
+
+    A pid absent at the identity checks can be re-leased before the member scan;
+    the new session leader's group then answers to this pgid and would be
+    classified ours, which _killpg_verified would happily signal.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    calls = {"n": 0}
+
+    def _absent_once(_pid):
+        calls["n"] += 1
+        return calls["n"] == 1  # absent at the checks, held by the recheck
+
+    monkeypatch.setattr(agent_runner_mod, "_pid_is_absent", _absent_once)
+    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    try:
+        state = agent_runner_mod._group_state(pgid, 12345)
+        assert state == agent_runner_mod._GROUP_FOREIGN, state
+        assert not agent_runner_mod._killpg_verified(pgid, 12345, signal.SIGKILL)
+        time.sleep(0.3)
+        assert _alive(worker), "signaled a group whose pgid was re-leased"
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+
+
+def test_unreadable_initial_identity_retains_pid(monkeypatch, tmp_path):
+    """The initial mismatch branch bypasses _group_state, so it needs its own gate.
+
+    A transient None on the very first read used to fall through to "identity
+    check failed", which cleared subprocess_pid — leaving the failed-task retry
+    with no pid to revisit and the writer lock held permanently.
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    agent = Agent(name="unreadable-initial", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="unreadable-initial")
+    task.status = TaskStatus.running
+    object.__setattr__(task, "subprocess_pid", pgid)
+    object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(pgid))
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    # Every read fails, so the very first identity check is unverifiable while
+    # the pid is provably present.
+    monkeypatch.setattr(agent_runner_mod, "_read_proc_start_time", lambda _p: None)
+    try:
+        assert AgentRunner().restore_orphan_tasks() == [task.id]
+        assert getattr(task, "subprocess_pid", None) == pgid, (
+            "pid cleared on an unreadable initial identity read"
+        )
+        assert getattr(task, "subprocess_start_time", None) is not None
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
 def test_unverifiable_group_is_not_reported_as_gone(monkeypatch):
     """"Don't signal" and "it's gone" must be separate verdicts.
 

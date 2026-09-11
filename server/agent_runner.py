@@ -1765,16 +1765,23 @@ class AgentRunner:
                 # would happily return. Absent before AND after means no such
                 # window opened. Members carry their start times so the kill
                 # itself is identity-checked too (see _kill_verified).
-                survivors = (
-                    _pgroup_member_ids(pid) if _pid_is_absent(pid) else []
-                )
-                if survivors and not _pid_is_absent(pid):
-                    logger.warning(
-                        "Orphan task %s pid=%d was re-allocated while enumerating its "
-                        "group; skip signaling to avoid killing an unrelated tree",
-                        task_id, pid,
-                    )
-                    survivors = []
+                survivors: list[tuple[int, int | None]] = []
+                if _pid_is_absent(pid):
+                    survivors, scan_complete = _scan_pgroup(pid)
+                    if not _pid_is_absent(pid):
+                        logger.warning(
+                            "Orphan task %s pid=%d was re-allocated while enumerating its "
+                            "group; skip signaling to avoid killing an unrelated tree",
+                            task_id, pid,
+                        )
+                        survivors = []
+                    elif not scan_complete:
+                        logger.warning(
+                            "Orphan task %s pid=%d group scan was incomplete; skip "
+                            "signaling this round",
+                            task_id, pid,
+                        )
+                        survivors = []
                 if survivors:
                     logger.warning(
                         "Orphan task %s leader pid=%d is gone but %d process(es) remain in "
@@ -1788,19 +1795,36 @@ class AgentRunner:
                     # Re-enumerate rather than assume the kills took: a member
                     # wedged uninterruptibly keeps SIGKILL pending, and one
                     # forked after enumeration was never signaled at all. If any
-                    # remain, keep the pgid — it is the only handle on them.
-                    still = _pgroup_member_ids(pid) if _pid_is_absent(pid) else []
-                    if still:
+                    # remain — or if the scan could not see all of /proc — keep
+                    # the pgid, it is the only handle on them.
+                    still, complete = _scan_pgroup(pid)
+                    if still or not complete or not _pid_is_absent(pid):
                         logger.error(
-                            "Orphan task %s group pgid=%d still has %d member(s) after "
-                            "verified kills; retaining pid metadata for a later retry",
-                            task_id, pid, len(still),
+                            "Orphan task %s group pgid=%d not provably empty after "
+                            "verified kills (members=%d complete=%s); retaining pid "
+                            "metadata for a later retry",
+                            task_id, pid, len(still), complete,
                         )
                         task.status = TaskStatus.failed
                         app_state.save_agent_tasks(task.agent_id)
                         cleaned.append(task_id)
                         continue
                 else:
+                    # No survivors to signal. Distinguish "the pid is genuinely
+                    # gone / re-leased" from "we could not read it": the latter
+                    # may still be our live group, and clearing the pid here
+                    # would strip the failed-task retry of the only handle it
+                    # has, leaving the writer lock held forever.
+                    if not _pid_is_absent(pid) and actual_start_time is None:
+                        logger.error(
+                            "Orphan task %s pid=%d exists but its identity is unreadable; "
+                            "retaining pid metadata for a later retry",
+                            task_id, pid,
+                        )
+                        task.status = TaskStatus.failed
+                        app_state.save_agent_tasks(task.agent_id)
+                        cleaned.append(task_id)
+                        continue
                     logger.warning(
                         "Orphan task %s pid identity check failed (pid=%d expected_start=%s actual_start=%s); "
                         "skip signaling and mark failed",
@@ -2183,6 +2207,50 @@ def _pid_is_absent(pid: int) -> bool:
     return False
 
 
+def _scan_pgroup(pgid: int) -> tuple[list[tuple[int, int | None]], bool]:
+    """(members, complete) for process group *pgid*.
+
+    `complete` is False when the scan could not see all of /proc — the directory
+    listing failed, or a candidate's stat was unreadable for a reason other than
+    the process having exited. An empty member list is then "we don't know",
+    not "the group is empty": collapsing the two lets a transient read failure
+    look like proof of death, which is how callers stop escalating or discard the
+    only handle on a live writer-lock holder.
+    """
+    members: list[tuple[int, int | None]] = []
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return members, False
+    complete = True
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            stat_text = Path(f"/proc/{name}/stat").read_text(encoding="utf-8")
+        except FileNotFoundError:
+            # Exited between listdir and read — a real observation, not a gap.
+            continue
+        except (OSError, ValueError):
+            complete = False
+            continue
+        # state, ppid, pgrp, ..., starttime follow the parenthesised comm, which
+        # can itself contain spaces and parens — split on the last ')'.
+        fields = stat_text.rpartition(")")[2].split()
+        if len(fields) < 20:
+            complete = False
+            continue
+        if fields[0] in ("Z", "X", "x"):
+            continue
+        try:
+            if int(fields[2]) == pgid:
+                members.append((int(name), int(fields[19])))
+        except ValueError:
+            complete = False
+            continue
+    return members, complete
+
+
 def _pgroup_member_ids(pgid: int) -> list[tuple[int, int | None]]:
     """Live (non-zombie) members of process group *pgid* as (pid, starttime).
 
@@ -2192,31 +2260,7 @@ def _pgroup_member_ids(pgid: int) -> list[tuple[int, int | None]]:
     time, so a number reused in between is detectable rather than silently
     inheriting a kill aimed at its predecessor.
     """
-    members: list[tuple[int, int | None]] = []
-    try:
-        entries = os.listdir("/proc")
-    except OSError:
-        return members
-    for name in entries:
-        if not name.isdigit():
-            continue
-        try:
-            stat_text = Path(f"/proc/{name}/stat").read_text(encoding="utf-8")
-        except (OSError, ValueError):
-            continue
-        # state, ppid, pgrp, ..., starttime follow the parenthesised comm, which
-        # can itself contain spaces and parens — split on the last ')'.
-        fields = stat_text.rpartition(")")[2].split()
-        if len(fields) < 20:
-            continue
-        if fields[0] in ("Z", "X", "x"):
-            continue
-        try:
-            if int(fields[2]) == pgid:
-                members.append((int(name), int(fields[19])))
-        except ValueError:
-            continue
-    return members
+    return _scan_pgroup(pgid)[0]
 
 
 """Verdicts from _group_state. "Don't signal" and "it's gone" are different
@@ -2241,16 +2285,27 @@ def _group_state(pgid: int, leader_start: int | None) -> str:
     established: callers must neither signal it nor treat it as disappeared.
     """
     current = _read_proc_start_time(pgid)
+    leader_absent = _pid_is_absent(pgid)
     if current is not None and leader_start is not None and current != leader_start:
         return _GROUP_FOREIGN
-    if current is None and not _pid_is_absent(pgid):
+    if current is None and not leader_absent:
         # Unreadable is not absent: something holds this pid but we cannot tell
         # whether it is ours. Not signalable, and not evidence of death either.
         return _GROUP_UNKNOWN
-    if leader_start is None and not _pid_is_absent(pgid):
+    if leader_start is None and not leader_absent:
         # No baseline to compare against while the pid is held.
         return _GROUP_UNKNOWN
-    return _GROUP_OURS if _pgroup_alive(pgid) else _GROUP_GONE
+    members, complete = _scan_pgroup(pgid)
+    if not complete:
+        # An incomplete /proc scan cannot prove the group is empty.
+        return _GROUP_UNKNOWN
+    if leader_absent and not _pid_is_absent(pgid):
+        # The number was free when we checked and is held now: it was re-leased
+        # during enumeration, so a new session leader may own this pgid and the
+        # members we just collected could be its, not ours. Absence is only ever
+        # a point-in-time fact, which is why it is rechecked after the scan.
+        return _GROUP_FOREIGN
+    return _GROUP_OURS if members else _GROUP_GONE
 
 
 def _group_is_still(pgid: int, leader_start: int | None) -> bool:
