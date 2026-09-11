@@ -1131,10 +1131,33 @@ class AgentRunner:
             stderr=asyncio.subprocess.PIPE,
             cwd=agent_cwd or None,
             env=env,
+            # Own process group, so kill_task/shutdown can signal the whole
+            # tree via killpg like the PTY path already does (which gets its
+            # group from os.setsid in the child). Agent commands are wrapper
+            # scripts — `codexgpt` execs `ept codex`, which spawns a node
+            # launcher, which spawns the real binary — and proc.terminate()
+            # only reaches the outermost one. A surviving grandchild keeps
+            # codex's per-thread writer lock held, so the next resume dies
+            # with "thread ... already has an active writer" and the task can
+            # never be continued.
+            start_new_session=True,
         )
         self._async_procs[task_id] = proc
         if run_id in self._live_runs:
             self._live_runs[run_id]["proc"] = proc
+            # killpg target for shutdown(), which otherwise only has `proc`
+            # and would again leave the grandchildren running.
+            self._live_runs[run_id]["pid"] = proc.pid
+
+        # Persist PID for orphan recovery, same as the PTY path. Without this a
+        # pipe-mode subprocess that outlives a server restart is invisible to
+        # restore_orphan_tasks, and its lingering process group keeps holding
+        # the thread writer lock.
+        task = app_state.get_task(task_id)
+        if task:
+            object.__setattr__(task, "subprocess_pid", proc.pid)
+            object.__setattr__(task, "subprocess_start_time", _read_proc_start_time(proc.pid))
+            app_state.save_agent_tasks(task.agent_id)
 
         logger.info("Spawned %s pid=%d for task %s (pipe mode)", args[0], proc.pid, task_id)
 
@@ -1576,17 +1599,35 @@ class AgentRunner:
                 except ProcessLookupError:
                     pass
 
-        # Pipe mode: kill asyncio subprocess
+        # Pipe mode: kill the whole process group, not just the direct child.
+        # proc.terminate() alone left grandchildren running (see the
+        # start_new_session comment in _run_pipe_mode), and a survivor holding
+        # codex's thread writer lock makes every later resume fail. Signal by
+        # pgid first and fall back to the bare pid if the group is already gone.
         proc = self._async_procs.pop(task_id, None)
         if proc and proc.returncode is None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(proc.pid, sig)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                except Exception:
+                    try:
+                        if sig == signal.SIGTERM:
+                            proc.terminate()
+                        else:
+                            proc.kill()
+                    except ProcessLookupError:
+                        pass
+                if sig == signal.SIGTERM:
+                    await asyncio.sleep(0.5)
+                    if proc.returncode is not None:
+                        break
+            # Reap the process so it does not linger as a zombie holding the
+            # asyncio transport open.
             try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-            await asyncio.sleep(0.5)
-            try:
-                proc.kill()
-            except ProcessLookupError:
+                await asyncio.wait_for(proc.wait(), timeout=2)
+            except (asyncio.TimeoutError, ProcessLookupError):
                 pass
 
         fd = self._master_fds.pop(task_id, None)
@@ -1735,7 +1776,10 @@ class AgentRunner:
                         except Exception:
                             pass
                 proc = run.get("proc")
-                if proc is not None and proc.returncode is None:
+                if proc is not None and proc.returncode is None and pid is None:
+                    # Only when no pid was recorded: pipe-mode runs now register
+                    # one and are already covered by the killpg above, which
+                    # reaches their grandchildren as proc.terminate() cannot.
                     try:
                         proc.terminate()
                     except ProcessLookupError:
@@ -1785,7 +1829,8 @@ class AgentRunner:
                             except Exception:
                                 pass
                     proc = run.get("proc")
-                    if proc is not None and proc.returncode is None:
+                    if proc is not None and proc.returncode is None and pid is None:
+                        # See _sigterm_all: killpg already covers pipe-mode runs.
                         try:
                             proc.kill()
                         except ProcessLookupError:
