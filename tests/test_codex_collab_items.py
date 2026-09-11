@@ -12,6 +12,8 @@ calls were dropped.
 
 import asyncio
 
+import pytest
+
 from server.adapters.codex import CodexAdapter
 from server.models import Message, Task
 from server.state import app_state
@@ -349,6 +351,49 @@ def test_repeated_wait_polling_does_not_replay_shown_replies():
     replies = [c for t, _, c in ctx.created if t == "tool_result"]
     assert replies == [f"[{CodexAdapter._short_tid(a)} completed]\nreply-A",
                        f"[{CodexAdapter._short_tid(b)} completed]\nreply-B"], replies
+
+
+@pytest.mark.parametrize("status", [
+    "completed", "interrupted", "errored", "not_found", "shutdown",
+    "some_future_status",
+])
+def test_every_non_pending_status_surfaces_its_message(status):
+    """A failed sub-agent's final message must not be swallowed.
+
+    The status set is a deny-list of the two pending states, not an allow-list
+    of terminal ones: the binary's enum includes interrupted / errored /
+    not_found, only some of which were ever seen live, and each value missing
+    from an allow-list means a call rendered with no result at all.
+    """
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+
+    async def drive():
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "wait", tids=[tid],
+                             states={tid: {"status": status, "message": "final"}})}, ctx)
+
+    _run(drive())
+    replies = [c for t, _, c in ctx.created if t == "tool_result"]
+    assert replies == [f"[{CodexAdapter._short_tid(tid)} {status}]\nfinal"], replies
+
+
+@pytest.mark.parametrize("status", ["pending_init", "running"])
+def test_pending_statuses_do_not_surface_a_stale_message(status):
+    adapter = CodexAdapter()
+    ctx = FakeCtx()
+    tid = "01a08e82-5115-7512-966d-6bcdf6e975b7"
+
+    async def drive():
+        await adapter.handle_chunk(
+            {"type": "item.completed",
+             "item": _collab("item_0", "send_message", tids=[tid], prompt="x",
+                             states={tid: {"status": status, "message": "stale"}})}, ctx)
+
+    _run(drive())
+    assert [c for t, _, c in ctx.created if t == "tool_result"] == []
 
 
 def test_nonblocking_dispatch_does_not_replay_the_previous_answer():

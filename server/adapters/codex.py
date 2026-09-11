@@ -32,14 +32,22 @@ from server.models import Message, TaskStatus
 
 logger = logging.getLogger(__name__)
 
-# Sub-agent statuses that mean "this thread's message is a settled answer".
-# Keying on the state rather than on the calling verb is deliberate: a
-# nonblocking dispatch (send_message / followup_task) completes before the
-# target has answered, and agents_states still holds the *previous* message
-# with a non-terminal status. Verb-based classification re-emitted that stale
-# answer as if it were new.
-_SETTLED_STATUSES = frozenset({"completed", "failed", "cancelled", "aborted",
-                               "error", "closed"})
+# Sub-agent statuses that mean "this thread has not answered yet". Everything
+# else — completed, interrupted, errored, not_found, shutdown, or any status a
+# future codex adds — counts as settled.
+#
+# Deliberately a deny-list. The enum observed in the binary is
+# pending_init | running | interrupted | errored | not_found | completed, but
+# only pending_init and completed were seen on a live stream, and an
+# allow-list of terminal values silently swallows a sub-agent's final error
+# message for every value guessed wrong: the transcript then shows the call
+# with no result. Listing the two states that certainly mean "still working"
+# fails the safe way — an unknown status shows its message.
+#
+# Keying on the state at all (rather than on the calling verb) is also
+# deliberate: a nonblocking dispatch completes before the target has answered,
+# and agents_states still holds the *previous* message with a `running` status.
+_PENDING_STATUSES = frozenset({"pending_init", "running"})
 
 
 class CodexAdapter(BaseAdapter):
@@ -232,13 +240,13 @@ class CodexAdapter(BaseAdapter):
         #  - A nonblocking dispatch completes before the target has answered,
         #    and the echo still carries the *previous* message.
         #
-        # Hence: a reply counts only when the thread's status says it settled,
-        # and only when its text differs from the last one shown for that
-        # thread. A prompt to that thread clears the mark, because two
-        # confirmations both answered "OK" are two distinct replies and
-        # swallowing the second would leave its tool call with no visible
-        # result. Marks are cleared per receiver_thread_ids, not per echoed
-        # thread, or prompting A would replay B's last answer.
+        # Hence: a reply counts once the thread is no longer pending, and only
+        # when its text differs from the last one shown for that thread. A
+        # prompt to that thread clears the mark, because two confirmations both
+        # answered "OK" are two distinct replies and swallowing the second
+        # would leave its tool call with no visible result. Marks are cleared
+        # per receiver_thread_ids, not per echoed thread, or prompting A would
+        # replay B's last answer.
         states = item.get("agents_states") or {}
         if item.get("prompt"):
             for tid in item.get("receiver_thread_ids") or []:
@@ -248,7 +256,7 @@ class CodexAdapter(BaseAdapter):
             state = states[tid]
             if not isinstance(state, dict):
                 continue
-            if state.get("status") not in _SETTLED_STATUSES:
+            if state.get("status") in _PENDING_STATUSES:
                 continue
             text = (state.get("message") or "").strip()
             if not text or self._shown_replies.get(tid) == text:
