@@ -1297,6 +1297,22 @@ class AgentRunner:
         if task and not was_terminal and not compact_will_continue:
             history_args = self._prepare_history(task_id, task, status)
 
+        # Close any bubble the subprocess left open. A run that dies between
+        # item.started and item.completed (crash, EOF, nonzero exit) otherwise
+        # leaves streaming=True forever: this path never closed messages, and
+        # only the explicit WS stop path swept them. Done after the snapshots
+        # above, which must be taken before the first await, and before
+        # save_agent_tasks below, so the persisted transcript is also clean.
+        if task and not was_terminal:
+            for msg in task.messages:
+                if msg.streaming:
+                    msg.streaming = False
+                    await broadcast({
+                        "type": "message_done",
+                        "task_id": task_id,
+                        "message_id": msg.id,
+                    })
+
         await self._broadcast_status(task_id, task.status if task else status)
         if task:
             app_state.save_agent_tasks(task.agent_id)
