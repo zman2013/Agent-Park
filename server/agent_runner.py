@@ -2018,6 +2018,35 @@ class AgentRunner:
         # bare number retained across it could name an unrelated group by the
         # time the SIGKILL phase reads it.
         signaled_pgids: dict[int, int | None] = {}
+        # kill_task 判决"没能证明消失"的旧组：后续 resume 已经把 subprocess_pid 换成
+        # 新 pid，它们既不在 _live_runs 里，也不在上面这份 signaled_pgids 里，唯一的
+        # 把手是任务元数据的 retained_pgids。只靠 restore_orphan_tasks 收割意味着
+        # `run.sh stop`（后面不接 start）会在这些组仍握着 codex writer lock 时退出
+        # 后端，所以这里一起 drain，走同一套身份闸门。
+        #
+        # 与 signaled_pgids 分开存：某个旧 pgid 可能已被我们的新 run 复用，混进同一份
+        # 映射会让那条 live run 拿着旧身份去投递（闸门正确地拒发 → 组里的后代反而一个
+        # 信号都收不到）。
+        retained_pgids: dict[int, int | None] = {}
+
+        def _refresh_retained() -> None:
+            # 每一趟都重扫任务元数据：drain 期间仍可能有 kill_task 落地并记下新把手。
+            # setdefault 而非覆盖 —— 先记下的身份来自更早的观测，更可信。
+            for t in list(app_state.tasks.values()):
+                for pgid, leader_start in (getattr(t, "retained_pgids", None) or []):
+                    retained_pgids.setdefault(pgid, leader_start)
+            for pgid, leader_start in list(retained_pgids.items()):
+                if _group_state(pgid, leader_start) in (_GROUP_GONE, _GROUP_FOREIGN):
+                    # 只有确定的判决才移出这份映射；UNKNOWN 不是死亡证据。
+                    retained_pgids.pop(pgid, None)
+
+        def _signal_retained(sig: int) -> None:
+            _refresh_retained()
+            for pgid, leader_start in list(retained_pgids.items()):
+                _killpg_verified(pgid, leader_start, sig)
+            # 不在这里改写 retained_pgids 元数据：把手的生命周期只有
+            # restore_orphan_tasks 一个 owner（见 _record_retained_pgid），它在下次
+            # 启动时按身份复核后摘除。多留一轮的代价只是下次启动多一次核验。
 
         def _sigterm_all() -> None:
             # Iterate _live_runs (keyed by run_id, never overwritten by an
@@ -2065,6 +2094,7 @@ class AgentRunner:
                         pass
 
         _sigterm_all()
+        _signal_retained(signal.SIGTERM)
 
         # Let killed runs reach their own finalization (_finish_task, which
         # schedules the completion card) before we snapshot _notify_tasks below.
@@ -2078,6 +2108,7 @@ class AgentRunner:
         deadline = loop.time() + 10
         while self._live_runs and loop.time() < deadline:
             _sigterm_all()  # catch pids/procs registered by new continuations
+            _signal_retained(signal.SIGTERM)
             tasks = [r["task"] for r in self._live_runs.values() if r.get("task")]
             if not tasks:
                 break
@@ -2096,7 +2127,11 @@ class AgentRunner:
             p for p, start in signaled_pgids.items()
             if _group_state(p, start) in (_GROUP_OURS, _GROUP_UNKNOWN)
         }
-        if self._live_runs or lingering_pgids:
+        # 保留组同样要能把 SIGKILL 阶段拉起来：SIGTERM 之后它们可能仍是 OURS/UNKNOWN，
+        # 而 _live_runs 与 signaled_pgids 都可能已经空了（这些组本来就不属于任何 live
+        # run）。_refresh_retained 顺便剔掉已有确定判决的条目。
+        _refresh_retained()
+        if self._live_runs or lingering_pgids or retained_pgids:
             # SIGTERM didn't finish the job in time — escalate to SIGKILL
             # and give finalization a second, shorter window. run.sh's
             # stop grace was sized to cover this (see do_stop). Without
@@ -2104,6 +2139,9 @@ class AgentRunner:
             # _finish_task, leaving its task stuck at running with no
             # completion card and no exit.
             def _sigkill_all() -> None:
+                # 先打保留组：它们没有 live run 兜底，_live_runs 空掉后下面的循环就不
+                # 再跑，这里是它们唯一的 SIGKILL 来源。
+                _signal_retained(signal.SIGKILL)
                 # Groups first, so one whose _live_runs entry already went away
                 # (stdout closed by a still-running descendant) is still killed.
                 # Drop only pgids with a definite death/foreign verdict: an

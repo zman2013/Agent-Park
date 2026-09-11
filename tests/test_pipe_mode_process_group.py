@@ -1087,3 +1087,47 @@ async def _check_retained_pgid_survives_resume(monkeypatch, tmp_path):
 
 def test_retained_pgid_survives_resume_overwriting_the_pid(monkeypatch, tmp_path):
     asyncio.run(_check_retained_pgid_survives_resume(monkeypatch, tmp_path))
+
+
+async def _check_shutdown_drains_retained_pgids(monkeypatch, tmp_path):
+    """`run.sh stop` 也要收割 retained_pgids，不能只等下次启动。
+
+    kill_task 保留了一个扛过 SIGTERM 的旧组，随后的 resume 把 subprocess_pid 换成了
+    新 pid —— 旧组从此不在 _live_runs 里，shutdown 的信号集合也就看不到它。只靠
+    restore_orphan_tasks 收割意味着 `bash run.sh stop`（后面不接 start）会在旧组仍
+    握着 codex writer lock 时退出后端，那个组就永远留在机器上了。
+    """
+    pgid, worker, leader = _live_group_with_stubborn_worker()
+    worker_id = _identity(worker)
+    agent = Agent(name="retaindrain", command="/bin/true", cwd=str(tmp_path))
+    task = Task(agent_id=agent.id, name="retaindrain")
+    # 任务当前状态与把手无关：resume 之后它可能已经跑成功了，旧组照样还在。
+    task.status = TaskStatus.success
+    object.__setattr__(task, "retained_pgids", [[pgid, _read_proc_start_time(pgid)]])
+    app_state.agents[agent.id] = agent
+    monkeypatch.setattr(app_state, "tasks", {task.id: task})
+    monkeypatch.setattr(app_state, "save_agent_tasks", lambda *a, **k: None)
+    runner = AgentRunner()
+    # _live_runs 空：这正是缺陷成立的前提，旧组没有任何 live run 可以搭便车。
+    assert not runner._live_runs
+    try:
+        await runner.shutdown()
+        for _ in range(30):
+            if not _alive_as(worker, worker_id):
+                break
+            await asyncio.sleep(0.1)
+        assert not _alive_as(worker, worker_id), (
+            "retained group outlived shutdown; run.sh stop would leak it"
+        )
+    finally:
+        for p in (worker, pgid):
+            try:
+                os.kill(p, 9)
+            except ProcessLookupError:
+                pass
+        leader.wait(timeout=10)
+        app_state.agents.pop(agent.id, None)
+
+
+def test_shutdown_drains_retained_pgids(monkeypatch, tmp_path):
+    asyncio.run(_check_shutdown_drains_retained_pgids(monkeypatch, tmp_path))
